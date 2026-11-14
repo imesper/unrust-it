@@ -1,12 +1,14 @@
-[package]
-name = "unrust-it"
+[workspace]
+members = ["crates/unrust-it"]
+resolver = "2"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
-description = "Path planning and collision avoidance for robotic manipulators in 3D space."
 license = "GPL-3.0-or-later"
-readme = "README.md"
+repository = "https://github.com/imesper/unrust-it"
 
-[dependencies]
+[workspace.dependencies]
 log = "0.4"
 nalgebra = "0.34"
 parry3d = "0.26"
