@@ -1,0 +1,13 @@
+[package]
+name = "unrust-it"
+version = "0.1.0"
+edition = "2021"
+description = "Path planning and collision avoidance for robotic manipulators in 3D space."
+license = "GPL-3.0-or-later"
+readme = "README.md"
+
+[dependencies]
+log = "0.4"
+nalgebra = "0.34"
+parry3d = "0.26"
+thiserror = "2"
