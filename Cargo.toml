@@ -1,0 +1,15 @@
+[workspace]
+members = ["crates/unrust-it"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/imesper/unrust-it"
+
+[workspace.dependencies]
+log = "0.4"
+nalgebra = "0.34"
+parry3d = "0.26"
+thiserror = "2"
