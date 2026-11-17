@@ -16,9 +16,11 @@ pub mod robot;
 pub mod trajectory;
 
 pub use batch::{
-    BatchRolloutBackend, CpuSimdBatchBackend, EsdfGridF32, FlatJointF32, FlatLinkSphereF32,
-    FlatRobotModelF32, FlatSpherePairF32,
+    BatchRolloutBackend, CpuSimdBatchBackend, EsdfGridF32, FlatEndEffectorF32, FlatJointF32,
+    FlatLinkSphereF32, FlatRobotModelF32, FlatSpherePairF32, RolloutUniformsF32,
 };
+#[cfg(feature = "gpu")]
+pub use batch::WgpuBatchBackend;
 pub use collision::{
     AllowedCollisionMatrix, BoundingSphere, CollidingPair, CollisionChecker, CollisionEnvironment,
     CollisionError, CollisionRule, CollisionWorkspace, GeometryTier, LinkCapsule, LinkGeometry,
@@ -525,5 +527,36 @@ mod tests {
         let mut costs = vec![0.0_f32; batch_size];
         backend.collision_cost_batch_f32(&flat_model, Some(&esdf), &q_batch_f32, 0.15, &mut costs);
         assert!(costs.iter().any(|&c| c > 0.0));
+
+        #[cfg(feature = "gpu")]
+        {
+            let gpu_backend = WgpuBatchBackend::new().expect("wgpu backend should initialize and compile rollout.wgsl");
+            let mut gpu_spheres = vec![[0.0_f32; 4]; batch_size * num_spheres];
+            let mut gpu_ees = vec![[0.0_f32; 7]; batch_size * num_ees];
+            let mut gpu_costs = vec![0.0_f32; batch_size];
+
+            gpu_backend.forward_kinematics_batch_f32(
+                &flat_model,
+                &q_batch_f32,
+                &mut gpu_spheres,
+                &mut gpu_ees,
+            );
+            gpu_backend.collision_cost_batch_f32(
+                &flat_model,
+                Some(&esdf),
+                &q_batch_f32,
+                0.15,
+                &mut gpu_costs,
+            );
+
+            for (cpu_ee, gpu_ee) in out_ees.iter().zip(gpu_ees.iter()) {
+                for i in 0..7 {
+                    assert_relative_eq!(cpu_ee[i], gpu_ee[i], epsilon = 1e-4);
+                }
+            }
+            for (&cpu_c, &gpu_c) in costs.iter().zip(gpu_costs.iter()) {
+                assert_relative_eq!(cpu_c, gpu_c, epsilon = 1e-4);
+            }
+        }
     }
 }

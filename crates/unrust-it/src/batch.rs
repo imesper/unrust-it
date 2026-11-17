@@ -1,17 +1,17 @@
 //! CuRobo-style batched `f32` kinematics, 3D Euclidean Signed Distance Fields (`EsdfGridF32`),
-//! and GPU/SIMD-friendly `B x H` trajectory rollout evaluation.
+//! and GPU (`wgpu` Metal / Vulkan / DX12 / WebGPU) + CPU SIMD (`f32x8`) `B x H` rollout evaluation.
 //!
 //! While [`crate::kinematics`] and [`crate::collision`] provide exact `f64` single-query APIs
-//! backed by `parry3d-f64`, GPU kernels (CUDA / Metal MPS / WebGPU) and wide CPU SIMD (`f32x8`)
-//! require:
-//! 1. **Branchless, pointer-free `#[repr(C)]` `f32` data layouts** (`FlatRobotModelF32`) that can be
-//!    uploaded directly to GPU storage buffers (`wgpu`, `cudarc`, `cubecl`, or Metal).
+//! backed by `parry3d-f64`, GPU kernels and wide CPU SIMD require:
+//! 1. **Branchless, pointer-free `#[repr(C)]` `bytemuck::Pod` `f32` data layouts** (`FlatRobotModelF32`)
+//!    that upload directly to GPU storage buffers (`wgpu`, `cudarc`, `cubecl`, or Metal).
 //! 2. **Batched tensor interfaces** evaluating $N = B \times H$ configurations in a single call.
-//! 3. **Branchless geometric primitives** (link sphere trees + 3D ESDF voxel grids + analytic OBBs/spheres)
+//! 3. **Branchless geometric primitives** (link sphere trees + 3D ESDF voxel grids)
 //!    with zero GJK/EPA while-loop warp divergence.
 
 use crate::collision::{AllowedCollisionMatrix, CollisionEnvironment};
 use crate::robot::{FrameAttachment, FrameId, JointType, LinkId, MultiRobotModel};
+use bytemuck::{Pod, Zeroable};
 use nalgebra::{Isometry3, Point3, Vector3};
 use rayon::prelude::*;
 use wide::f32x8;
@@ -23,17 +23,17 @@ pub const JOINT_KIND_REVOLUTE: u32 = 1;
 /// Prismatic linear joint (`u32` tag).
 pub const JOINT_KIND_PRISMATIC: u32 = 2;
 
-/// GPU-ready `#[repr(C)]` flat joint descriptor (`f32`, 16-byte aligned fields).
-#[derive(Debug, Clone, Copy)]
+/// GPU-ready `#[repr(C)]` flat joint descriptor (`f32`, 64 bytes, 16-byte aligned).
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
 #[repr(C)]
 pub struct FlatJointF32 {
-    /// Static translation `[tx, ty, tz]` from parent link to joint frame, plus `q_index` encoded as `i32` (`-1` if fixed).
+    /// Static translation `[tx, ty, tz]` from parent link to joint frame.
     pub origin_xyz: [f32; 3],
     /// Index into configuration vector `q` (`u32::MAX` if fixed).
     pub q_index: u32,
     /// Static unit quaternion `[qx, qy, qz, qw]` from parent link to joint frame.
     pub origin_quat_xyzw: [f32; 4],
-    /// Local joint axis `[ax, ay, az]` and joint kind (`JOINT_KIND_*`).
+    /// Local joint axis `[ax, ay, az]`.
     pub axis_xyz: [f32; 3],
     /// Joint kind (`0 = Fixed`, `1 = Revolute/Continuous`, `2 = Prismatic`).
     pub kind: u32,
@@ -47,8 +47,8 @@ pub struct FlatJointF32 {
     pub max_pos: f32,
 }
 
-/// GPU-ready `#[repr(C)]` sphere primitive attached to a robot link (`f32`).
-#[derive(Debug, Clone, Copy)]
+/// GPU-ready `#[repr(C)]` sphere primitive attached to a robot link (`f32`, 32 bytes, 16-byte aligned).
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
 #[repr(C)]
 pub struct FlatLinkSphereF32 {
     /// Local sphere center `[x, y, z]` in link coordinates.
@@ -61,8 +61,8 @@ pub struct FlatLinkSphereF32 {
     pub _pad: [u32; 3],
 }
 
-/// GPU-ready `#[repr(C)]` active self/inter-arm sphere collision pair compiled from [`AllowedCollisionMatrix`].
-#[derive(Debug, Clone, Copy)]
+/// GPU-ready `#[repr(C)]` active self/inter-arm sphere collision pair (`f32`, 16 bytes, 16-byte aligned).
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
 #[repr(C)]
 pub struct FlatSpherePairF32 {
     /// First sphere index in `FlatRobotModelF32::spheres`.
@@ -72,6 +72,48 @@ pub struct FlatSpherePairF32 {
     /// Combined radius plus safety margin ($r_a + r_b + d_{\text{margin}}$).
     pub combined_radius: f32,
     /// Padding for 16-byte alignment.
+    pub _pad: u32,
+}
+
+/// GPU-ready `#[repr(C)]` end-effector frame descriptor (`f32`, 32 bytes, 16-byte aligned).
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
+#[repr(C)]
+pub struct FlatEndEffectorF32 {
+    /// Local translation `[x, y, z]` relative to `link_index`.
+    pub local_xyz: [f32; 3],
+    /// Associated link index (`0..num_links`).
+    pub link_index: u32,
+    /// Local rotation quaternion `[qx, qy, qz, qw]` relative to `link_index`.
+    pub local_quat_xyzw: [f32; 4],
+}
+
+/// GPU uniform buffer parameters for batched rollout shaders (`64 bytes`, 16-byte aligned).
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
+#[repr(C)]
+pub struct RolloutUniformsF32 {
+    /// Number of states $N = B \times H$ in the batch.
+    pub batch_size: u32,
+    /// Number of actuated degrees of freedom $D$.
+    pub dof: u32,
+    /// Number of links $L$.
+    pub num_links: u32,
+    /// Number of link spheres $S$.
+    pub num_spheres: u32,
+    /// Number of end-effector frames $E$.
+    pub num_ees: u32,
+    /// Number of active self/inter-arm sphere pairs.
+    pub num_self_pairs: u32,
+    /// `1` if an `EsdfGridF32` is bound, `0` otherwise.
+    pub has_esdf: u32,
+    /// Smooth collision hinge activation distance $d_{\text{act}}$.
+    pub activation_distance: f32,
+    /// World-space minimum corner of the ESDF grid.
+    pub esdf_origin: [f32; 3],
+    /// Reciprocal voxel size `1.0 / voxel_size`.
+    pub esdf_inv_voxel_size: f32,
+    /// ESDF grid dimensions `[nx, ny, nz]`.
+    pub esdf_dims: [u32; 3],
+    /// 16-byte alignment padding.
     pub _pad: u32,
 }
 
@@ -91,12 +133,12 @@ pub struct FlatRobotModelF32 {
     pub spheres: Vec<FlatLinkSphereF32>,
     /// Pre-compiled active self/inter-arm sphere pairs from the [`AllowedCollisionMatrix`].
     pub active_self_pairs: Vec<FlatSpherePairF32>,
-    /// End-effector `(link_index, local_xyz, local_quat_xyzw)` descriptors for task-space rollouts.
-    pub end_effectors: Vec<(u32, [f32; 3], [f32; 4])>,
+    /// End-effector descriptors for task-space rollouts.
+    pub end_effectors: Vec<FlatEndEffectorF32>,
 }
 
 impl FlatRobotModelF32 {
-    /// Compiles a [`MultiRobotModel`], [`CollisionEnvironment`], and optional [`AllowedCollisionMatrix`]
+    /// Compiles a [`MultiRobotModel`] and [`CollisionEnvironment`]
     /// into a contiguous GPU/SIMD-friendly `f32` model.
     pub fn compile(model: &MultiRobotModel, env: &CollisionEnvironment) -> Self {
         let dof = model.dof();
@@ -186,11 +228,11 @@ impl FlatRobotModelF32 {
                 if let Some((link_id, local_iso)) = Self::resolve_frame_to_link(model, ee_frame) {
                     let t = local_iso.translation.vector;
                     let q = local_iso.rotation.coords;
-                    end_effectors.push((
-                        link_id.0 as u32,
-                        [t.x as f32, t.y as f32, t.z as f32],
-                        [q.x as f32, q.y as f32, q.z as f32, q.w as f32],
-                    ));
+                    end_effectors.push(FlatEndEffectorF32 {
+                        local_xyz: [t.x as f32, t.y as f32, t.z as f32],
+                        link_index: link_id.0 as u32,
+                        local_quat_xyzw: [q.x as f32, q.y as f32, q.z as f32, q.w as f32],
+                    });
                 }
             }
         }
@@ -293,12 +335,16 @@ impl EsdfGridF32 {
         let stride_z = nx * ny;
 
         for iz in 0..nz {
-            let qz = (self.origin[2] + (iz as f32 + 0.5) * self.voxel_size - center[2]).abs() - half[2];
+            let qz =
+                (self.origin[2] + (iz as f32 + 0.5) * self.voxel_size - center[2]).abs() - half[2];
             for iy in 0..ny {
-                let qy = (self.origin[1] + (iy as f32 + 0.5) * self.voxel_size - center[1]).abs() - half[1];
+                let qy = (self.origin[1] + (iy as f32 + 0.5) * self.voxel_size - center[1]).abs()
+                    - half[1];
                 let row_off = iz * stride_z + iy * stride_y;
                 for ix in 0..nx {
-                    let qx = (self.origin[0] + (ix as f32 + 0.5) * self.voxel_size - center[0]).abs() - half[0];
+                    let qx = (self.origin[0] + (ix as f32 + 0.5) * self.voxel_size - center[0])
+                        .abs()
+                        - half[0];
                     let out_x = qx.max(0.0);
                     let out_y = qy.max(0.0);
                     let out_z = qz.max(0.0);
@@ -373,11 +419,11 @@ impl EsdfGridF32 {
 }
 
 /// Hardware-agnostic trait for batched `f32` Forward Kinematics and Collision Rollouts
-/// (implementable by CPU SIMD/`rayon`, `wgpu`, `cudarc`, or `cubecl` backends).
+/// (implemented by [`CpuSimdBatchBackend`] and [`WgpuBatchBackend`]).
 pub trait BatchRolloutBackend: Send + Sync {
     /// Evaluates Forward Kinematics for a batch of $N$ configurations (`q_batch.len() == N * dof`),
-    /// writing world-space sphere `[x, y, z, r]` (`len = N * num_spheres * 4`)
-    /// and end-effector poses `[tx, ty, tz, qx, qy, qz, qw]` (`len = N * num_ees * 7`).
+    /// writing world-space spheres `[x, y, z, r]` (`len = N * num_spheres`)
+    /// and end-effector poses `[tx, ty, tz, qx, qy, qz, qw]` (`len = N * num_ees`).
     fn forward_kinematics_batch_f32(
         &self,
         model: &FlatRobotModelF32,
@@ -398,23 +444,22 @@ pub trait BatchRolloutBackend: Send + Sync {
     );
 }
 
-/// Default CPU backend using 8-wide `f32x8` SIMD and `rayon` multi-threading.
+/// CPU backend using 8-wide `f32x8` SIMD and `rayon` multi-threading.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CpuSimdBatchBackend;
 
 impl CpuSimdBatchBackend {
-    /// Processes 8 configurations simultaneously in lockstep using 8-wide `f32x8` SIMD registers!
+    /// Processes 8 configurations simultaneously in lockstep using 8-wide `f32x8` SIMD registers.
     #[inline]
     pub fn fk_8_wide(
         model: &FlatRobotModelF32,
-        q_8: &[f32], // len = 8 * dof
-        out_spheres_8: &mut [[f32; 4]], // len = 8 * num_spheres
-        out_ees_8: &mut [[f32; 7]],     // len = 8 * num_ees
+        q_8: &[f32],
+        out_spheres_8: &mut [[f32; 4]],
+        out_ees_8: &mut [[f32; 7]],
     ) {
         let dof = model.dof;
         let num_links = model.num_links;
 
-        // Gather q into [dof] of f32x8
         let mut q_simd = vec![f32x8::ZERO; dof];
         for (d, slot) in q_simd.iter_mut().enumerate() {
             *slot = f32x8::from([
@@ -429,12 +474,9 @@ impl CpuSimdBatchBackend {
             ]);
         }
 
-        // Link world translations (tx, ty, tz) and unit quaternions (qx, qy, qz, qw) in f32x8
         let mut link_t = vec![[f32x8::ZERO; 3]; num_links];
-        let mut link_q = vec![
-            [f32x8::ZERO, f32x8::ZERO, f32x8::ZERO, f32x8::ONE];
-            num_links
-        ];
+        let mut link_q =
+            vec![[f32x8::ZERO, f32x8::ZERO, f32x8::ZERO, f32x8::ONE]; num_links];
 
         for joint in &model.joints {
             let (p_t, p_q) = if joint.parent_link == u32::MAX {
@@ -459,7 +501,6 @@ impl CpuSimdBatchBackend {
                 f32x8::splat(joint.origin_quat_xyzw[3]),
             ];
 
-            // base_pose = parent_pose * origin_transform
             let base_t = simd_transform_point(&p_t, &p_q, &o_t);
             let base_q = simd_quat_mul(&p_q, &o_q);
 
@@ -497,7 +538,6 @@ impl CpuSimdBatchBackend {
             link_q[child_idx] = c_q;
         }
 
-        // Scatter transformed world spheres for each of the 8 batch lanes
         let num_spheres = model.spheres.len();
         for (s_idx, s) in model.spheres.iter().enumerate() {
             let l_idx = s.link_index as usize;
@@ -511,24 +551,24 @@ impl CpuSimdBatchBackend {
             let wy: [f32; 8] = world_p[1].into();
             let wz: [f32; 8] = world_p[2].into();
             for lane in 0..8 {
-                out_spheres_8[lane * num_spheres + s_idx] = [wx[lane], wy[lane], wz[lane], s.radius];
+                out_spheres_8[lane * num_spheres + s_idx] =
+                    [wx[lane], wy[lane], wz[lane], s.radius];
             }
         }
 
-        // Scatter end-effector poses for each of the 8 batch lanes
         let num_ees = model.end_effectors.len();
-        for (ee_idx, &(l_u32, off_t, off_q)) in model.end_effectors.iter().enumerate() {
-            let l_idx = l_u32 as usize;
+        for (ee_idx, ee) in model.end_effectors.iter().enumerate() {
+            let l_idx = ee.link_index as usize;
             let local_t = [
-                f32x8::splat(off_t[0]),
-                f32x8::splat(off_t[1]),
-                f32x8::splat(off_t[2]),
+                f32x8::splat(ee.local_xyz[0]),
+                f32x8::splat(ee.local_xyz[1]),
+                f32x8::splat(ee.local_xyz[2]),
             ];
             let local_q = [
-                f32x8::splat(off_q[0]),
-                f32x8::splat(off_q[1]),
-                f32x8::splat(off_q[2]),
-                f32x8::splat(off_q[3]),
+                f32x8::splat(ee.local_quat_xyzw[0]),
+                f32x8::splat(ee.local_quat_xyzw[1]),
+                f32x8::splat(ee.local_quat_xyzw[2]),
+                f32x8::splat(ee.local_quat_xyzw[3]),
             ];
             let ee_t = simd_transform_point(&link_t[l_idx], &link_q[l_idx], &local_t);
             let ee_q = simd_quat_mul(&link_q[l_idx], &local_q);
@@ -542,8 +582,9 @@ impl CpuSimdBatchBackend {
             let qw: [f32; 8] = ee_q[3].into();
 
             for lane in 0..8 {
-                out_ees_8[lane * num_ees + ee_idx] =
-                    [tx[lane], ty[lane], tz[lane], qx[lane], qy[lane], qz[lane], qw[lane]];
+                out_ees_8[lane * num_ees + ee_idx] = [
+                    tx[lane], ty[lane], tz[lane], qx[lane], qy[lane], qz[lane], qw[lane],
+                ];
             }
         }
     }
@@ -608,10 +649,10 @@ impl CpuSimdBatchBackend {
             out_spheres[s_idx] = [wp[0], wp[1], wp[2], s.radius];
         }
 
-        for (ee_idx, &(l_u32, off_t, off_q)) in model.end_effectors.iter().enumerate() {
-            let l_idx = l_u32 as usize;
-            let t = scalar_transform_point(&link_t[l_idx], &link_q[l_idx], &off_t);
-            let q_ee = scalar_quat_mul(&link_q[l_idx], &off_q);
+        for (ee_idx, ee) in model.end_effectors.iter().enumerate() {
+            let l_idx = ee.link_index as usize;
+            let t = scalar_transform_point(&link_t[l_idx], &link_q[l_idx], &ee.local_xyz);
+            let q_ee = scalar_quat_mul(&link_q[l_idx], &ee.local_quat_xyzw);
             out_ees[ee_idx] = [t[0], t[1], t[2], q_ee[0], q_ee[1], q_ee[2], q_ee[3]];
         }
     }
@@ -688,7 +729,6 @@ impl BatchRolloutBackend for CpuSimdBatchBackend {
                 let spheres_b = &world_spheres[b * num_spheres..(b + 1) * num_spheres];
                 let mut total_cost = 0.0_f32;
 
-                // 1. Self-collision & inter-arm collision over pre-compiled active sphere pairs
                 for pair in &model.active_self_pairs {
                     let sa = spheres_b[pair.sphere_a as usize];
                     let sb = spheres_b[pair.sphere_b as usize];
@@ -699,7 +739,6 @@ impl BatchRolloutBackend for CpuSimdBatchBackend {
                     total_cost += smooth_hinge_cost(d, act, inv_two_act);
                 }
 
-                // 2. Environment collision against 3D ESDF voxel grid
                 if let Some(grid) = esdf {
                     for s in spheres_b {
                         if let Some((voxel_d, _grad)) =
@@ -713,6 +752,576 @@ impl BatchRolloutBackend for CpuSimdBatchBackend {
 
                 *cost_out = total_cost;
             });
+    }
+}
+
+/// Cross-platform GPU compute backend powered by `wgpu` (Metal on Apple Silicon, Vulkan on Linux/Windows, DX12, WebGPU).
+///
+/// Compiles and dispatches `rollout.wgsl` (`fk_main` and `collision_main` compute shaders).
+/// On headless CI environments without a hardware GPU, `WgpuBatchBackend` initializes `wgpu`'s
+/// `Noop` validation backend so the WGSL shader, pipeline layouts, buffer alignments, and dispatches
+/// are strictly verified by `naga`/`wgpu-core`, while transparently populating results via [`CpuSimdBatchBackend`].
+#[cfg(feature = "gpu")]
+pub struct WgpuBatchBackend {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    adapter_info: wgpu::AdapterInfo,
+    group0_layout: wgpu::BindGroupLayout,
+    group1_layout: wgpu::BindGroupLayout,
+    fk_pipeline: wgpu::ComputePipeline,
+    collision_pipeline: wgpu::ComputePipeline,
+}
+
+#[cfg(feature = "gpu")]
+impl WgpuBatchBackend {
+    /// Initializes the `wgpu` compute device, queue, and compiled `rollout.wgsl` pipelines synchronously.
+    pub fn new() -> Result<Self, String> {
+        pollster::block_on(Self::new_async())
+    }
+
+    /// Initializes the `wgpu` compute device, queue, and compiled `rollout.wgsl` pipelines asynchronously.
+    pub async fn new_async() -> Result<Self, String> {
+        // 1. Try hardware GPU backends first (Metal, Vulkan, DX12, GL)
+        let hw_instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::PRIMARY | wgpu::Backends::GL,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = match hw_instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(a) => a,
+            Err(_) => {
+                // Fall back to wgpu's Noop backend on headless CI machines so WGSL compilation,
+                // bind-group layouts, and command encoding are still validated.
+                let noop_instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                    backends: wgpu::Backends::NOOP,
+                    backend_options: wgpu::BackendOptions {
+                        noop: wgpu::NoopBackendOptions {
+                            enable: true,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    ..wgpu::InstanceDescriptor::new_without_display_handle()
+                });
+                noop_instance
+                    .request_adapter(&wgpu::RequestAdapterOptions::default())
+                    .await
+                    .map_err(|e| format!("failed to acquire hardware or noop wgpu adapter: {e}"))?
+            }
+        };
+
+        let adapter_info = adapter.get_info();
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("unrust-it-rollout-device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| format!("failed to create wgpu device: {e}"))?;
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("unrust-it-rollout-wgsl"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("rollout.wgsl").into()),
+        });
+
+        let storage_ro = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let storage_rw = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+
+        let group0_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("unrust-it-group0-layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                storage_ro(1), // joints
+                storage_ro(2), // spheres
+                storage_ro(3), // end_effectors
+                storage_ro(4), // q_batch
+                storage_rw(5), // out_world_spheres
+                storage_rw(6), // out_ee_poses
+            ],
+        });
+
+        let group1_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("unrust-it-group1-layout"),
+            entries: &[
+                storage_ro(0), // self_pairs
+                storage_ro(1), // esdf_distances
+            ],
+        });
+
+        let fk_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("unrust-it-fk-pipeline-layout"),
+            bind_group_layouts: &[Some(&group0_layout)],
+            immediate_size: 0,
+        });
+
+        let collision_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("unrust-it-collision-pipeline-layout"),
+            bind_group_layouts: &[Some(&group0_layout), Some(&group1_layout)],
+            immediate_size: 0,
+        });
+
+        let fk_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("unrust-it-fk-pipeline"),
+            layout: Some(&fk_layout),
+            module: &shader,
+            entry_point: Some("fk_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+
+        let collision_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("unrust-it-collision-pipeline"),
+            layout: Some(&collision_layout),
+            module: &shader,
+            entry_point: Some("collision_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+
+        Ok(Self {
+            device,
+            queue,
+            adapter_info,
+            group0_layout,
+            group1_layout,
+            fk_pipeline,
+            collision_pipeline,
+        })
+    }
+
+    /// Returns information about the active `wgpu` adapter (e.g., Metal, Vulkan, DX12, or Noop).
+    #[inline]
+    pub fn adapter_info(&self) -> &wgpu::AdapterInfo {
+        &self.adapter_info
+    }
+
+    /// Returns `true` if backed by a physical/driver GPU (Metal, Vulkan, DX12, GL) rather than `Backends::NOOP`.
+    #[inline]
+    pub fn is_hardware_accelerated(&self) -> bool {
+        self.adapter_info.backend != wgpu::Backend::Noop
+    }
+
+    fn create_storage_buffer_from_bytes(&self, label: &str, bytes: &[u8], rw: bool) -> wgpu::Buffer {
+        use wgpu::util::DeviceExt;
+        let non_empty = if bytes.is_empty() { &[0u8; 64] } else { bytes };
+        let mut usage = wgpu::BufferUsages::STORAGE;
+        if rw {
+            usage |= wgpu::BufferUsages::COPY_SRC;
+        }
+        self.device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: non_empty,
+                usage,
+            })
+    }
+
+    fn read_buffer_sync(&self, src_buffer: &wgpu::Buffer, byte_len: u64, dst_bytes: &mut [u8]) {
+        if byte_len == 0 {
+            return;
+        }
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("unrust-it-staging-readback"),
+            size: byte_len,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("unrust-it-readback-encoder"),
+            });
+        encoder.copy_buffer_to_buffer(src_buffer, 0, &staging, 0, byte_len);
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        rx.recv()
+            .expect("wgpu map_async channel closed")
+            .expect("failed to map staging buffer");
+
+        let mapped = slice
+            .get_mapped_range()
+            .expect("failed to get mapped staging buffer range");
+        dst_bytes.copy_from_slice(&mapped[..dst_bytes.len()]);
+        drop(mapped);
+        staging.unmap();
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl BatchRolloutBackend for WgpuBatchBackend {
+    fn forward_kinematics_batch_f32(
+        &self,
+        model: &FlatRobotModelF32,
+        q_batch: &[f32],
+        out_world_spheres: &mut [[f32; 4]],
+        out_ee_poses: &mut [[f32; 7]],
+    ) {
+        use wgpu::util::DeviceExt;
+        let dof = model.dof.max(1);
+        let batch_size = q_batch.len() / dof;
+        if batch_size == 0 {
+            return;
+        }
+
+        let uniforms = RolloutUniformsF32 {
+            batch_size: batch_size as u32,
+            dof: model.dof as u32,
+            num_links: model.num_links as u32,
+            num_spheres: model.spheres.len() as u32,
+            num_ees: model.end_effectors.len() as u32,
+            num_self_pairs: model.active_self_pairs.len() as u32,
+            has_esdf: 0,
+            activation_distance: 0.1,
+            esdf_origin: [0.0; 3],
+            esdf_inv_voxel_size: 1.0,
+            esdf_dims: [1, 1, 1],
+            _pad: 0,
+        };
+
+        let uniform_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("uniforms"),
+                contents: bytemuck::bytes_of(&uniforms),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let joints_buf = self.create_storage_buffer_from_bytes(
+            "joints",
+            bytemuck::cast_slice(&model.joints),
+            false,
+        );
+        let spheres_buf = self.create_storage_buffer_from_bytes(
+            "spheres",
+            bytemuck::cast_slice(&model.spheres),
+            false,
+        );
+        let ees_buf = self.create_storage_buffer_from_bytes(
+            "ees",
+            bytemuck::cast_slice(&model.end_effectors),
+            false,
+        );
+        let q_buf =
+            self.create_storage_buffer_from_bytes("q_batch", bytemuck::cast_slice(q_batch), false);
+
+        let spheres_byte_len = std::mem::size_of_val(out_world_spheres) as u64;
+        let ees_byte_len = std::mem::size_of_val(out_ee_poses) as u64;
+
+        let out_spheres_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("out_world_spheres"),
+            size: spheres_byte_len.max(16),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let out_ees_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("out_ee_poses"),
+            size: ees_byte_len.max(16),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let group0 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fk_group0"),
+            layout: &self.group0_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: joints_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: spheres_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: ees_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: q_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: out_spheres_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: out_ees_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("fk_encoder"),
+            });
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("fk_compute_pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.fk_pipeline);
+            cpass.set_bind_group(0, &group0, &[]);
+            let workgroups = (batch_size as u32).div_ceil(64);
+            cpass.dispatch_workgroups(workgroups, 1, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+
+        if self.is_hardware_accelerated() {
+            self.read_buffer_sync(
+                &out_spheres_buf,
+                spheres_byte_len,
+                bytemuck::cast_slice_mut(out_world_spheres),
+            );
+            self.read_buffer_sync(
+                &out_ees_buf,
+                ees_byte_len,
+                bytemuck::cast_slice_mut(out_ee_poses),
+            );
+        } else {
+            let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+            CpuSimdBatchBackend.forward_kinematics_batch_f32(
+                model,
+                q_batch,
+                out_world_spheres,
+                out_ee_poses,
+            );
+        }
+    }
+
+    fn collision_cost_batch_f32(
+        &self,
+        model: &FlatRobotModelF32,
+        esdf: Option<&EsdfGridF32>,
+        q_batch: &[f32],
+        activation_distance: f32,
+        out_costs: &mut [f32],
+    ) {
+        use wgpu::util::DeviceExt;
+        let dof = model.dof.max(1);
+        let batch_size = q_batch.len() / dof;
+        if batch_size == 0 {
+            return;
+        }
+
+        let (has_esdf, esdf_origin, esdf_inv, esdf_dims, esdf_slice): (
+            u32,
+            [f32; 3],
+            f32,
+            [u32; 3],
+            &[f32],
+        ) = match esdf {
+            Some(g) => (
+                1,
+                g.origin,
+                g.inv_voxel_size,
+                [g.dims[0] as u32, g.dims[1] as u32, g.dims[2] as u32],
+                &g.distances,
+            ),
+            None => (0, [0.0; 3], 1.0, [1, 1, 1], &[1.0_f32]),
+        };
+
+        let uniforms = RolloutUniformsF32 {
+            batch_size: batch_size as u32,
+            dof: model.dof as u32,
+            num_links: model.num_links as u32,
+            num_spheres: model.spheres.len() as u32,
+            num_ees: 0,
+            num_self_pairs: model.active_self_pairs.len() as u32,
+            has_esdf,
+            activation_distance,
+            esdf_origin,
+            esdf_inv_voxel_size: esdf_inv,
+            esdf_dims,
+            _pad: 0,
+        };
+
+        let uniform_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("uniforms"),
+                contents: bytemuck::bytes_of(&uniforms),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let joints_buf = self.create_storage_buffer_from_bytes(
+            "joints",
+            bytemuck::cast_slice(&model.joints),
+            false,
+        );
+        let spheres_buf = self.create_storage_buffer_from_bytes(
+            "spheres",
+            bytemuck::cast_slice(&model.spheres),
+            false,
+        );
+        let ees_buf = self.create_storage_buffer_from_bytes(
+            "ees",
+            bytemuck::cast_slice(&model.end_effectors),
+            false,
+        );
+        let q_buf =
+            self.create_storage_buffer_from_bytes("q_batch", bytemuck::cast_slice(q_batch), false);
+
+        let spheres_byte_len = (batch_size * model.spheres.len() * 16) as u64;
+        let costs_byte_len = std::mem::size_of_val(out_costs) as u64;
+
+        let out_spheres_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("out_world_spheres"),
+            size: spheres_byte_len.max(16),
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let out_costs_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("out_costs"),
+            size: costs_byte_len.max(16),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let pairs_buf = self.create_storage_buffer_from_bytes(
+            "self_pairs",
+            bytemuck::cast_slice(&model.active_self_pairs),
+            false,
+        );
+        let esdf_buf = self.create_storage_buffer_from_bytes(
+            "esdf_distances",
+            bytemuck::cast_slice(esdf_slice),
+            false,
+        );
+
+        let group0 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rollout_group0"),
+            layout: &self.group0_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: joints_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: spheres_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: ees_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: q_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: out_spheres_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: out_costs_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let group1 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rollout_group1"),
+            layout: &self.group1_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: pairs_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: esdf_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        // Dispatch both fk_main and collision_main back-to-back in a single command submission!
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("collision_rollout_encoder"),
+            });
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("fk_and_collision_pass"),
+                timestamp_writes: None,
+            });
+            let workgroups = (batch_size as u32).div_ceil(64);
+            cpass.set_pipeline(&self.fk_pipeline);
+            cpass.set_bind_group(0, &group0, &[]);
+            cpass.dispatch_workgroups(workgroups, 1, 1);
+
+            cpass.set_pipeline(&self.collision_pipeline);
+            cpass.set_bind_group(0, &group0, &[]);
+            cpass.set_bind_group(1, &group1, &[]);
+            cpass.dispatch_workgroups(workgroups, 1, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+
+        if self.is_hardware_accelerated() {
+            self.read_buffer_sync(
+                &out_costs_buf,
+                costs_byte_len,
+                bytemuck::cast_slice_mut(out_costs),
+            );
+        } else {
+            let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+            CpuSimdBatchBackend.collision_cost_batch_f32(
+                model,
+                esdf,
+                q_batch,
+                activation_distance,
+                out_costs,
+            );
+        }
     }
 }
 
@@ -741,7 +1350,6 @@ fn simd_quat_mul(a: &[f32x8; 4], b: &[f32x8; 4]) -> [f32x8; 4] {
 
 #[inline(always)]
 fn simd_transform_point(t: &[f32x8; 3], q: &[f32x8; 4], p: &[f32x8; 3]) -> [f32x8; 3] {
-    // p' = t + p + 2 * qw * (q_vec x p) + 2 * (q_vec x (q_vec x p))
     let two = f32x8::splat(2.0);
     let uv_x = two * (q[1] * p[2] - q[2] * p[1]);
     let uv_y = two * (q[2] * p[0] - q[0] * p[2]);

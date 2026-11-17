@@ -10,11 +10,14 @@ repository = "https://github.com/imesper/unrust-it"
 
 [workspace.dependencies]
 approx = "0.5"
+bytemuck = { version = "1.25", features = ["derive"] }
 glamx = { version = "0.1.3", features = ["nalgebra"] }
 log = "0.4"
 nalgebra = "0.34"
 parry3d = { package = "parry3d-f64", version = "0.26", features = ["simd-stable", "parallel"] }
+pollster = "1.0"
 rayon = "1.10"
 smallvec = "1.16"
 thiserror = "2"
+wgpu = { version = "30", default-features = false, features = ["std", "wgsl", "metal", "vulkan", "dx12", "gles", "noop"] }
 wide = "0.7"

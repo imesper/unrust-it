@@ -7,14 +7,21 @@ license.workspace = true
 repository.workspace = true
 readme = "../../README.md"
 
+[features]
+default = ["gpu"]
+gpu = ["dep:wgpu", "dep:pollster"]
+
 [dependencies]
+bytemuck.workspace = true
 glamx.workspace = true
 log.workspace = true
 nalgebra.workspace = true
 parry3d.workspace = true
+pollster = { workspace = true, optional = true }
 rayon.workspace = true
 smallvec.workspace = true
 thiserror.workspace = true
+wgpu = { workspace = true, optional = true }
 wide.workspace = true
 
 [dev-dependencies]
