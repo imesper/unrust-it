@@ -1422,3 +1422,884 @@ pub fn pose_f32_to_isometry(pose: &[f32; 7]) -> Isometry3<f64> {
     ));
     Isometry3::from_parts(t.into(), q)
 }
+
+/// Persistent GPU-resident buffer context for [`WgpuBatchBackend`].
+///
+/// Keeps the kinematic tree (`joints`, `spheres`, `end_effectors`, `active_self_pairs`),
+/// obstacle ESDF voxel grid (`esdf_distances`), and pre-allocated input/output buffers
+/// (`q_batch`, `out_world_spheres`, `out_scalars`, `staging`) resident in GPU memory.
+/// Subsequent rollouts up to `max_batch_size` perform zero GPU buffer or bind-group
+/// allocations, updating only `uniform_buf` and `q_buf` via `queue.write_buffer`.
+#[cfg(feature = "gpu")]
+pub struct GpuRobotContext {
+    model: FlatRobotModelF32,
+    esdf: Option<EsdfGridF32>,
+    max_batch_size: usize,
+    uniform_buf: wgpu::Buffer,
+    #[allow(dead_code)]
+    joints_buf: wgpu::Buffer,
+    #[allow(dead_code)]
+    spheres_buf: wgpu::Buffer,
+    #[allow(dead_code)]
+    ees_buf: wgpu::Buffer,
+    pairs_buf: wgpu::Buffer,
+    esdf_buf: wgpu::Buffer,
+    q_buf: wgpu::Buffer,
+    out_spheres_buf: wgpu::Buffer,
+    out_scalars_buf: wgpu::Buffer,
+    staging_buf: wgpu::Buffer,
+    group0: wgpu::BindGroup,
+    group1: wgpu::BindGroup,
+}
+
+#[cfg(feature = "gpu")]
+impl GpuRobotContext {
+    /// Uploads `model` and optional `esdf` to resident GPU buffers sized for up to `max_batch_size` configurations.
+    pub fn new(
+        backend: &WgpuBatchBackend,
+        model: FlatRobotModelF32,
+        esdf: Option<EsdfGridF32>,
+        max_batch_size: usize,
+    ) -> Self {
+        use wgpu::util::DeviceExt;
+        let max_batch_size = max_batch_size.max(1);
+        let dof = model.dof.max(1);
+        let num_spheres = model.spheres.len().max(1);
+        let num_ees = model.end_effectors.len().max(1);
+
+        let dummy_uniforms = RolloutUniformsF32 {
+            batch_size: max_batch_size as u32,
+            dof: model.dof as u32,
+            num_links: model.num_links as u32,
+            num_spheres: model.spheres.len() as u32,
+            num_ees: model.end_effectors.len() as u32,
+            num_self_pairs: model.active_self_pairs.len() as u32,
+            has_esdf: u32::from(esdf.is_some()),
+            activation_distance: 0.1,
+            esdf_origin: esdf.as_ref().map_or([0.0; 3], |g| g.origin),
+            esdf_inv_voxel_size: esdf.as_ref().map_or(1.0, |g| g.inv_voxel_size),
+            esdf_dims: esdf.as_ref().map_or([1, 1, 1], |g| {
+                [g.dims[0] as u32, g.dims[1] as u32, g.dims[2] as u32]
+            }),
+            _pad: 0,
+        };
+
+        let uniform_buf = backend
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("resident_uniforms"),
+                contents: bytemuck::bytes_of(&dummy_uniforms),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+
+        let joints_buf = backend.create_storage_buffer_from_bytes(
+            "resident_joints",
+            bytemuck::cast_slice(&model.joints),
+            false,
+        );
+        let spheres_buf = backend.create_storage_buffer_from_bytes(
+            "resident_spheres",
+            bytemuck::cast_slice(&model.spheres),
+            false,
+        );
+        let ees_buf = backend.create_storage_buffer_from_bytes(
+            "resident_ees",
+            bytemuck::cast_slice(&model.end_effectors),
+            false,
+        );
+        let pairs_buf = backend.create_storage_buffer_from_bytes(
+            "resident_self_pairs",
+            bytemuck::cast_slice(&model.active_self_pairs),
+            false,
+        );
+
+        let esdf_bytes: &[u8] = match &esdf {
+            Some(g) => bytemuck::cast_slice(&g.distances),
+            None => bytemuck::bytes_of(&1.0_f32),
+        };
+        let esdf_buf = backend
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("resident_esdf"),
+                contents: if esdf_bytes.is_empty() {
+                    &[0u8; 64]
+                } else {
+                    esdf_bytes
+                },
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            });
+
+        let q_cap_bytes = (max_batch_size * dof * 4).max(16) as u64;
+        let spheres_cap_bytes = (max_batch_size * num_spheres * 16).max(16) as u64;
+        let scalars_cap_bytes = ((max_batch_size * num_ees * 28).max(max_batch_size * 4)).max(16) as u64;
+        let staging_cap_bytes = spheres_cap_bytes.max(scalars_cap_bytes);
+
+        let q_buf = backend.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("resident_q_batch"),
+            size: q_cap_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let out_spheres_buf = backend.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("resident_out_world_spheres"),
+            size: spheres_cap_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let out_scalars_buf = backend.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("resident_out_scalars"),
+            size: scalars_cap_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let staging_buf = backend.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("resident_staging_readback"),
+            size: staging_cap_bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let group0 = backend.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("resident_group0"),
+            layout: &backend.group0_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: joints_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: spheres_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: ees_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: q_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: out_spheres_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: out_scalars_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let group1 = backend.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("resident_group1"),
+            layout: &backend.group1_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: pairs_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: esdf_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        Self {
+            model,
+            esdf,
+            max_batch_size,
+            uniform_buf,
+            joints_buf,
+            spheres_buf,
+            ees_buf,
+            pairs_buf,
+            esdf_buf,
+            q_buf,
+            out_spheres_buf,
+            out_scalars_buf,
+            staging_buf,
+            group0,
+            group1,
+        }
+    }
+
+    /// Maximum number of configurations (`B * H`) this resident context can evaluate per call.
+    #[inline]
+    pub fn max_batch_size(&self) -> usize {
+        self.max_batch_size
+    }
+
+    /// Reference to the compiled `f32` robot model.
+    #[inline]
+    pub fn model(&self) -> &FlatRobotModelF32 {
+        &self.model
+    }
+
+    /// Reference to the resident ESDF obstacle grid, if present.
+    #[inline]
+    pub fn esdf(&self) -> Option<&EsdfGridF32> {
+        self.esdf.as_ref()
+    }
+
+    /// Updates the resident ESDF voxel grid on the GPU.
+    ///
+    /// If the voxel count matches the existing buffer, this performs an in-place `queue.write_buffer`
+    /// upload without reallocating buffers or bind groups.
+    pub fn update_esdf(&mut self, backend: &WgpuBatchBackend, esdf: EsdfGridF32) {
+        use wgpu::util::DeviceExt;
+        let new_bytes: &[u8] = bytemuck::cast_slice(&esdf.distances);
+        let same_size = self
+            .esdf
+            .as_ref()
+            .is_some_and(|old| old.distances.len() == esdf.distances.len());
+
+        if same_size && !new_bytes.is_empty() {
+            backend.queue.write_buffer(&self.esdf_buf, 0, new_bytes);
+        } else {
+            self.esdf_buf = backend
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("resident_esdf"),
+                    contents: if new_bytes.is_empty() {
+                        &[0u8; 64]
+                    } else {
+                        new_bytes
+                    },
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                });
+            self.group1 = backend.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("resident_group1"),
+                layout: &backend.group1_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.pairs_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: self.esdf_buf.as_entire_binding(),
+                    },
+                ],
+            });
+        }
+        self.esdf = Some(esdf);
+    }
+
+    fn read_via_staging(
+        &self,
+        backend: &WgpuBatchBackend,
+        src_buffer: &wgpu::Buffer,
+        byte_len: u64,
+        dst_bytes: &mut [u8],
+    ) {
+        if byte_len == 0 {
+            return;
+        }
+        let mut encoder = backend
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("resident_readback_encoder"),
+            });
+        encoder.copy_buffer_to_buffer(src_buffer, 0, &self.staging_buf, 0, byte_len);
+        backend.queue.submit(Some(encoder.finish()));
+
+        let slice = self.staging_buf.slice(..byte_len);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        let _ = backend.device.poll(wgpu::PollType::wait_indefinitely());
+        rx.recv()
+            .expect("wgpu map_async channel closed")
+            .expect("failed to map resident staging buffer");
+
+        let mapped = slice
+            .get_mapped_range()
+            .expect("failed to get mapped resident staging buffer range");
+        dst_bytes.copy_from_slice(&mapped[..dst_bytes.len()]);
+        drop(mapped);
+        self.staging_buf.unmap();
+    }
+
+    /// Evaluates batched `f32` forward kinematics using resident GPU buffers without per-call allocations.
+    pub fn forward_kinematics_resident(
+        &self,
+        backend: &WgpuBatchBackend,
+        q_batch: &[f32],
+        out_world_spheres: &mut [[f32; 4]],
+        out_ee_poses: &mut [[f32; 7]],
+    ) {
+        let dof = self.model.dof.max(1);
+        let batch_size = q_batch.len() / dof;
+        if batch_size == 0 {
+            return;
+        }
+        assert!(
+            batch_size <= self.max_batch_size,
+            "batch_size ({batch_size}) exceeds GpuRobotContext::max_batch_size ({})",
+            self.max_batch_size
+        );
+
+        let uniforms = RolloutUniformsF32 {
+            batch_size: batch_size as u32,
+            dof: self.model.dof as u32,
+            num_links: self.model.num_links as u32,
+            num_spheres: self.model.spheres.len() as u32,
+            num_ees: self.model.end_effectors.len() as u32,
+            num_self_pairs: self.model.active_self_pairs.len() as u32,
+            has_esdf: 0,
+            activation_distance: 0.1,
+            esdf_origin: [0.0; 3],
+            esdf_inv_voxel_size: 1.0,
+            esdf_dims: [1, 1, 1],
+            _pad: 0,
+        };
+
+        backend
+            .queue
+            .write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
+        backend
+            .queue
+            .write_buffer(&self.q_buf, 0, bytemuck::cast_slice(q_batch));
+
+        let mut encoder = backend
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("resident_fk_encoder"),
+            });
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("resident_fk_pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&backend.fk_pipeline);
+            cpass.set_bind_group(0, &self.group0, &[]);
+            let workgroups = (batch_size as u32).div_ceil(64);
+            cpass.dispatch_workgroups(workgroups, 1, 1);
+        }
+        backend.queue.submit(Some(encoder.finish()));
+
+        if backend.is_hardware_accelerated() {
+            let spheres_byte_len = std::mem::size_of_val(out_world_spheres) as u64;
+            let ees_byte_len = std::mem::size_of_val(out_ee_poses) as u64;
+            self.read_via_staging(
+                backend,
+                &self.out_spheres_buf,
+                spheres_byte_len,
+                bytemuck::cast_slice_mut(out_world_spheres),
+            );
+            self.read_via_staging(
+                backend,
+                &self.out_scalars_buf,
+                ees_byte_len,
+                bytemuck::cast_slice_mut(out_ee_poses),
+            );
+        } else {
+            let _ = backend.device.poll(wgpu::PollType::wait_indefinitely());
+            CpuSimdBatchBackend.forward_kinematics_batch_f32(
+                &self.model,
+                q_batch,
+                out_world_spheres,
+                out_ee_poses,
+            );
+        }
+    }
+
+    /// Evaluates batched `f32` rollout collision costs using resident GPU buffers without per-call allocations.
+    pub fn collision_cost_resident(
+        &self,
+        backend: &WgpuBatchBackend,
+        q_batch: &[f32],
+        activation_distance: f32,
+        out_costs: &mut [f32],
+    ) {
+        let dof = self.model.dof.max(1);
+        let batch_size = q_batch.len() / dof;
+        if batch_size == 0 {
+            return;
+        }
+        assert!(
+            batch_size <= self.max_batch_size,
+            "batch_size ({batch_size}) exceeds GpuRobotContext::max_batch_size ({})",
+            self.max_batch_size
+        );
+
+        let (has_esdf, esdf_origin, esdf_inv, esdf_dims) = match &self.esdf {
+            Some(g) => (
+                1,
+                g.origin,
+                g.inv_voxel_size,
+                [g.dims[0] as u32, g.dims[1] as u32, g.dims[2] as u32],
+            ),
+            None => (0, [0.0; 3], 1.0, [1, 1, 1]),
+        };
+
+        let uniforms = RolloutUniformsF32 {
+            batch_size: batch_size as u32,
+            dof: self.model.dof as u32,
+            num_links: self.model.num_links as u32,
+            num_spheres: self.model.spheres.len() as u32,
+            num_ees: 0,
+            num_self_pairs: self.model.active_self_pairs.len() as u32,
+            has_esdf,
+            activation_distance,
+            esdf_origin,
+            esdf_inv_voxel_size: esdf_inv,
+            esdf_dims,
+            _pad: 0,
+        };
+
+        backend
+            .queue
+            .write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
+        backend
+            .queue
+            .write_buffer(&self.q_buf, 0, bytemuck::cast_slice(q_batch));
+
+        let mut encoder = backend
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("resident_collision_encoder"),
+            });
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("resident_fk_and_collision_pass"),
+                timestamp_writes: None,
+            });
+            let workgroups = (batch_size as u32).div_ceil(64);
+            cpass.set_pipeline(&backend.fk_pipeline);
+            cpass.set_bind_group(0, &self.group0, &[]);
+            cpass.dispatch_workgroups(workgroups, 1, 1);
+
+            cpass.set_pipeline(&backend.collision_pipeline);
+            cpass.set_bind_group(0, &self.group0, &[]);
+            cpass.set_bind_group(1, &self.group1, &[]);
+            cpass.dispatch_workgroups(workgroups, 1, 1);
+        }
+        backend.queue.submit(Some(encoder.finish()));
+
+        if backend.is_hardware_accelerated() {
+            let costs_byte_len = std::mem::size_of_val(out_costs) as u64;
+            self.read_via_staging(
+                backend,
+                &self.out_scalars_buf,
+                costs_byte_len,
+                bytemuck::cast_slice_mut(out_costs),
+            );
+        } else {
+            let _ = backend.device.poll(wgpu::PollType::wait_indefinitely());
+            CpuSimdBatchBackend.collision_cost_batch_f32(
+                &self.model,
+                self.esdf.as_ref(),
+                q_batch,
+                activation_distance,
+                out_costs,
+            );
+        }
+    }
+}
+
+/// Multi-seed collision-free inverse kinematics solver.
+///
+/// Evaluates `num_seeds` initial joint seeds in parallel, scores all converged IK
+/// solutions in a single [`BatchRolloutBackend::collision_cost_batch_f32`] pass,
+/// and validates exact collision freedom via [`CollisionEnvironment`].
+#[derive(Debug, Clone)]
+pub struct BatchIkSolver {
+    /// Number of parallel initial seeds to evaluate.
+    pub num_seeds: usize,
+    /// Maximum DLS iterations per seed.
+    pub max_iterations: usize,
+    /// Task-space convergence tolerance.
+    pub tolerance: f64,
+    /// Damping factor $\lambda$ for Damped Least Squares.
+    pub damping: f64,
+    /// Collision activation distance (meters) used to rank converged IK candidates.
+    pub activation_distance: f32,
+}
+
+impl Default for BatchIkSolver {
+    fn default() -> Self {
+        Self {
+            num_seeds: 32,
+            max_iterations: 80,
+            tolerance: 1e-3,
+            damping: 0.04,
+            activation_distance: 0.08,
+        }
+    }
+}
+
+impl BatchIkSolver {
+    /// Creates a new [`BatchIkSolver`] with `num_seeds` parallel seeds.
+    pub fn new(num_seeds: usize) -> Self {
+        Self {
+            num_seeds: num_seeds.max(1),
+            ..Self::default()
+        }
+    }
+
+    /// Solves multi-target 6-DOF inverse kinematics across `num_seeds` initial seeds,
+    /// returning the lowest-cost collision-free [`Configuration`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn solve_collision_free<B: BatchRolloutBackend>(
+        &self,
+        backend: &B,
+        model: &MultiRobotModel,
+        flat_model: &FlatRobotModelF32,
+        env: &CollisionEnvironment,
+        esdf: Option<&EsdfGridF32>,
+        q_seed: &[f64],
+        targets: &[ crate::robot::TaskPose ],
+    ) -> Result< crate::robot::Configuration, crate::kinematics::KinematicsError > {
+        let dof = model.dof();
+        if q_seed.len() != dof {
+            return Err(crate::kinematics::KinematicsError::InvalidConfiguration(
+                crate::robot::RobotError::WrongDof {
+                    expected: dof,
+                    actual: q_seed.len(),
+                },
+            ));
+        }
+
+        let limits = model.dof_limits();
+        let num_seeds = self.num_seeds.max(1);
+
+        // Generate deterministic quasi-random seeds (seed 0 = q_seed).
+        let seeds: Vec<Vec<f64>> = (0..num_seeds)
+            .map(|s| {
+                if s == 0 {
+                    q_seed.to_vec()
+                } else {
+                    let mut q = vec![0.0; dof];
+                    for d in 0..dof {
+                        // Golden-ratio Kronecker sequence for low-discrepancy coverage
+                        let golden = 0.5 * (1.0 + 5.0_f64.sqrt());
+                        let phi = golden * ((d + 1) as f64 * 0.754_877_666_246_692_7);
+                        let u = ((s as f64) * phi).fract();
+                        let lo = limits[d].position.min.max(-std::f64::consts::PI);
+                        let hi = limits[d].position.max.min(std::f64::consts::PI);
+                        let sample = lo + u * (hi - lo);
+                        let alpha = ((s as f64) / (num_seeds as f64)).clamp(0.25, 1.0);
+                        q[d] = ((1.0 - alpha) * q_seed[d] + alpha * sample).clamp(lo, hi);
+                    }
+                    q
+                }
+            })
+            .collect();
+
+        // Solve DLS IK in parallel across all seeds
+        let converged: Vec<Vec<f64>> = seeds
+            .into_par_iter()
+            .filter_map(|seed| {
+                let mut buf = model.create_transform_buffer();
+                model
+                    .solve_ik_dls(
+                        targets,
+                        &seed,
+                        self.max_iterations,
+                        self.tolerance,
+                        self.damping,
+                        &mut buf,
+                    )
+                    .ok()
+                    .map(|cfg| cfg.0)
+            })
+            .collect();
+
+        if converged.is_empty() {
+            return Err(crate::kinematics::KinematicsError::TargetUnreachable);
+        }
+
+        // Batch-score all converged candidates using the f32 rollout backend
+        let num_conv = converged.len();
+        let mut q_batch_f32 = Vec::with_capacity(num_conv * dof);
+        for q in &converged {
+            for &v in q {
+                q_batch_f32.push(v as f32);
+            }
+        }
+        let mut costs = vec![0.0_f32; num_conv];
+        backend.collision_cost_batch_f32(
+            flat_model,
+            esdf,
+            &q_batch_f32,
+            self.activation_distance,
+            &mut costs,
+        );
+
+        let mut indices: Vec<usize> = (0..num_conv).collect();
+        indices.sort_by(|&a, &b| {
+            let cost_cmp = costs[a].total_cmp(&costs[b]);
+            if cost_cmp != std::cmp::Ordering::Equal {
+                return cost_cmp;
+            }
+            let dist_a: f64 = converged[a]
+                .iter()
+                .zip(q_seed.iter())
+                .map(|(x, y)| (x - y).powi(2))
+                .sum();
+            let dist_b: f64 = converged[b]
+                .iter()
+                .zip(q_seed.iter())
+                .map(|(x, y)| (x - y).powi(2))
+                .sum();
+            dist_a.total_cmp(&dist_b)
+        });
+
+        let mut workspace = env.create_workspace(model);
+        for idx in indices {
+            let candidate = &converged[idx];
+            if env
+                .is_state_collision_free(
+                    model,
+                    candidate,
+                    crate::collision::GeometryTier::Convex,
+                    &mut workspace,
+                )
+                .unwrap_or(false)
+            {
+                return Ok(crate::robot::Configuration::new(candidate.clone()));
+            }
+        }
+
+        Err(crate::kinematics::KinematicsError::TargetUnreachable)
+    }
+}
+
+/// Hyperparameters for [`BatchMppiOptimizer`].
+#[derive(Debug, Clone)]
+pub struct MppiConfig {
+    /// Number of noisy trajectory rollouts $B$ evaluated per iteration.
+    pub num_rollouts: usize,
+    /// Number of discrete waypoints $H$ along the trajectory horizon (including start and goal).
+    pub horizon: usize,
+    /// Number of MPPI optimization iterations.
+    pub num_iterations: usize,
+    /// Standard deviation of joint-space exploration noise (radians / meters).
+    pub noise_std: f64,
+    /// Softmax temperature $\lambda$ controlling elite weighting selectivity.
+    pub temperature: f64,
+    /// Step size $\alpha \in (0, 1]$ for blending the weighted rollout update.
+    pub step_size: f64,
+    /// Collision activation distance (meters) for the hinge barrier cost.
+    pub activation_distance: f32,
+    /// Weight applied to batched collision + ESDF barrier cost.
+    pub collision_weight: f64,
+    /// Weight applied to first-order velocity smoothness ($\|\mathbf{q}_{t+1} - \mathbf{q}_t\|^2$).
+    pub velocity_weight: f64,
+    /// Weight applied to second-order acceleration smoothness ($\|\mathbf{q}_{t+1} - 2\mathbf{q}_t + \mathbf{q}_{t-1}\|^2$).
+    pub acceleration_weight: f64,
+}
+
+impl Default for MppiConfig {
+    fn default() -> Self {
+        Self {
+            num_rollouts: 64,
+            horizon: 20,
+            num_iterations: 25,
+            noise_std: 0.25,
+            temperature: 0.15,
+            step_size: 0.75,
+            activation_distance: 0.12,
+            collision_weight: 120.0,
+            velocity_weight: 2.5,
+            acceleration_weight: 6.0,
+        }
+    }
+}
+
+/// Batched Model Predictive Path Integral (MPPI) trajectory optimizer.
+///
+/// Evaluates $B \times H$ states per iteration in a single [`BatchRolloutBackend::collision_cost_batch_f32`]
+/// call to bend a joint-space trajectory smoothly around 3D ESDF and self-collision obstacles.
+#[derive(Debug, Clone)]
+pub struct BatchMppiOptimizer {
+    pub config: MppiConfig,
+}
+
+impl BatchMppiOptimizer {
+    /// Creates a new [`BatchMppiOptimizer`] with the given configuration.
+    pub fn new(config: MppiConfig) -> Self {
+        Self { config }
+    }
+
+    /// Optimizes a collision-avoiding trajectory of length `config.horizon` between `start` and `goal`.
+    pub fn optimize<B: BatchRolloutBackend>(
+        &self,
+        backend: &B,
+        model: &MultiRobotModel,
+        flat_model: &FlatRobotModelF32,
+        esdf: Option<&EsdfGridF32>,
+        start: &[f64],
+        goal: &[f64],
+    ) -> Vec<crate::robot::Configuration> {
+        let dof = model.dof();
+        assert_eq!(start.len(), dof, "start configuration must match model DOF");
+        assert_eq!(goal.len(), dof, "goal configuration must match model DOF");
+
+        let h = self.config.horizon.max(3);
+        let b_count = self.config.num_rollouts.max(2);
+        let limits = model.dof_limits();
+
+        // Initialize nominal trajectory via straight-line interpolation in C-space
+        let mut nominal = vec![0.0_f64; h * dof];
+        for t in 0..h {
+            let alpha = (t as f64) / ((h - 1) as f64);
+            for d in 0..dof {
+                nominal[t * dof + d] = (1.0 - alpha) * start[d] + alpha * goal[d];
+            }
+        }
+
+        let total_states = b_count * h;
+        let mut rollout_q = vec![0.0_f64; total_states * dof];
+        let mut rollout_q_f32 = vec![0.0_f32; total_states * dof];
+        let mut state_costs = vec![0.0_f32; total_states];
+        let mut rollout_costs = vec![0.0_f64; b_count];
+        let mut weights = vec![0.0_f64; b_count];
+
+        let mut rng_state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next_gaussian = || -> f64 {
+            // Marsaglia / Box-Muller using SplitMix64
+            let mut next_u = || -> f64 {
+                rng_state = rng_state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = rng_state;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^= z >> 31;
+                ((z >> 11) as f64) * (1.0 / ((1u64 << 53) as f64))
+            };
+            let u1 = next_u().max(1e-12);
+            let u2 = next_u();
+            (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+        };
+
+        for iter in 0..self.config.num_iterations {
+            // Anneal exploration noise slightly over iterations
+            let decay = 1.0 - 0.5 * ((iter as f64) / (self.config.num_iterations.max(1) as f64));
+            let sigma = self.config.noise_std * decay;
+
+            // Rollout 0 is the current nominal trajectory
+            rollout_q[0..h * dof].copy_from_slice(&nominal);
+
+            // Rollouts 1..B use smooth half-sine basis perturbations pinned to 0 at t=0 and t=H-1
+            for b in 1..b_count {
+                let base_idx = b * h * dof;
+                // Sample 3 smooth Fourier modes per joint so perturbations are naturally C^2 smooth
+                for d in 0..dof {
+                    let c1 = next_gaussian() * sigma;
+                    let c2 = next_gaussian() * (0.5 * sigma);
+                    let c3 = next_gaussian() * (0.25 * sigma);
+                    let lo = limits[d].position.min;
+                    let hi = limits[d].position.max;
+
+                    rollout_q[base_idx + d] = start[d];
+                    rollout_q[base_idx + (h - 1) * dof + d] = goal[d];
+
+                    for t in 1..(h - 1) {
+                        let s = (t as f64) / ((h - 1) as f64);
+                        let delta = c1 * (std::f64::consts::PI * s).sin()
+                            + c2 * (2.0 * std::f64::consts::PI * s).sin()
+                            + c3 * (3.0 * std::f64::consts::PI * s).sin();
+                        rollout_q[base_idx + t * dof + d] =
+                            (nominal[t * dof + d] + delta).clamp(lo, hi);
+                    }
+                }
+            }
+
+            for (dst, &src) in rollout_q_f32.iter_mut().zip(rollout_q.iter()) {
+                *dst = src as f32;
+            }
+
+            // Evaluate all B * H states in one batched f32 rollout call
+            backend.collision_cost_batch_f32(
+                flat_model,
+                esdf,
+                &rollout_q_f32,
+                self.config.activation_distance,
+                &mut state_costs,
+            );
+
+            // Aggregate per-rollout cost (collision + velocity smoothness + acceleration smoothness)
+            let mut min_cost = f64::INFINITY;
+            for (b, cost_slot) in rollout_costs.iter_mut().enumerate() {
+                let state_offset = b * h;
+                let q_offset = state_offset * dof;
+
+                let mut coll_sum = 0.0_f64;
+                for t in 0..h {
+                    coll_sum += state_costs[state_offset + t] as f64;
+                }
+
+                let mut vel_sum = 0.0_f64;
+                for t in 0..(h - 1) {
+                    let row_t = q_offset + t * dof;
+                    let row_next = row_t + dof;
+                    for d in 0..dof {
+                        let dq = rollout_q[row_next + d] - rollout_q[row_t + d];
+                        vel_sum += dq * dq;
+                    }
+                }
+
+                let mut acc_sum = 0.0_f64;
+                for t in 1..(h - 1) {
+                    let row_prev = q_offset + (t - 1) * dof;
+                    let row_t = q_offset + t * dof;
+                    let row_next = q_offset + (t + 1) * dof;
+                    for d in 0..dof {
+                        let ddq =
+                            rollout_q[row_next + d] - 2.0 * rollout_q[row_t + d] + rollout_q[row_prev + d];
+                        acc_sum += ddq * ddq;
+                    }
+                }
+
+                let total = self.config.collision_weight * coll_sum
+                    + self.config.velocity_weight * vel_sum
+                    + self.config.acceleration_weight * acc_sum;
+                *cost_slot = total;
+                if total < min_cost {
+                    min_cost = total;
+                }
+            }
+
+            // Softmax importance weights
+            let temp = self.config.temperature.max(1e-6);
+            let mut weight_sum = 0.0_f64;
+            for b in 0..b_count {
+                let w = (-(rollout_costs[b] - min_cost) / temp).exp();
+                weights[b] = w;
+                weight_sum += w;
+            }
+            if weight_sum > 0.0 {
+                for w in &mut weights {
+                    *w /= weight_sum;
+                }
+            }
+
+            // Update nominal interior waypoints
+            let step = self.config.step_size.clamp(0.05, 1.0);
+            for t in 1..(h - 1) {
+                for d in 0..dof {
+                    let mut weighted_q = 0.0_f64;
+                    for (b, &w) in weights.iter().enumerate() {
+                        weighted_q += w * rollout_q[(b * h + t) * dof + d];
+                    }
+                    let lo = limits[d].position.min;
+                    let hi = limits[d].position.max;
+                    nominal[t * dof + d] =
+                        ((1.0 - step) * nominal[t * dof + d] + step * weighted_q).clamp(lo, hi);
+                }
+            }
+        }
+
+        (0..h)
+            .map(|t| crate::robot::Configuration::from_slice(&nominal[t * dof..(t + 1) * dof]))
+            .collect()
+    }
+}
+

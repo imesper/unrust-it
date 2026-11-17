@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/unrust-it"]
+members = ["crates/unrust-it", "crates/unrust-it-urdf"]
 resolver = "2"
 
 [workspace.package]
@@ -17,7 +17,9 @@ nalgebra = "0.34"
 parry3d = { package = "parry3d-f64", version = "0.26", features = ["simd-stable", "parallel"] }
 pollster = "1.0"
 rayon = "1.10"
+roxmltree = "0.21"
 smallvec = "1.16"
 thiserror = "2"
+unrust-it = { path = "crates/unrust-it" }
 wgpu = { version = "30", default-features = false, features = ["std", "wgsl", "metal", "vulkan", "dx12", "gles", "noop"] }
 wide = "0.7"

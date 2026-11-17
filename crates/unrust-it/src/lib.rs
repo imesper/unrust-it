@@ -16,11 +16,12 @@ pub mod robot;
 pub mod trajectory;
 
 pub use batch::{
-    BatchRolloutBackend, CpuSimdBatchBackend, EsdfGridF32, FlatEndEffectorF32, FlatJointF32,
-    FlatLinkSphereF32, FlatRobotModelF32, FlatSpherePairF32, RolloutUniformsF32,
+    BatchIkSolver, BatchMppiOptimizer, BatchRolloutBackend, CpuSimdBatchBackend, EsdfGridF32,
+    FlatEndEffectorF32, FlatJointF32, FlatLinkSphereF32, FlatRobotModelF32, FlatSpherePairF32,
+    MppiConfig, RolloutUniformsF32,
 };
 #[cfg(feature = "gpu")]
-pub use batch::WgpuBatchBackend;
+pub use batch::{GpuRobotContext, WgpuBatchBackend};
 pub use collision::{
     AllowedCollisionMatrix, BoundingSphere, CollidingPair, CollisionChecker, CollisionEnvironment,
     CollisionError, CollisionRule, CollisionWorkspace, GeometryTier, LinkCapsule, LinkGeometry,
@@ -557,6 +558,151 @@ mod tests {
             for (&cpu_c, &gpu_c) in costs.iter().zip(gpu_costs.iter()) {
                 assert_relative_eq!(cpu_c, gpu_c, epsilon = 1e-4);
             }
+
+            // Verify persistent GPU resident buffers (zero per-step allocations) + update_esdf
+            let mut gpu_ctx = GpuRobotContext::new(
+                &gpu_backend,
+                flat_model.clone(),
+                Some(esdf.clone()),
+                batch_size,
+            );
+            let mut res_spheres = vec![[0.0_f32; 4]; batch_size * num_spheres];
+            let mut res_ees = vec![[0.0_f32; 7]; batch_size * num_ees];
+            let mut res_costs = vec![0.0_f32; batch_size];
+
+            gpu_ctx.forward_kinematics_resident(
+                &gpu_backend,
+                &q_batch_f32,
+                &mut res_spheres,
+                &mut res_ees,
+            );
+            gpu_ctx.collision_cost_resident(&gpu_backend, &q_batch_f32, 0.15, &mut res_costs);
+
+            for (&cpu_c, &res_c) in costs.iter().zip(res_costs.iter()) {
+                assert_relative_eq!(cpu_c, res_c, epsilon = 1e-4);
+            }
+
+            let mut updated_esdf = esdf.clone();
+            updated_esdf.add_sphere_obstacle([0.0, -0.35, 0.5], 0.2);
+            gpu_ctx.update_esdf(&gpu_backend, updated_esdf);
+            gpu_ctx.collision_cost_resident(&gpu_backend, &q_batch_f32, 0.15, &mut res_costs);
+            assert!(res_costs.iter().any(|&c| c > 0.0));
         }
+    }
+
+    #[test]
+    fn batch_ik_and_mppi_optimizer_avoid_obstacles() {
+        let (model, left_arm, right_arm, _) = build_dual_arm_model();
+        let mut env = CollisionEnvironment::new();
+        env.set_acm(AllowedCollisionMatrix::from_model(&model));
+        for link in model.links() {
+            env.set_link_geometry(
+                link.id,
+                LinkGeometry::from_capsule(
+                    Point3::origin(),
+                    Point3::new(0.0, 0.0, 0.3),
+                    link.bounding_radius,
+                ),
+            );
+        }
+
+        // Place an obstacle along the straight-line trajectory at q_mid = [0.0, 0.5, 0.0, 0.0, 0.0, 0.0]
+        let mut buf = model.create_transform_buffer();
+        let q_mid = [0.0, 0.5, 0.0, 0.0, 0.0, 0.0];
+        model.forward_kinematics(&q_mid, &mut buf).unwrap();
+        let obs_pos = buf.frame_pose(left_arm.end_effectors[0]).translation.vector;
+        env.add_obstacle(
+            SharedShape::new(Ball::new(0.14)),
+            Isometry3::from(Translation3::from(obs_pos)),
+        );
+
+        let mut esdf = EsdfGridF32::new([-1.2, -1.2, -0.5], 0.04, [60, 60, 50], 1.0);
+        esdf.add_sphere_obstacle(
+            [obs_pos.x as f32, obs_pos.y as f32, obs_pos.z as f32],
+            0.14,
+        );
+
+        let flat_model = FlatRobotModelF32::compile(&model, &env);
+        let backend = CpuSimdBatchBackend;
+
+        // 1. Multi-seed collision-free IK
+        let q_goal_ref = [0.25, -0.35, 0.45, -0.25, 0.35, -0.45];
+        model.forward_kinematics(&q_goal_ref, &mut buf).unwrap();
+        let left_target = TaskPose::new(
+            left_arm.end_effectors[0],
+            *buf.frame_pose(left_arm.end_effectors[0]),
+        );
+        let right_target = TaskPose::new(
+            right_arm.end_effectors[0],
+            *buf.frame_pose(right_arm.end_effectors[0]),
+        );
+
+        let ik_solver = BatchIkSolver::new(24);
+        let q_sol = ik_solver
+            .solve_collision_free(
+                &backend,
+                &model,
+                &flat_model,
+                &env,
+                Some(&esdf),
+                &[0.0; 6],
+                &[left_target, right_target],
+            )
+            .expect("BatchIkSolver should find a collision-free solution");
+
+        let mut ws = env.create_workspace(&model);
+        assert!(env
+            .is_state_collision_free(&model, q_sol.as_slice(), GeometryTier::Convex, &mut ws)
+            .unwrap());
+
+        // 2. Batched MPPI trajectory optimization around the obstacle
+        let start = [0.0, -0.2, 0.0, 0.0, 0.0, 0.0];
+        let goal = [0.0, 1.1, 0.0, 0.0, 0.0, 0.0];
+
+        // Evaluate straight-line initial collision cost vs MPPI-optimized collision cost
+        let h = 16;
+        let mppi = BatchMppiOptimizer::new(MppiConfig {
+            num_rollouts: 64,
+            horizon: h,
+            num_iterations: 30,
+            noise_std: 0.35,
+            temperature: 0.12,
+            step_size: 0.8,
+            activation_distance: 0.14,
+            collision_weight: 200.0,
+            velocity_weight: 2.0,
+            acceleration_weight: 4.0,
+        });
+
+        let mut init_batch = Vec::with_capacity(h * 6);
+        for t in 0..h {
+            let a = (t as f64) / ((h - 1) as f64);
+            for d in 0..6 {
+                init_batch.push(((1.0 - a) * start[d] + a * goal[d]) as f32);
+            }
+        }
+        let mut init_costs = vec![0.0_f32; h];
+        backend.collision_cost_batch_f32(&flat_model, Some(&esdf), &init_batch, 0.14, &mut init_costs);
+        let init_total_coll: f32 = init_costs.iter().sum();
+        assert!(init_total_coll > 0.0, "straight line should intersect obstacle activation zone");
+
+        let opt_traj = mppi.optimize(&backend, &model, &flat_model, Some(&esdf), &start, &goal);
+        assert_eq!(opt_traj.len(), h);
+        assert_eq!(opt_traj.first().unwrap().as_slice(), &start);
+        assert_eq!(opt_traj.last().unwrap().as_slice(), &goal);
+
+        let mut opt_batch = Vec::with_capacity(h * 6);
+        for cfg in &opt_traj {
+            for &v in cfg.as_slice() {
+                opt_batch.push(v as f32);
+            }
+        }
+        let mut opt_costs = vec![0.0_f32; h];
+        backend.collision_cost_batch_f32(&flat_model, Some(&esdf), &opt_batch, 0.14, &mut opt_costs);
+        let opt_total_coll: f32 = opt_costs.iter().sum();
+        assert!(
+            opt_total_coll < init_total_coll * 0.25,
+            "MPPI should substantially reduce collision cost (init={init_total_coll}, opt={opt_total_coll})"
+        );
     }
 }
