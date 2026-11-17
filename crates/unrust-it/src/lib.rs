@@ -6,6 +6,7 @@
 //! to support both multi-threaded global motion planning and zero-allocation
 //! real-time reactive collision avoidance.
 
+pub mod batch;
 pub mod collision;
 pub mod control;
 pub mod kinematics;
@@ -14,6 +15,10 @@ pub mod planner;
 pub mod robot;
 pub mod trajectory;
 
+pub use batch::{
+    BatchRolloutBackend, CpuSimdBatchBackend, EsdfGridF32, FlatJointF32, FlatLinkSphereF32,
+    FlatRobotModelF32, FlatSpherePairF32,
+};
 pub use collision::{
     AllowedCollisionMatrix, BoundingSphere, CollidingPair, CollisionChecker, CollisionEnvironment,
     CollisionError, CollisionRule, CollisionWorkspace, GeometryTier, LinkCapsule, LinkGeometry,
@@ -439,5 +444,86 @@ mod tests {
             )
             .unwrap();
         assert!(dq_cmd.iter().any(|&v| v.abs() > 1e-4));
+    }
+
+    #[test]
+    fn batch_f32_fk_and_esdf_rollout_match_f64_reference() {
+        let (model, left_arm, right_arm, _) = build_dual_arm_model();
+        let mut env = CollisionEnvironment::new();
+        env.set_acm(AllowedCollisionMatrix::from_model(&model));
+        for link in model.links() {
+            env.set_link_geometry(
+                link.id,
+                LinkGeometry::from_capsule(
+                    Point3::origin(),
+                    Point3::new(0.0, 0.0, 0.3),
+                    link.bounding_radius,
+                ),
+            );
+        }
+
+        let flat_model = FlatRobotModelF32::compile(&model, &env);
+        assert_eq!(flat_model.dof, 6);
+        assert_eq!(flat_model.num_links, 6);
+        assert!(!flat_model.spheres.is_empty());
+        assert!(!flat_model.active_self_pairs.is_empty());
+
+        // Evaluate a B x H = 16 x 16 = 256 rollout batch
+        let batch_size = 256;
+        let dof = flat_model.dof;
+        let mut q_batch_f32 = vec![0.0_f32; batch_size * dof];
+        for b in 0..batch_size {
+            let phase = b as f32 * 0.03;
+            for d in 0..dof {
+                q_batch_f32[b * dof + d] = (phase + d as f32 * 0.4).sin() * 0.8;
+            }
+        }
+
+        let backend = CpuSimdBatchBackend;
+        let num_spheres = flat_model.spheres.len();
+        let num_ees = flat_model.end_effectors.len();
+        let mut out_spheres = vec![[0.0_f32; 4]; batch_size * num_spheres];
+        let mut out_ees = vec![[0.0_f32; 7]; batch_size * num_ees];
+
+        backend.forward_kinematics_batch_f32(
+            &flat_model,
+            &q_batch_f32,
+            &mut out_spheres,
+            &mut out_ees,
+        );
+
+        // Verify batched f32x8 SIMD poses match f64 MultiRobotModel::forward_kinematics
+        let mut buf = model.create_transform_buffer();
+        for b in [0, 1, 7, 8, 63, 128, 255] {
+            let q_f64: Vec<f64> = q_batch_f32[b * dof..(b + 1) * dof]
+                .iter()
+                .map(|&v| v as f64)
+                .collect();
+            model.forward_kinematics(&q_f64, &mut buf).unwrap();
+
+            let left_f64 = buf.frame_pose(left_arm.end_effectors[0]);
+            let right_f64 = buf.frame_pose(right_arm.end_effectors[0]);
+            let left_f32 = batch::pose_f32_to_isometry(&out_ees[b * num_ees]);
+            let right_f32 = batch::pose_f32_to_isometry(&out_ees[b * num_ees + 1]);
+
+            assert_relative_eq!(
+                left_f64.translation.vector,
+                left_f32.translation.vector,
+                epsilon = 1e-5
+            );
+            assert_relative_eq!(
+                right_f64.translation.vector,
+                right_f32.translation.vector,
+                epsilon = 1e-5
+            );
+        }
+
+        // Carve an obstacle into a 3D ESDF voxel grid and evaluate batched rollout costs
+        let mut esdf = EsdfGridF32::new([-1.0, -1.0, -0.5], 0.04, [50, 50, 50], 1.0);
+        esdf.add_sphere_obstacle([0.3, 0.35, 0.5], 0.25);
+
+        let mut costs = vec![0.0_f32; batch_size];
+        backend.collision_cost_batch_f32(&flat_model, Some(&esdf), &q_batch_f32, 0.15, &mut costs);
+        assert!(costs.iter().any(|&c| c > 0.0));
     }
 }
