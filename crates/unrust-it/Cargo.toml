@@ -8,7 +8,14 @@ repository.workspace = true
 readme = "../../README.md"
 
 [dependencies]
+glamx.workspace = true
 log.workspace = true
 nalgebra.workspace = true
 parry3d.workspace = true
+rayon.workspace = true
+smallvec.workspace = true
 thiserror.workspace = true
+wide.workspace = true
+
+[dev-dependencies]
+approx.workspace = true
