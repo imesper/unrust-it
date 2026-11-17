@@ -1,0 +1,13 @@
+[package]
+name = "unrust-it-visualizer"
+description = "Interactive 3D multi-arm trajectory, collision sphere, signed-distance witness, and MPPI rollout visualizer for unrust-it"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+nalgebra.workspace = true
+parry3d.workspace = true
+unrust-it.workspace = true
+unrust-it-urdf = { path = "../../crates/unrust-it-urdf" }

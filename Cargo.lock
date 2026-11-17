@@ -1253,6 +1253,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "unrust-it-visualizer"
+version = "0.1.0"
+dependencies = [
+ "nalgebra",
+ "parry3d-f64",
+ "unrust-it",
+ "unrust-it-urdf",
+]
+
+[[package]]
 name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

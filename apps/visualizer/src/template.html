@@ -1,0 +1,548 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>unrust-it 3D Multi-Arm Visualizer</title>
+  <script src="https://www.gstatic.com/antigravity/web/dev/tailwindcss.min.js"></script>
+</head>
+<body class="bg-transparent text-[var(--foreground)] antialiased p-0 m-0 select-none">
+  <div class="py-1.5 space-y-2">
+    <!-- Top Control Bar -->
+    <div class="flex flex-wrap items-center justify-between gap-2 pb-1.5 border-b border-[var(--card-border)] text-xs">
+      <div class="flex items-center gap-1.5">
+        <span class="font-semibold tracking-tight text-[var(--foreground)]">unrust-it 3D</span>
+        <select id="scenarioSelect" class="bg-[var(--card)] text-[var(--foreground)] border border-[var(--card-border)] rounded px-2 py-0.5 text-xs focus:outline-none">
+          <option value="0">1. RRT-Connect + TOPP-RA</option>
+          <option value="1">2. Batched MPPI + 3D ESDF (64x24)</option>
+          <option value="2">3. Closed-Chain + 1 kHz CBF Servo</option>
+          <option value="3">4. Interactive FK &amp; Witness Sandbox</option>
+        </select>
+      </div>
+
+      <div class="flex items-center gap-2.5 text-xs text-[var(--muted-foreground)]">
+        <label class="flex items-center gap-1 cursor-pointer">
+          <input id="chkSpheres" type="checkbox" checked class="accent-[var(--primary)]" />
+          <span>Spheres (SoA)</span>
+        </label>
+        <label class="flex items-center gap-1 cursor-pointer">
+          <input id="chkWitness" type="checkbox" checked class="accent-[var(--primary)]" />
+          <span>Witnesses</span>
+        </label>
+        <label class="flex items-center gap-1 cursor-pointer">
+          <input id="chkTrails" type="checkbox" checked class="accent-[var(--primary)]" />
+          <span>Rollouts/Trails</span>
+        </label>
+      </div>
+    </div>
+
+    <!-- Main 3D Viewport + Side Telemetry Column -->
+    <div class="grid grid-cols-12 gap-2 items-stretch">
+      <div class="col-span-8 relative rounded border border-[var(--card-border)] bg-[var(--card)] overflow-hidden" style="height: 290px;">
+        <canvas id="viewport3d" class="w-full h-full block cursor-grab active:cursor-grabbing"></canvas>
+        <div id="subtitleOverlay" class="absolute top-1.5 left-2 right-2 flex items-center justify-between pointer-events-none text-xs">
+          <span id="scenarioSubtitle" class="px-1.5 py-0.5 rounded bg-[var(--background)]/80 text-[var(--muted-foreground)] border border-[var(--card-border)] truncate"></span>
+          <span class="px-1.5 py-0.5 rounded bg-[var(--background)]/80 text-[var(--muted-foreground)] border border-[var(--card-border)] font-mono">Drag: Orbit · Wheel: Zoom</span>
+        </div>
+      </div>
+
+      <!-- Right Column: Live Telemetry + Sparkline / Interactive Sliders -->
+      <div class="col-span-4 flex flex-col justify-between rounded border border-[var(--card-border)] bg-[var(--card)] p-2 text-xs" style="height: 290px;">
+        <div class="space-y-1.5">
+          <div class="flex items-center justify-between border-b border-[var(--card-border)] pb-1">
+            <span class="text-[var(--muted-foreground)] font-medium">Live Telemetry</span>
+            <span id="timeReadout" class="font-mono tabular-nums text-[var(--foreground)]">t = 0.00s</span>
+          </div>
+
+          <div class="grid grid-cols-2 gap-1.5 font-mono">
+            <div class="p-1.5 rounded border border-[var(--card-border)] bg-[var(--background)]">
+              <div class="text-[var(--muted-foreground)]">Min Clearance</div>
+              <div id="clrReadout" class="font-semibold tabular-nums text-[var(--foreground)]">0.000 m</div>
+            </div>
+            <div class="p-1.5 rounded border border-[var(--card-border)] bg-[var(--background)]">
+              <div id="auxLabel" class="text-[var(--muted-foreground)]">Max |dq/dt|</div>
+              <div id="auxReadout" class="font-semibold tabular-nums text-[var(--foreground)]">0.00 rad/s</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Clearance Sparkline (Scenarios 0-2) or Joint Sliders (Scenario 3) -->
+        <div id="sparklinePanel" class="space-y-1 my-1">
+          <div class="flex items-center justify-between text-xs text-[var(--muted-foreground)]">
+            <span>Signed Distance Profile d_min(t)</span>
+            <span class="font-mono">margin: 0.04m</span>
+          </div>
+          <canvas id="sparkCanvas" class="w-full rounded border border-[var(--card-border)] bg-[var(--background)] block" style="height: 82px;"></canvas>
+        </div>
+
+        <div id="sandboxPanel" class="hidden space-y-1 my-0.5 overflow-y-auto">
+          <div class="text-[var(--muted-foreground)] font-medium">Interactive Joint &amp; Obstacle Control</div>
+          <label class="flex items-center justify-between gap-1">
+            <span class="font-mono">L j1/j2</span>
+            <input id="slL1" type="range" min="-1.6" max="1.6" step="0.02" value="-0.2" class="w-16 accent-[var(--primary)]" />
+            <input id="slL2" type="range" min="-1.2" max="1.4" step="0.02" value="0.6" class="w-16 accent-[var(--primary)]" />
+          </label>
+          <label class="flex items-center justify-between gap-1">
+            <span class="font-mono">R j1/j2</span>
+            <input id="slR1" type="range" min="-1.6" max="1.6" step="0.02" value="0.2" class="w-16 accent-[var(--primary)]" />
+            <input id="slR2" type="range" min="-1.2" max="1.4" step="0.02" value="0.6" class="w-16 accent-[var(--primary)]" />
+          </label>
+          <label class="flex items-center justify-between gap-1">
+            <span class="font-mono">Obs Y/Z</span>
+            <input id="slOy" type="range" min="-0.45" max="0.45" step="0.01" value="0.0" class="w-16 accent-[var(--primary)]" />
+            <input id="slOz" type="range" min="0.25" max="0.85" step="0.01" value="0.55" class="w-16 accent-[var(--primary)]" />
+          </label>
+        </div>
+
+        <!-- Legend & Active Joint Angles -->
+        <div class="space-y-1 pt-1 border-t border-[var(--card-border)]">
+          <div id="jointReadout" class="font-mono tabular-nums text-[var(--muted-foreground)] truncate">qL: [0.00, 0.00, 0.00, 0.00]</div>
+          <div class="flex items-center justify-between text-[var(--muted-foreground)]">
+            <span class="flex items-center gap-1"><span class="inline-block w-2 h-2 rounded-full" style="background:#38bdf8"></span>Left Arm</span>
+            <span class="flex items-center gap-1"><span class="inline-block w-2 h-2 rounded-full" style="background:#a78bfa"></span>Right Arm</span>
+            <span class="flex items-center gap-1"><span class="inline-block w-2 h-2 rounded-full" style="background:#f97316"></span>Obstacle</span>
+            <span class="flex items-center gap-1"><span class="inline-block w-2 h-2 rounded-full" style="background:#f43f5e"></span>Witness</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Bottom Playback Timeline Scrubber -->
+    <div class="flex items-center gap-3 pt-1 border-t border-[var(--card-border)] text-xs">
+      <button id="btnPlay" class="px-2.5 py-0.5 rounded bg-[var(--primary)] text-[var(--primary-foreground)] font-medium cursor-pointer">Pause</button>
+      <input id="frameSlider" type="range" min="0" max="49" value="0" class="flex-1 accent-[var(--primary)] cursor-pointer" />
+      <span id="frameCounter" class="font-mono tabular-nums text-[var(--muted-foreground)] w-16 text-right">1 / 50</span>
+    </div>
+  </div>
+
+  <script>
+    const SCENARIOS = __UNRUST_SCENARIOS_JSON__;
+
+    let activeScenarioIdx = 1; // Default to Batched MPPI + 3D ESDF showcase
+    let frameIdx = 0;
+    let isPlaying = true;
+    let lastTick = performance.now();
+
+    // 3D Orbit Camera State
+    let camYaw = -0.68;
+    let camPitch = 0.42;
+    let camDist = 1.95;
+    let camTarget = [0.18, 0.0, 0.42];
+    let isDragging = false;
+    let lastMouse = [0, 0];
+
+    const canvas3d = document.getElementById('viewport3d');
+    const ctx3d = canvas3d.getContext('2d');
+    const sparkCanvas = document.getElementById('sparkCanvas');
+    const ctxSpark = sparkCanvas.getContext('2d');
+
+    const scenarioSelect = document.getElementById('scenarioSelect');
+    const chkSpheres = document.getElementById('chkSpheres');
+    const chkWitness = document.getElementById('chkWitness');
+    const chkTrails = document.getElementById('chkTrails');
+    const btnPlay = document.getElementById('btnPlay');
+    const frameSlider = document.getElementById('frameSlider');
+    const frameCounter = document.getElementById('frameCounter');
+    const scenarioSubtitle = document.getElementById('scenarioSubtitle');
+    const timeReadout = document.getElementById('timeReadout');
+    const clrReadout = document.getElementById('clrReadout');
+    const auxLabel = document.getElementById('auxLabel');
+    const auxReadout = document.getElementById('auxReadout');
+    const jointReadout = document.getElementById('jointReadout');
+    const sparklinePanel = document.getElementById('sparklinePanel');
+    const sandboxPanel = document.getElementById('sandboxPanel');
+
+    scenarioSelect.value = String(activeScenarioIdx);
+
+    // Client-side forward kinematics & witness evaluator for Interactive Sandbox mode (mode 3)
+    function computeSandboxFrame() {
+      const l1 = parseFloat(document.getElementById('slL1').value);
+      const l2 = parseFloat(document.getElementById('slL2').value);
+      const r1 = parseFloat(document.getElementById('slR1').value);
+      const r2 = parseFloat(document.getElementById('slR2').value);
+      const oy = parseFloat(document.getElementById('slOy').value);
+      const oz = parseFloat(document.getElementById('slOz').value);
+
+      function buildChain(baseY, j1, j2, j3, j4, robotId) {
+        const c1 = Math.cos(j1), s1 = Math.sin(j1);
+        const pts = [[0, baseY, 0], [0, baseY, 0.10], [0, baseY, 0.28]];
+        const lens = [0.32, 0.28, 0.16];
+        const rads = [0.048, 0.042, 0.035];
+        const angles = [j2, j2 + j3, j2 + j3 + j4];
+        let cur = [0, baseY, 0.28];
+        const spheres = [[0, baseY, 0.05, 0.06, robotId], [0, baseY, 0.19, 0.055, robotId]];
+        for (let i = 0; i < 3; i++) {
+          const sp = Math.sin(angles[i]), cp = Math.cos(angles[i]);
+          const dx = lens[i] * sp * c1;
+          const dy = lens[i] * sp * s1;
+          const dz = lens[i] * cp;
+          const next = [cur[0] + dx, cur[1] + dy, cur[2] + dz];
+          for (let k = 1; k <= 3; k++) {
+            const a = k / 3;
+            spheres.push([
+              cur[0] + dx * a,
+              cur[1] + dy * a,
+              cur[2] + dz * a,
+              rads[i],
+              robotId
+            ]);
+          }
+          pts.push(next);
+          cur = next;
+        }
+        return { pts, spheres };
+      }
+
+      const left = buildChain(0.36, l1, l2, 0.65, 0.15, 0);
+      const right = buildChain(-0.36, r1, r2, 0.65, 0.15, 1);
+      const allSpheres = left.spheres.concat(right.spheres);
+      const obs = [[0.38, oy, oz, 0.13]];
+
+      // Compute closest sphere-to-obstacle and inter-arm witnesses
+      const witnesses = [];
+      let minClr = 99.0;
+      for (const s of allSpheres) {
+        const o = obs[0];
+        const dx = s[0] - o[0], dy = s[1] - o[1], dz = s[2] - o[2];
+        const centerDist = Math.hypot(dx, dy, dz) || 1e-6;
+        const sd = centerDist - (s[3] + o[3]);
+        if (sd < minClr) minClr = sd;
+        const nx = dx / centerDist, ny = dy / centerDist, nz = dz / centerDist;
+        witnesses.push([
+          [s[0] - nx * s[3], s[1] - ny * s[3], s[2] - nz * s[3]],
+          [o[0] + nx * o[3], o[1] + ny * o[3], o[2] + nz * o[3]],
+          sd,
+          0
+        ]);
+      }
+      for (const sl of left.spheres) {
+        for (const sr of right.spheres) {
+          const dx = sl[0] - sr[0], dy = sl[1] - sr[1], dz = sl[2] - sr[2];
+          const centerDist = Math.hypot(dx, dy, dz) || 1e-6;
+          const sd = centerDist - (sl[3] + sr[3]);
+          if (sd < minClr) minClr = sd;
+          const nx = dx / centerDist, ny = dy / centerDist, nz = dz / centerDist;
+          witnesses.push([
+            [sl[0] - nx * sl[3], sl[1] - ny * sl[3], sl[2] - nz * sl[3]],
+            [sr[0] + nx * sr[3], sr[1] + ny * sr[3], sr[2] + nz * sr[3]],
+            sd,
+            1
+          ]);
+        }
+      }
+      witnesses.sort((a, b) => a[2] - b[2]);
+
+      return {
+        t: 0.0,
+        clr: minClr,
+        err: 0.0,
+        q: [l1, l2, 0.65, 0.15, r1, r2, 0.65, 0.15],
+        qd: [0, 0, 0, 0, 0, 0, 0, 0],
+        lc: left.pts,
+        rc: right.pts,
+        sp: allSpheres,
+        obs,
+        wit: witnesses.slice(0, 4)
+      };
+    }
+
+    function projectPoint(pt, width, height) {
+      const cy = Math.cos(camYaw), sy = Math.sin(camYaw);
+      const cp = Math.cos(camPitch), sp = Math.sin(camPitch);
+
+      // Camera position in world (Z-up right-handed robotics frame)
+      const camX = camTarget[0] - camDist * cp * cy;
+      const camY = camTarget[1] - camDist * cp * sy;
+      const camZ = camTarget[2] + camDist * sp;
+
+      // Forward vector from camera to target
+      const fx = cp * cy, fy = cp * sy, fz = -sp;
+      // Right vector = normalize(f x [0,0,1])
+      const rx = fy, ry = -fx, rz = 0;
+      // Up vector = r x f
+      const ux = -rx * fz, uy = -ry * fz, uz = rx * fy - ry * fx;
+
+      const dx = pt[0] - camX, dy = pt[1] - camY, dz = pt[2] - camZ;
+      const vx = dx * rx + dy * ry + dz * rz;
+      const vy = dx * ux + dy * uy + dz * uz;
+      const vz = dx * fx + dy * fy + dz * fz;
+
+      if (vz <= 0.08) return null;
+      const fovScale = Math.min(width, height) * 1.15;
+      return {
+        x: width * 0.5 + (vx / vz) * fovScale,
+        y: height * 0.54 - (vy / vz) * fovScale,
+        depth: vz,
+        scale: fovScale / vz
+      };
+    }
+
+    function drawLine3D(a, b, color, width, dash = []) {
+      const pa = projectPoint(a, canvas3d.width, canvas3d.height);
+      const pb = projectPoint(b, canvas3d.width, canvas3d.height);
+      if (!pa || !pb) return;
+      ctx3d.save();
+      ctx3d.beginPath();
+      ctx3d.setLineDash(dash);
+      ctx3d.strokeStyle = color;
+      ctx3d.lineWidth = width;
+      ctx3d.lineCap = 'round';
+      ctx3d.moveTo(pa.x, pa.y);
+      ctx3d.lineTo(pb.x, pb.y);
+      ctx3d.stroke();
+      ctx3d.restore();
+    }
+
+    function drawSparkline(sc, currentFrameIdx) {
+      const w = sparkCanvas.width = sparkCanvas.clientWidth * window.devicePixelRatio;
+      const h = sparkCanvas.height = sparkCanvas.clientHeight * window.devicePixelRatio;
+      ctxSpark.clearRect(0, 0, w, h);
+
+      const isLight = document.documentElement.classList.contains('light');
+      const gridColor = isLight ? 'rgba(0,0,0,0.08)' : 'rgba(255,255,255,0.08)';
+      const frames = sc.frames;
+      if (!frames.length) return;
+
+      const maxClr = 0.35;
+      const minClr = -0.05;
+      const yOf = (v) => h - ((Math.max(minClr, Math.min(maxClr, v)) - minClr) / (maxClr - minClr)) * (h - 12) - 6;
+
+      // Safety margin threshold line (0.04m)
+      const ySafe = yOf(0.04);
+      ctxSpark.strokeStyle = 'rgba(244,63,94,0.45)';
+      ctxSpark.setLineDash([4, 4]);
+      ctxSpark.beginPath();
+      ctxSpark.moveTo(0, ySafe);
+      ctxSpark.lineTo(w, ySafe);
+      ctxSpark.stroke();
+      ctxSpark.setLineDash([]);
+
+      // Curve
+      ctxSpark.strokeStyle = '#38bdf8';
+      ctxSpark.lineWidth = 2 * window.devicePixelRatio;
+      ctxSpark.beginPath();
+      frames.forEach((f, idx) => {
+        const x = (idx / Math.max(1, frames.length - 1)) * (w - 12) + 6;
+        const y = yOf(f.clr);
+        if (idx === 0) ctxSpark.moveTo(x, y);
+        else ctxSpark.lineTo(x, y);
+      });
+      ctxSpark.stroke();
+
+      // Current frame playhead dot
+      const cx = (currentFrameIdx / Math.max(1, frames.length - 1)) * (w - 12) + 6;
+      const cy = yOf(frames[currentFrameIdx].clr);
+      ctxSpark.fillStyle = '#f97316';
+      ctxSpark.beginPath();
+      ctxSpark.arc(cx, cy, 4 * window.devicePixelRatio, 0, Math.PI * 2);
+      ctxSpark.fill();
+      ctxSpark.strokeStyle = gridColor;
+    }
+
+    function render() {
+      const dpr = window.devicePixelRatio || 1;
+      const w = canvas3d.width = canvas3d.clientWidth * dpr;
+      const h = canvas3d.height = canvas3d.clientHeight * dpr;
+      ctx3d.clearRect(0, 0, w, h);
+
+      const isLight = document.documentElement.classList.contains('light');
+      const gridColor = isLight ? 'rgba(100,116,139,0.22)' : 'rgba(148,163,184,0.16)';
+
+      // 1. Floor Grid (z = 0)
+      for (let g = -0.8; g <= 0.801; g += 0.2) {
+        drawLine3D([g, -0.8, 0], [g, 0.8, 0], gridColor, 1 * dpr);
+        drawLine3D([-0.8, g, 0], [0.8, g, 0], gridColor, 1 * dpr);
+      }
+      // World coordinate triad
+      drawLine3D([0, 0, 0], [0.22, 0, 0], '#ef4444', 2 * dpr);
+      drawLine3D([0, 0, 0], [0, 0.22, 0], '#22c55e', 2 * dpr);
+      drawLine3D([0, 0, 0], [0, 0, 0.22], '#3b82f6', 2 * dpr);
+
+      const isSandbox = activeScenarioIdx === 3;
+      const sc = isSandbox ? null : SCENARIOS[activeScenarioIdx];
+      const frame = isSandbox ? computeSandboxFrame() : sc.frames[frameIdx];
+
+      // 2. Draw Rollout Ribbons & TCP Trajectory Trails
+      if (chkTrails.checked && !isSandbox) {
+        for (const rib of sc.rollouts) {
+          for (let i = 0; i < rib.length - 1; i++) {
+            drawLine3D(rib[i], rib[i + 1], 'rgba(56,189,248,0.20)', 1.2 * dpr);
+          }
+        }
+        for (let i = 0; i < sc.frames.length - 1; i++) {
+          const fa = sc.frames[i], fb = sc.frames[i + 1];
+          drawLine3D(fa.lc[fa.lc.length - 1], fb.lc[fb.lc.length - 1], 'rgba(56,189,248,0.65)', 2.0 * dpr);
+          drawLine3D(fa.rc[fa.rc.length - 1], fb.rc[fb.rc.length - 1], 'rgba(167,139,250,0.65)', 2.0 * dpr);
+        }
+      }
+
+      // 3. Collect depth-sorted 3D primitives (Obstacles + Tier-1 Spheres)
+      const drawables = [];
+      for (const o of frame.obs) {
+        const p = projectPoint([o[0], o[1], o[2]], w, h);
+        if (p) drawables.push({ type: 'obs', p, r: o[3] * p.scale });
+      }
+      if (chkSpheres.checked) {
+        for (const s of frame.sp) {
+          const p = projectPoint([s[0], s[1], s[2]], w, h);
+          if (p) drawables.push({ type: 'sp', p, r: s[3] * p.scale, robot: s[4] });
+        }
+      }
+      drawables.sort((a, b) => b.p.depth - a.p.depth);
+
+      for (const d of drawables) {
+        ctx3d.beginPath();
+        ctx3d.arc(d.p.x, d.p.y, Math.max(2, d.r), 0, Math.PI * 2);
+        if (d.type === 'obs') {
+          const grad = ctx3d.createRadialGradient(
+            d.p.x - d.r * 0.3, d.p.y - d.r * 0.3, d.r * 0.1,
+            d.p.x, d.p.y, d.r
+          );
+          grad.addColorStop(0, 'rgba(251,146,60,0.85)');
+          grad.addColorStop(1, 'rgba(194,65,12,0.55)');
+          ctx3d.fillStyle = grad;
+          ctx3d.fill();
+          ctx3d.strokeStyle = 'rgba(251,146,60,0.95)';
+          ctx3d.lineWidth = 1.5 * dpr;
+          ctx3d.stroke();
+        } else {
+          ctx3d.fillStyle = d.robot === 0 ? 'rgba(56,189,248,0.18)' : 'rgba(167,139,250,0.18)';
+          ctx3d.fill();
+          ctx3d.strokeStyle = d.robot === 0 ? 'rgba(56,189,248,0.55)' : 'rgba(167,139,250,0.55)';
+          ctx3d.lineWidth = 1.0 * dpr;
+          ctx3d.stroke();
+        }
+      }
+
+      // 4. Draw Left & Right Kinematic Link Skeletons
+      function drawArmChain(chain, color) {
+        for (let i = 0; i < chain.length - 1; i++) {
+          drawLine3D(chain[i], chain[i + 1], color, (5.5 - i * 0.5) * dpr);
+        }
+        for (let i = 0; i < chain.length; i++) {
+          const p = projectPoint(chain[i], w, h);
+          if (!p) continue;
+          ctx3d.beginPath();
+          ctx3d.arc(p.x, p.y, (i === chain.length - 1 ? 4.5 : 3.5) * dpr, 0, Math.PI * 2);
+          ctx3d.fillStyle = i === chain.length - 1 ? '#22c55e' : '#f8fafc';
+          ctx3d.fill();
+          ctx3d.strokeStyle = color;
+          ctx3d.lineWidth = 1.5 * dpr;
+          ctx3d.stroke();
+        }
+      }
+      drawArmChain(frame.lc, '#0284c7');
+      drawArmChain(frame.rc, '#7c3aed');
+
+      // In Scenario 2 (Closed-Chain Bimanual Transport), draw the rigid payload bar held between the two TCPs
+      if (activeScenarioIdx === 2) {
+        const tcpL = frame.lc[frame.lc.length - 1];
+        const tcpR = frame.rc[frame.rc.length - 1];
+        drawLine3D(tcpL, tcpR, '#10b981', 5.0 * dpr);
+      }
+
+      // 5. Draw Closest Signed-Distance Witness Vectors
+      if (chkWitness.checked) {
+        for (const wPair of frame.wit) {
+          const color = wPair[2] < 0.08 ? '#f43f5e' : (wPair[3] ? '#eab308' : '#fb7185');
+          drawLine3D(wPair[0], wPair[1], color, 2.0 * dpr, [4 * dpr, 3 * dpr]);
+        }
+      }
+
+      // 6. Update Telemetry Readouts
+      scenarioSubtitle.textContent = isSandbox
+        ? 'Live Forward Kinematics, SoA Spheres & Signed Distance Witnesses'
+        : sc.subtitle;
+      timeReadout.textContent = `t = ${frame.t.toFixed(2)}s`;
+      clrReadout.textContent = `${frame.clr.toFixed(3)} m`;
+      clrReadout.style.color = frame.clr < 0.05 ? 'var(--error)' : 'var(--foreground)';
+
+      if (activeScenarioIdx === 2) {
+        auxLabel.textContent = 'Closed-Chain Err';
+        auxReadout.textContent = `${frame.err.toFixed(3)} mm`;
+      } else {
+        auxLabel.textContent = 'Max |dq/dt|';
+        const maxQd = Math.max(0, ...frame.qd.map(Math.abs));
+        auxReadout.textContent = `${maxQd.toFixed(2)} rad/s`;
+      }
+
+      jointReadout.textContent = `qL:[${frame.q.slice(0, 4).map(v => v.toFixed(2)).join(',')}] qR:[${frame.q.slice(4, 8).map(v => v.toFixed(2)).join(',')}]`;
+
+      if (!isSandbox) {
+        drawSparkline(sc, frameIdx);
+      }
+    }
+
+    // Orbit Camera Mouse & Touch Handlers
+    canvas3d.addEventListener('pointerdown', (e) => {
+      isDragging = true;
+      lastMouse = [e.clientX, e.clientY];
+      canvas3d.setPointerCapture(e.pointerId);
+    });
+    canvas3d.addEventListener('pointermove', (e) => {
+      if (!isDragging) return;
+      const dx = e.clientX - lastMouse[0];
+      const dy = e.clientY - lastMouse[1];
+      lastMouse = [e.clientX, e.clientY];
+      camYaw -= dx * 0.008;
+      camPitch = Math.max(-0.2, Math.min(1.35, camPitch + dy * 0.008));
+      render();
+    });
+    canvas3d.addEventListener('pointerup', () => { isDragging = false; });
+    canvas3d.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      camDist = Math.max(0.9, Math.min(3.4, camDist + e.deltaY * 0.0012));
+      render();
+    }, { passive: false });
+
+    scenarioSelect.addEventListener('change', () => {
+      activeScenarioIdx = parseInt(scenarioSelect.value, 10);
+      frameIdx = 0;
+      const isSandbox = activeScenarioIdx === 3;
+      sparklinePanel.classList.toggle('hidden', isSandbox);
+      sandboxPanel.classList.toggle('hidden', !isSandbox);
+      if (!isSandbox) {
+        const len = SCENARIOS[activeScenarioIdx].frames.length;
+        frameSlider.max = String(len - 1);
+        frameSlider.value = '0';
+        frameCounter.textContent = `1 / ${len}`;
+      }
+      render();
+    });
+
+    btnPlay.addEventListener('click', () => {
+      isPlaying = !isPlaying;
+      btnPlay.textContent = isPlaying ? 'Pause' : 'Play';
+    });
+
+    frameSlider.addEventListener('input', () => {
+      isPlaying = false;
+      btnPlay.textContent = 'Play';
+      frameIdx = parseInt(frameSlider.value, 10);
+      const len = SCENARIOS[Math.min(2, activeScenarioIdx)].frames.length;
+      frameCounter.textContent = `${frameIdx + 1} / ${len}`;
+      render();
+    });
+
+    [chkSpheres, chkWitness, chkTrails].forEach(el => el.addEventListener('change', render));
+    ['slL1', 'slL2', 'slR1', 'slR2', 'slOy', 'slOz'].forEach(id => {
+      document.getElementById(id).addEventListener('input', render);
+    });
+    window.addEventListener('resize', render);
+    window.addEventListener('themechange', render);
+
+    function animate(now) {
+      if (isPlaying && activeScenarioIdx < 3 && now - lastTick > 45) {
+        lastTick = now;
+        const len = SCENARIOS[activeScenarioIdx].frames.length;
+        frameIdx = (frameIdx + 1) % len;
+        frameSlider.value = String(frameIdx);
+        frameCounter.textContent = `${frameIdx + 1} / ${len}`;
+        render();
+      }
+      requestAnimationFrame(animate);
+    }
+    render();
+    requestAnimationFrame(animate);
+  </script>
+</body>
+</html>

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/unrust-it", "crates/unrust-it-urdf"]
+members = ["crates/unrust-it", "crates/unrust-it-urdf", "apps/visualizer"]
 resolver = "2"
 
 [workspace.package]
