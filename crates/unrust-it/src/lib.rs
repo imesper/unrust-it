@@ -7,16 +7,21 @@
 //! real-time reactive collision avoidance.
 
 pub mod collision;
+pub mod control;
 pub mod kinematics;
+pub mod manifold;
 pub mod planner;
 pub mod robot;
+pub mod trajectory;
 
 pub use collision::{
     AllowedCollisionMatrix, BoundingSphere, CollidingPair, CollisionChecker, CollisionEnvironment,
     CollisionError, CollisionRule, CollisionWorkspace, GeometryTier, LinkCapsule, LinkGeometry,
     Obstacle, SignedDistanceWitness, WorldSphereSoA,
 };
+pub use control::{ControlError, ReactiveServoConfig, ReactiveServoController, ServoTarget};
 pub use kinematics::{ForwardKinematics, InverseKinematics, KinematicsError, TransformBuffer};
+pub use manifold::{ClosedChainGraspConstraint, ConstraintManifold};
 pub use planner::{PathPlanner, PlannerError, RrtPlanner, Target};
 pub use robot::{
     AttachedPayload, Configuration, FrameAttachment, FrameGraph, FrameId, FrameNode, JointId,
@@ -24,12 +29,15 @@ pub use robot::{
     MultiRobotModel, ObstacleId, PlanningGroup, Robot, RobotError, RobotId, TaskPose,
     TaskSpacePoint,
 };
+pub use trajectory::{
+    CubicSplinePath, JerkLimitedTrajectory, ToppraTrajectory, TrajectorySample,
+};
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
-    use nalgebra::{DMatrix, Isometry3, Point3, Translation3, UnitVector3, Vector3};
+    use nalgebra::{DMatrix, Isometry3, Point3, SVector, Translation3, UnitVector3, Vector3};
     use parry3d::shape::{Ball, SharedShape};
     use std::f64::consts::PI;
     use std::sync::Arc;
@@ -39,9 +47,24 @@ mod tests {
         let mut model = MultiRobotModel::new();
         let limit = JointLimit::new(-PI, PI);
         let segments = [
-            (UnitVector3::new_normalize(Vector3::z()), Vector3::new(0.0, 0.0, 0.2), limit, 0.05),
-            (UnitVector3::new_normalize(Vector3::y()), Vector3::new(0.0, 0.0, 0.4), limit, 0.05),
-            (UnitVector3::new_normalize(Vector3::y()), Vector3::new(0.0, 0.0, 0.35), limit, 0.04),
+            (
+                UnitVector3::new_normalize(Vector3::z()),
+                Vector3::new(0.0, 0.0, 0.2),
+                limit,
+                0.05,
+            ),
+            (
+                UnitVector3::new_normalize(Vector3::y()),
+                Vector3::new(0.0, 0.0, 0.4),
+                limit,
+                0.05,
+            ),
+            (
+                UnitVector3::new_normalize(Vector3::y()),
+                Vector3::new(0.0, 0.0, 0.35),
+                limit,
+                0.04,
+            ),
         ];
 
         let left_arm = model
@@ -262,7 +285,7 @@ mod tests {
             );
         }
 
-        // Place an obstacle that blocks the straight-line configuration path at q = [0, 0.5, 0, ...]
+        // Place an obstacle that blocks the straight-line configuration path at q = [0, 0.6, 0, ...]
         let mut buf = model.create_transform_buffer();
         let q_mid = [0.0, 0.6, 0.0, 0.0, 0.0, 0.0];
         model.forward_kinematics(&q_mid, &mut buf).unwrap();
@@ -276,7 +299,6 @@ mod tests {
         let start = Configuration::new(vec![0.0, -0.2, 0.0, 0.0, 0.0, 0.0]);
         let goal = Configuration::new(vec![0.0, 1.2, 0.0, 0.0, 0.0, 0.0]);
 
-        // Verify midpoint is actually in collision while endpoints are collision-free
         assert!(env.is_collision_free(&robot, &start).unwrap());
         assert!(env.is_collision_free(&robot, &goal).unwrap());
         assert!(!env
@@ -291,7 +313,6 @@ mod tests {
         assert_eq!(path.first().unwrap(), &start);
         assert_eq!(path.last().unwrap(), &goal);
 
-        // Also test multi-arm simultaneous TaskPose IK target resolution
         let model_ref = robot.model.as_ref().unwrap();
         let q_desired = [0.3, -0.4, 0.5, -0.3, 0.4, -0.5];
         model_ref.forward_kinematics(&q_desired, &mut buf).unwrap();
@@ -322,5 +343,101 @@ mod tests {
             right_pose.translation.vector,
             epsilon = 1e-3
         );
+    }
+
+    #[test]
+    fn closed_chain_bimanual_manifold_and_kinodynamic_trajectories_work() {
+        let (model, left_arm, right_arm, _) = build_dual_arm_model();
+        let mut buf = model.create_transform_buffer();
+
+        // 1. Test closed-chain bimanual relative position constraint between left_arm and right_arm TCPs
+        let q_ref = [0.1, 0.4, 0.2, -0.1, 0.4, 0.2];
+        model.forward_kinematics(&q_ref, &mut buf).unwrap();
+        let desired_rel = buf.relative_pose(left_arm.end_effectors[0], right_arm.end_effectors[0]);
+
+        let closure = ClosedChainGraspConstraint::with_active_dims(
+            left_arm.end_effectors[0],
+            right_arm.end_effectors[0],
+            desired_rel,
+            [true, true, true, false, false, false],
+        );
+
+        let mut q_perturbed = [0.25, 0.55, 0.1, -0.3, 0.2, 0.4];
+        closure
+            .project(&model, &mut q_perturbed, &mut buf, 1e-6, 80)
+            .expect("closed-chain projection should converge");
+
+        model.forward_kinematics(&q_perturbed, &mut buf).unwrap();
+        let projected_rel =
+            buf.relative_pose(left_arm.end_effectors[0], right_arm.end_effectors[0]);
+        assert_relative_eq!(
+            projected_rel.translation.vector,
+            desired_rel.translation.vector,
+            epsilon = 1e-5
+        );
+
+        // 2. Test TOPP-RA time-optimal parameterization and JerkLimitedTrajectory
+        let waypoints = vec![
+            Configuration::new(vec![0.0; 6]),
+            Configuration::from_slice(&q_ref),
+            Configuration::from_slice(&q_perturbed),
+        ];
+        let spline = CubicSplinePath::from_waypoints(&waypoints).unwrap();
+        let toppra = ToppraTrajectory::parameterize(spline, model.dof_limits(), 64).unwrap();
+        assert!(toppra.duration() > 0.0);
+
+        let mid_sample = toppra.sample(0.5 * toppra.duration());
+        for (k, lim) in model.dof_limits().iter().enumerate() {
+            assert!(mid_sample.velocity[k].abs() <= lim.max_velocity + 1e-2);
+            assert!(mid_sample.acceleration[k].abs() <= lim.max_acceleration + 1e-1);
+        }
+
+        let otg = JerkLimitedTrajectory::generate(
+            &[0.0; 6],
+            &[0.1; 6],
+            &[0.0; 6],
+            &q_ref,
+            &[0.0; 6],
+            &[0.0; 6],
+            model.dof_limits(),
+            0.1,
+        );
+        let end_sample = otg.sample(otg.duration());
+        for (k, &expected) in q_ref.iter().enumerate() {
+            assert_relative_eq!(end_sample.position[k], expected, epsilon = 1e-6);
+            assert_relative_eq!(end_sample.velocity[k], 0.0, epsilon = 1e-6);
+        }
+
+        // 3. Test 1 kHz ReactiveServoController with CBF obstacle avoidance
+        let mut env = CollisionEnvironment::new();
+        env.set_acm(AllowedCollisionMatrix::from_model(&model));
+        for link in model.links() {
+            env.set_link_geometry(
+                link.id,
+                LinkGeometry::from_capsule(
+                    Point3::origin(),
+                    Point3::new(0.0, 0.0, 0.3),
+                    link.bounding_radius,
+                ),
+            );
+        }
+        let mut servo =
+            ReactiveServoController::new(&model, &env, ReactiveServoConfig::default());
+        let mut dq_cmd = [0.0; 6];
+        servo
+            .step(
+                &model,
+                &env,
+                &q_perturbed,
+                &[0.0; 6],
+                &[ServoTarget::twist(
+                    left_arm.end_effectors[0],
+                    SVector::<f64, 6>::new(0.05, 0.0, 0.0, 0.0, 0.0, 0.0),
+                )],
+                Some(&closure),
+                &mut dq_cmd,
+            )
+            .unwrap();
+        assert!(dq_cmd.iter().any(|&v| v.abs() > 1e-4));
     }
 }
