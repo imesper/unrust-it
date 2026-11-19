@@ -4,15 +4,17 @@
 use crate::gui::viewport_bridge::ViewportRenderState;
 use crate::gui::{
     AcmCellItem, AcmHeaderItem, AcmMatrixRow, AcmRuleKind, AcmSliceMode, AcmState, ArmSummary,
-    JointSliderItem, MainWindow, PlannerState, SceneNodeKind, SceneState, SceneTreeNode,
-    SelectedAcmPair, SolverStatus, TimelineAlertMarker, TimelineState, ToolPresetKind,
-    ViewportState,
+    ArmTargetPose, JointSliderItem, MainWindow, ObstacleItem, PlannerState, PrimitiveKind,
+    SceneNodeKind, SceneState, SceneTreeNode, SelectedAcmPair, SolverStatus, TimelineAlertMarker,
+    TimelineState, ToolPresetKind, TouchLinkToggle, ViewportState,
 };
 use crate::plots::{
     render_joint_vel_plot, render_min_clearance_plot, render_pose_error_plot,
     render_tool_clearance_plot, PlotImage,
 };
-use crate::render::extract_render_scene;
+use crate::render::{
+    extract_render_scene_with_highlights, pick_entity_along_ray, PickedEntity, SceneHighlights,
+};
 use crate::scene::{
     arm_palette_color, evaluate_frame_snapshot, preset_workcell, ArmSpec, ArmTargetSpec,
     BuiltWorkcell, DirtyFlags, FrameSnapshot, ObstacleRole, ObstacleSpec, PlaybackTrajectory,
@@ -28,7 +30,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use unrust_it::{
-    CollidingPair, CollisionEnvironment, CollisionRule, CollisionWorkspace, LinkId, ObstacleId,
+    BatchIkSolver, CollidingPair, CollisionEnvironment, CollisionRule, CollisionWorkspace,
+    CpuSimdBatchBackend, LinkId, ObstacleId, TaskPose,
 };
 
 const SPEED_FACTORS: [f64; 5] = [0.1, 0.25, 0.5, 1.0, 2.0];
@@ -47,8 +50,13 @@ pub struct AppController {
     speed_index: usize,
     selected_arm_idx: usize,
     selected_node_id: i32,
+    selected_link_id: Option<LinkId>,
+    selected_payload_name: Option<String>,
+    selected_obstacle_idx: Option<usize>,
     expanded_keys: HashSet<String>,
     acm_slice: AcmSliceMode,
+    acm_name_filter: String,
+    acm_only_active_or_custom: bool,
     acm_selected_pair: Option<(String, String)>,
     plot_dims: (u32, u32),
     worker: PlannerWorker,
@@ -97,8 +105,13 @@ impl AppController {
             speed_index: 3,
             selected_arm_idx: 0,
             selected_node_id: 1,
+            selected_link_id: None,
+            selected_payload_name: None,
+            selected_obstacle_idx: None,
             expanded_keys,
             acm_slice: AcmSliceMode::InterArm,
+            acm_name_filter: String::new(),
+            acm_only_active_or_custom: false,
             acm_selected_pair: None,
             plot_dims: (320, 110),
             worker,
@@ -113,6 +126,8 @@ impl AppController {
 
         {
             let mut c = ctrl.borrow_mut();
+            c.sync_adapter_label_ui();
+            c.sync_esdf_bounds_ui();
             c.sync_scene_ui();
             c.sync_planner_ui();
             c.refresh_pose_and_scene();
@@ -189,6 +204,22 @@ impl AppController {
                     if self.current_q.len() != self.workcell.model.dof() {
                         self.current_q = self.workcell.q_start.0.clone();
                     }
+                    if let Some(lid) = self.selected_link_id {
+                        if lid.0 as usize >= self.workcell.model.num_links() {
+                            self.selected_link_id = None;
+                        }
+                    }
+                    if let Some(idx) = self.selected_obstacle_idx {
+                        if idx >= self.spec.obstacles.len() {
+                            self.selected_obstacle_idx = None;
+                        }
+                    }
+                    if let Some(ref pname) = self.selected_payload_name {
+                        if !self.workcell.payload_by_name.contains_key(pname) {
+                            self.selected_payload_name = None;
+                        }
+                    }
+                    self.sync_esdf_bounds_ui();
                     self.sync_scene_ui();
                     self.sync_planner_ui();
                     self.refresh_pose_and_scene();
@@ -247,15 +278,24 @@ impl AppController {
             &mut self.workspace,
         );
 
+        let highlights = build_scene_highlights(
+            &self.workcell,
+            &snap,
+            self.selected_link_id,
+            self.selected_payload_name.as_deref(),
+            self.selected_obstacle_idx,
+            self.acm_selected_pair.as_ref(),
+        );
         let scene_data = {
             let vp = self.viewport_state.borrow();
-            extract_render_scene(
+            extract_render_scene_with_highlights(
                 &self.workcell,
                 &self.spec,
                 &snap,
                 self.trajectory.as_deref(),
                 vp.camera.eye_position(),
                 &vp.overlays,
+                &highlights,
             )
         };
         {
@@ -332,6 +372,44 @@ impl AppController {
         self.sync_joint_sliders_ui();
     }
 
+    fn sync_adapter_label_ui(&self) {
+        let Some(ui) = self.ui_weak.upgrade() else {
+            return;
+        };
+        let gfx = if cfg!(feature = "gui") {
+            if cfg!(target_os = "macos") {
+                "wgpu 30 Metal"
+            } else if cfg!(target_os = "windows") {
+                "wgpu 30 DX12/Vk"
+            } else {
+                "wgpu 30 Vulkan"
+            }
+        } else {
+            "Offscreen Readback"
+        };
+        let compute = if cfg!(feature = "gpu-compute") {
+            "GPU + SIMD f32x8"
+        } else {
+            "CPU SIMD f32x8"
+        };
+        ui.global::<PlannerState>()
+            .set_gpu_adapter_label(SharedString::from(format!("{gfx} · {compute}")));
+    }
+
+    fn sync_esdf_bounds_ui(&self) {
+        let Some(ui) = self.ui_weak.upgrade() else {
+            return;
+        };
+        let v = ui.global::<ViewportState>();
+        let axis = v.get_esdf_slice_axis().clamp(0, 2) as usize;
+        let lo = self.spec.esdf.origin[axis];
+        let hi = lo + self.spec.esdf.voxel_size * (self.spec.esdf.dims[axis] as f32);
+        v.set_esdf_slice_min_z(lo);
+        v.set_esdf_slice_max_z(hi);
+        let clamped = v.get_esdf_slice_z().clamp(lo, hi);
+        v.set_esdf_slice_z(clamped);
+    }
+
     fn sync_scene_ui(&self) {
         let Some(ui) = self.ui_weak.upgrade() else {
             return;
@@ -344,35 +422,41 @@ impl AppController {
             .iter()
             .zip(self.workcell.arms.iter())
             .enumerate()
-            .map(|(idx, (arm_s, arm_c))| ArmSummary {
-                robot_id: idx as i32,
-                name: SharedString::from(arm_s.label.as_str()),
-                prefix: SharedString::from(arm_c.prefix.as_str()),
-                source_label: SharedString::from(match &arm_s.urdf_source {
-                    UrdfSource::Builtin4Dof => "Built-in 4-DOF",
-                    UrdfSource::Builtin6Dof => "Built-in 6-DOF",
-                    UrdfSource::InlineXml { .. } => "Imported XML",
-                    UrdfSource::FilePath { .. } => "URDF File",
-                }),
-                dof: arm_c.q_range.len() as i32,
-                link_count: arm_c.handle.links.len() as i32,
-                accent: rgba_to_slint_color(arm_s.color_rgba),
-                base_x: arm_s.base_pose.xyz[0] as f32,
-                base_y: arm_s.base_pose.xyz[1] as f32,
-                base_z: arm_s.base_pose.xyz[2] as f32,
-                base_yaw_deg: arm_s.base_pose.rpy[2].to_degrees() as f32,
-                tool_preset: tool_to_slint(&arm_s.tool),
-                tool_name: SharedString::from(arm_c.payload_name.as_deref().unwrap_or("None")),
-                tool_margin_mm: (arm_c
+            .map(|(idx, (arm_s, arm_c))| {
+                let payload = arm_c
                     .payload_id
-                    .and_then(|pid| self.workcell.env.attached_payload(pid))
-                    .and_then(|p| p.safety_margin)
-                    .unwrap_or(self.spec.rules.tool_tool_margin)
-                    * 1000.0) as f32,
-                tool_activation_mm: (self.spec.rules.tool_tool_activation * 1000.0) as f32,
-                tool_mass_kg: 0.5,
-                tcp_z_offset_mm: (arm_s.default_tcp_z * 1000.0) as f32,
-                priority_weight: arm_s.priority as f32,
+                    .and_then(|pid| self.workcell.env.attached_payload(pid));
+                ArmSummary {
+                    robot_id: idx as i32,
+                    name: SharedString::from(arm_s.label.as_str()),
+                    prefix: SharedString::from(arm_c.prefix.as_str()),
+                    source_label: SharedString::from(match &arm_s.urdf_source {
+                        UrdfSource::Builtin4Dof => "Built-in 4-DOF",
+                        UrdfSource::Builtin6Dof => "Built-in 6-DOF",
+                        UrdfSource::InlineXml { .. } => "Imported XML",
+                        UrdfSource::FilePath { .. } => "URDF File",
+                    }),
+                    dof: arm_c.q_range.len() as i32,
+                    link_count: arm_c.handle.links.len() as i32,
+                    accent: rgba_to_slint_color(arm_s.color_rgba),
+                    base_x: arm_s.base_pose.xyz[0] as f32,
+                    base_y: arm_s.base_pose.xyz[1] as f32,
+                    base_z: arm_s.base_pose.xyz[2] as f32,
+                    base_yaw_deg: arm_s.base_pose.rpy[2].to_degrees() as f32,
+                    tool_preset: tool_to_slint(&arm_s.tool),
+                    tool_name: SharedString::from(arm_c.payload_name.as_deref().unwrap_or("None")),
+                    tool_margin_mm: (payload
+                        .and_then(|p| p.safety_margin)
+                        .unwrap_or(self.spec.rules.tool_tool_margin)
+                        * 1000.0) as f32,
+                    tool_activation_mm: (payload
+                        .and_then(|p| p.activation_distance)
+                        .unwrap_or(self.spec.rules.tool_tool_activation)
+                        * 1000.0) as f32,
+                    tool_mass_kg: payload.map_or(0.0, |p| p.mass) as f32,
+                    tcp_z_offset_mm: (arm_s.default_tcp_z * 1000.0) as f32,
+                    priority_weight: arm_s.priority as f32,
+                }
             })
             .collect();
 
@@ -384,6 +468,57 @@ impl AppController {
             sc.set_selected_arm_index(-1);
         }
 
+        let touch_toggles: Vec<TouchLinkToggle> = self
+            .workcell
+            .arms
+            .get(sel_idx)
+            .and_then(|arm_c| {
+                let pid = arm_c.payload_id?;
+                let pay = self.workcell.env.attached_payload(pid)?;
+                Some(
+                    arm_c
+                        .handle
+                        .links
+                        .iter()
+                        .map(|&lid| TouchLinkToggle {
+                            link_id: lid.0 as i32,
+                            name: SharedString::from(self.workcell.model.link(lid).name.as_str()),
+                            exempt: pay.touch_links.contains(&lid),
+                        })
+                        .collect(),
+                )
+            })
+            .unwrap_or_default();
+        sc.set_selected_arm_touch_links(ModelRc::new(VecModel::from(touch_toggles)));
+
+        if let Some(obs_idx) = self
+            .selected_obstacle_idx
+            .filter(|&i| i < self.spec.obstacles.len())
+        {
+            let obs = &self.spec.obstacles[obs_idx];
+            sc.set_has_selected_obstacle(true);
+            sc.set_selected_obstacle(ObstacleItem {
+                obstacle_id: obs_idx as i32,
+                name: SharedString::from(obs.label.as_str()),
+                kind: shape_to_primitive_kind(&obs.shape),
+                is_workpiece: matches!(obs.role, ObstacleRole::Workpiece),
+                carve_esdf: obs.carve_esdf,
+                pos_x: obs.pose.xyz[0] as f32,
+                pos_y: obs.pose.xyz[1] as f32,
+                pos_z: obs.pose.xyz[2] as f32,
+                margin_mm: (obs
+                    .safety_margin
+                    .unwrap_or(self.spec.rules.default_body_margin)
+                    * 1000.0) as f32,
+                activation_mm: (obs
+                    .activation_distance
+                    .unwrap_or(self.spec.rules.default_body_activation)
+                    * 1000.0) as f32,
+            });
+        } else {
+            sc.set_has_selected_obstacle(false);
+        }
+
         sc.set_arms(ModelRc::new(VecModel::from(arms)));
         sc.set_total_dof(self.workcell.model.dof() as i32);
         sc.set_total_links(self.workcell.model.num_links() as i32);
@@ -392,6 +527,10 @@ impl AppController {
         // Build hierarchical indented SceneTreeNode model
         let mut nodes = Vec::new();
         let mut next_id = 0_i32;
+        let has_entity_selection = self.selected_link_id.is_some()
+            || self.selected_payload_name.is_some()
+            || self.selected_obstacle_idx.is_some();
+
         let robots_open = self.expanded_keys.contains("group:robots");
         nodes.push(SceneTreeNode {
             node_id: next_id,
@@ -405,7 +544,7 @@ impl AppController {
             expanded: robots_open,
             has_children: !self.workcell.arms.is_empty(),
             visible: true,
-            selected: self.selected_node_id == next_id,
+            selected: !has_entity_selection && self.selected_node_id == next_id,
         });
         next_id += 1;
 
@@ -428,7 +567,7 @@ impl AppController {
                     expanded: arm_open,
                     has_children: true,
                     visible: true,
-                    selected: self.selected_node_id == id,
+                    selected: !has_entity_selection && self.selected_node_id == id,
                 });
 
                 if arm_open {
@@ -453,7 +592,7 @@ impl AppController {
                             expanded: false,
                             has_children: false,
                             visible: true,
-                            selected: self.selected_node_id == nid,
+                            selected: self.selected_link_id == Some(lid),
                         });
                     }
                     if let Some(ref pname) = arm.payload_name {
@@ -471,7 +610,7 @@ impl AppController {
                             expanded: false,
                             has_children: false,
                             visible: true,
-                            selected: self.selected_node_id == nid,
+                            selected: self.selected_payload_name.as_deref() == Some(pname.as_str()),
                         });
                     }
                 }
@@ -493,7 +632,7 @@ impl AppController {
             expanded: obs_open,
             has_children: !self.workcell.obstacles.is_empty(),
             visible: true,
-            selected: self.selected_node_id == obs_hdr_id,
+            selected: !has_entity_selection && self.selected_node_id == obs_hdr_id,
         });
 
         if obs_open {
@@ -518,7 +657,7 @@ impl AppController {
                     expanded: false,
                     has_children: false,
                     visible: true,
-                    selected: self.selected_node_id == nid,
+                    selected: self.selected_obstacle_idx == Some(idx),
                 });
             }
         }
@@ -553,7 +692,56 @@ impl AppController {
             }
             _ => {}
         }
+        self.sync_targets_ui();
         self.sync_joint_sliders_ui();
+    }
+
+    fn sync_targets_ui(&self) {
+        let Some(ui) = self.ui_weak.upgrade() else {
+            return;
+        };
+        let ps = ui.global::<PlannerState>();
+        let mut list = Vec::new();
+        for (idx, (arm_s, arm_c)) in self
+            .spec
+            .arms
+            .iter()
+            .zip(self.workcell.arms.iter())
+            .enumerate()
+        {
+            let (pose, standoff_mm) = match &arm_s.target {
+                ArmTargetSpec::ApproachPose {
+                    final_pose,
+                    standoff_local,
+                } => (final_pose, (standoff_local[2].abs() * 1000.0) as f32),
+                ArmTargetSpec::DirectPose(pose) => (pose, 0.0),
+                _ => continue,
+            };
+            let tcp_frame_name = self
+                .workcell
+                .model
+                .frame_graph()
+                .node(arm_c.tcp_frame)
+                .map_or("tcp", |n| n.name.as_str());
+            list.push(ArmTargetPose {
+                robot_id: idx as i32,
+                arm_name: SharedString::from(arm_s.label.as_str()),
+                tcp_frame_name: SharedString::from(tcp_frame_name),
+                accent: rgba_to_slint_color(arm_s.color_rgba),
+                x: pose.xyz[0] as f32,
+                y: pose.xyz[1] as f32,
+                z: pose.xyz[2] as f32,
+                roll_deg: pose.rpy[0].to_degrees() as f32,
+                pitch_deg: pose.rpy[1].to_degrees() as f32,
+                yaw_deg: pose.rpy[2].to_degrees() as f32,
+                standoff_mm,
+            });
+        }
+        let cur_sel = ps.get_selected_target_arm();
+        if !list.is_empty() && !list.iter().any(|t| t.robot_id == cur_sel) {
+            ps.set_selected_target_arm(list[0].robot_id);
+        }
+        ps.set_arm_targets(ModelRc::new(VecModel::from(list)));
     }
 
     fn sync_joint_sliders_ui(&self) {
@@ -774,23 +962,67 @@ impl AppController {
             }
         }
 
+        let filter_q = self.acm_name_filter.trim().to_ascii_lowercase();
+        if !filter_q.is_empty() {
+            let matches_filter = |hdr: &AcmHeaderItem| {
+                hdr.short_label.to_ascii_lowercase().contains(&filter_q)
+                    || hdr.full_label.to_ascii_lowercase().contains(&filter_q)
+            };
+            row_entities.retain(|(_, h)| matches_filter(h));
+            col_entities.retain(|(_, h)| matches_filter(h));
+        }
+
         let live_map = self.live_distance_lookup();
-        let col_headers: Vec<AcmHeaderItem> = col_entities.iter().map(|(_, h)| h.clone()).collect();
-        let mut rows = Vec::with_capacity(row_entities.len());
+        let mut raw_cols: Vec<AcmHeaderItem> = col_entities.iter().map(|(_, h)| h.clone()).collect();
+        let mut raw_rows: Vec<(AcmHeaderItem, Vec<AcmCellItem>)> =
+            Vec::with_capacity(row_entities.len());
 
         for (rk, r_hdr) in &row_entities {
             let mut cells = Vec::with_capacity(col_entities.len());
             for (ck, _) in &col_entities {
                 cells.push(self.describe_acm_cell(rk, ck, &live_map));
             }
-            rows.push(AcmMatrixRow {
-                header: r_hdr.clone(),
-                cells: ModelRc::new(VecModel::from(cells)),
-            });
+            raw_rows.push((r_hdr.clone(), cells));
         }
 
+        if self.acm_only_active_or_custom {
+            let is_active = |c: &AcmCellItem| {
+                c.row_key != c.col_key
+                    && matches!(c.rule, AcmRuleKind::Enabled | AcmRuleKind::CustomMargin)
+            };
+            raw_rows.retain(|(_, cells)| cells.iter().any(is_active));
+            let keep_cols: Vec<bool> = (0..raw_cols.len())
+                .map(|ci| {
+                    raw_rows
+                        .iter()
+                        .any(|(_, cells)| cells.get(ci).is_some_and(is_active))
+                })
+                .collect();
+            raw_cols = raw_cols
+                .into_iter()
+                .enumerate()
+                .filter_map(|(ci, h)| keep_cols[ci].then_some(h))
+                .collect();
+            for (_, cells) in &mut raw_rows {
+                let retained: Vec<AcmCellItem> = cells
+                    .drain(..)
+                    .enumerate()
+                    .filter_map(|(ci, c)| keep_cols[ci].then_some(c))
+                    .collect();
+                *cells = retained;
+            }
+        }
+
+        let rows: Vec<AcmMatrixRow> = raw_rows
+            .into_iter()
+            .map(|(header, cells)| AcmMatrixRow {
+                header,
+                cells: ModelRc::new(VecModel::from(cells)),
+            })
+            .collect();
+
         let acm_state = ui.global::<AcmState>();
-        acm_state.set_col_headers(ModelRc::new(VecModel::from(col_headers)));
+        acm_state.set_col_headers(ModelRc::new(VecModel::from(raw_cols)));
         acm_state.set_rows(ModelRc::new(VecModel::from(rows)));
 
         if let Some((ref rk, ref ck)) = self.acm_selected_pair {
@@ -819,53 +1051,7 @@ impl AppController {
             return map;
         };
         for &(pair, dist) in &snap.all_distances_below_cutoff {
-            let (ka, kb) = match pair {
-                CollidingPair::LinkToLink { link_a, link_b } => {
-                    (format!("L:{}", link_a.0), format!("L:{}", link_b.0))
-                }
-                CollidingPair::LinkToObstacle { link, obstacle } => {
-                    (format!("L:{}", link.0), format!("O:{}", obstacle.0))
-                }
-                CollidingPair::PayloadToObstacle {
-                    payload, obstacle, ..
-                } => {
-                    let pname = self
-                        .workcell
-                        .env
-                        .attached_payloads()
-                        .get(payload.0 as usize)
-                        .map_or_else(String::new, |p| p.id.clone());
-                    (format!("P:{pname}"), format!("O:{}", obstacle.0))
-                }
-                CollidingPair::PayloadToLink { payload, link, .. } => {
-                    let pname = self
-                        .workcell
-                        .env
-                        .attached_payloads()
-                        .get(payload.0 as usize)
-                        .map_or_else(String::new, |p| p.id.clone());
-                    (format!("P:{pname}"), format!("L:{}", link.0))
-                }
-                CollidingPair::PayloadToPayload {
-                    payload_a,
-                    payload_b,
-                    ..
-                } => {
-                    let pa = self
-                        .workcell
-                        .env
-                        .attached_payloads()
-                        .get(payload_a.0 as usize)
-                        .map_or_else(String::new, |p| p.id.clone());
-                    let pb = self
-                        .workcell
-                        .env
-                        .attached_payloads()
-                        .get(payload_b.0 as usize)
-                        .map_or_else(String::new, |p| p.id.clone());
-                    (format!("P:{pa}"), format!("P:{pb}"))
-                }
-            };
+            let (ka, kb) = colliding_pair_to_keys(&self.workcell, &pair);
             map.insert((ka.clone(), kb.clone()), dist);
             map.insert((kb, ka), dist);
         }
@@ -1222,19 +1408,100 @@ fn bind_callbacks(window: &MainWindow, ctrl: &Rc<RefCell<AppController>>) {
             let mut b = c.borrow_mut();
             if let Some(ui) = b.ui_weak.upgrade() {
                 let v = ui.global::<ViewportState>();
+                let axis = v.get_esdf_slice_axis().clamp(0, 2) as usize;
+                let lo = b.spec.esdf.origin[axis];
+                let hi = lo + b.spec.esdf.voxel_size * (b.spec.esdf.dims[axis] as f32);
+                v.set_esdf_slice_min_z(lo);
+                v.set_esdf_slice_max_z(hi);
+                let coord = v.get_esdf_slice_z().clamp(lo, hi);
+                v.set_esdf_slice_z(coord);
+
                 let mut vp_st = b.viewport_state.borrow_mut();
                 vp_st.overlays.show_links = v.get_show_links();
                 vp_st.overlays.show_tool_convex = v.get_show_tool_convex();
                 vp_st.overlays.show_tier1_spheres = v.get_show_tier1_spheres();
                 vp_st.overlays.show_esdf_slice = v.get_show_esdf_slice();
-                vp_st.overlays.esdf_slice_coord = v.get_esdf_slice_z();
+                vp_st.overlays.esdf_slice_axis = axis as u8;
+                vp_st.overlays.esdf_slice_coord = coord;
+                vp_st.overlays.esdf_opacity = v.get_esdf_opacity().clamp(0.1, 0.95);
                 vp_st.overlays.show_mppi_ribbons = v.get_show_mppi_ribbons();
                 vp_st.overlays.show_witnesses = v.get_show_witnesses();
                 vp_st.overlays.witnesses_xray = v.get_witnesses_xray();
+                vp_st.overlays.max_witnesses = v.get_max_witnesses().clamp(1, 16) as usize;
                 vp_st.overlays.show_tf_frames = v.get_show_tf_frames();
                 vp_st.overlays.show_target_ghosts = v.get_show_target_ghosts();
                 vp_st.overlays.show_floor_grid = v.get_show_floor_grid();
             }
+            b.refresh_pose_and_scene();
+        });
+
+        let c = Rc::clone(ctrl);
+        vp.on_pick_ray(move |nx, ny| {
+            let mut b = c.borrow_mut();
+            let hit = {
+                let Some(snap) = b.last_snapshot.as_ref() else {
+                    return;
+                };
+                let (origin, dir) = {
+                    let vp_st = b.viewport_state.borrow();
+                    let aspect = (vp_st.logical_size.0 as f32) / (vp_st.logical_size.1.max(1) as f32);
+                    vp_st.camera.screen_ray(nx, ny, aspect)
+                };
+                pick_entity_along_ray(&b.workcell, snap, origin, dir)
+            };
+
+            b.selected_link_id = None;
+            b.selected_payload_name = None;
+            b.selected_obstacle_idx = None;
+            let summary = match hit {
+                Some(PickedEntity::Link(lid)) => {
+                    let (link_name, r_idx) = {
+                        let link = b.workcell.model.link(lid);
+                        (link.name.clone(), link.robot.0 as usize)
+                    };
+                    let arm_idx = r_idx.min(b.spec.arms.len().saturating_sub(1));
+                    b.selected_link_id = Some(lid);
+                    b.selected_arm_idx = arm_idx;
+                    b.expanded_keys.insert("group:robots".to_string());
+                    b.expanded_keys.insert(format!("arm:{arm_idx}"));
+                    format!("Picked link {link_name} (Arm {arm_idx})")
+                }
+                Some(PickedEntity::Payload(pid_idx)) => {
+                    if let Some(p) = b.workcell.env.attached_payloads().get(pid_idx).cloned() {
+                        let r_idx = b.workcell.model.link(p.parent_link).robot.0 as usize;
+                        let arm_idx = r_idx.min(b.spec.arms.len().saturating_sub(1));
+                        b.selected_payload_name = Some(p.id.clone());
+                        b.selected_arm_idx = arm_idx;
+                        b.expanded_keys.insert("group:robots".to_string());
+                        b.expanded_keys.insert(format!("arm:{arm_idx}"));
+                        format!("Picked tool {} (Arm {arm_idx})", p.id)
+                    } else {
+                        "No entity at cursor".to_string()
+                    }
+                }
+                Some(PickedEntity::Obstacle(oid)) => {
+                    let found = b
+                        .workcell
+                        .obstacles
+                        .iter()
+                        .enumerate()
+                        .find(|(_, o)| o.obstacle_id == oid)
+                        .map(|(idx, obs)| (idx, obs.label.clone(), obs.uid.clone()));
+                    if let Some((idx, label, uid)) = found {
+                        b.selected_obstacle_idx = Some(idx);
+                        b.expanded_keys.insert("group:obstacles".to_string());
+                        format!("Picked obstacle {label} ({uid})")
+                    } else {
+                        "No entity at cursor".to_string()
+                    }
+                }
+                None => "No entity hit by 3D pick ray".to_string(),
+            };
+            if let Some(ui) = b.ui_weak.upgrade() {
+                ui.global::<SceneState>()
+                    .set_selected_info_summary(SharedString::from(summary));
+            }
+            b.sync_scene_ui();
             b.refresh_pose_and_scene();
         });
     }
@@ -1318,6 +1585,11 @@ fn bind_callbacks(window: &MainWindow, ctrl: &Rc<RefCell<AppController>>) {
             let mut b = c.borrow_mut();
             b.spec = preset_workcell(preset);
             b.playing = false;
+            b.selected_arm_idx = 0;
+            b.selected_link_id = None;
+            b.selected_payload_name = None;
+            b.selected_obstacle_idx = None;
+            b.acm_selected_pair = None;
             if let Some(ui) = b.ui_weak.upgrade() {
                 ui.global::<TimelineState>().set_playing(false);
             }
@@ -1395,6 +1667,132 @@ fn bind_callbacks(window: &MainWindow, ctrl: &Rc<RefCell<AppController>>) {
                 b.refresh_pose_and_scene();
             }
         });
+
+        let c_tgt = Rc::clone(ctrl);
+        ps.on_update_arm_target(
+            move |robot_id, x, y, z, roll_deg, pitch_deg, yaw_deg, standoff_mm| {
+                {
+                    let mut b = c_tgt.borrow_mut();
+                    if let Some(arm) = b.spec.arms.get_mut(robot_id as usize) {
+                        let new_pose = PoseSpec {
+                            xyz: [x as f64, y as f64, z as f64],
+                            rpy: [
+                                (roll_deg as f64).to_radians(),
+                                (pitch_deg as f64).to_radians(),
+                                (yaw_deg as f64).to_radians(),
+                            ],
+                        };
+                        match &mut arm.target {
+                            ArmTargetSpec::ApproachPose {
+                                final_pose,
+                                standoff_local,
+                            } => {
+                                *final_pose = new_pose;
+                                standoff_local[2] = -(standoff_mm.max(0.0) as f64) * 0.001;
+                            }
+                            ArmTargetSpec::DirectPose(pose) => {
+                                if standoff_mm > 0.5 {
+                                    arm.target = ArmTargetSpec::ApproachPose {
+                                        final_pose: new_pose,
+                                        standoff_local: [0.0, 0.0, -(standoff_mm as f64) * 0.001],
+                                    };
+                                } else {
+                                    *pose = new_pose;
+                                }
+                            }
+                            _ => {
+                                arm.target = if standoff_mm > 0.5 {
+                                    ArmTargetSpec::ApproachPose {
+                                        final_pose: new_pose,
+                                        standoff_local: [0.0, 0.0, -(standoff_mm as f64) * 0.001],
+                                    }
+                                } else {
+                                    ArmTargetSpec::DirectPose(new_pose)
+                                };
+                            }
+                        }
+                    }
+                    b.sync_targets_ui();
+                    b.refresh_pose_and_scene();
+                }
+                AppController::schedule_debounced_compile_and_plan(&c_tgt, DirtyFlags::PLAN);
+            },
+        );
+
+        let c_copy = Rc::clone(ctrl);
+        ps.on_copy_current_tcp_to_target(move |robot_id| {
+            {
+                let mut b = c_copy.borrow_mut();
+                let r_idx = robot_id as usize;
+                let tcp_iso = b
+                    .last_snapshot
+                    .as_ref()
+                    .and_then(|s| s.tcp_poses.get(r_idx))
+                    .copied();
+                if let (Some(iso), Some(arm)) = (tcp_iso, b.spec.arms.get_mut(r_idx)) {
+                    let pose = PoseSpec::from_isometry(&iso);
+                    match &mut arm.target {
+                        ArmTargetSpec::ApproachPose { final_pose, .. } => {
+                            *final_pose = pose;
+                        }
+                        ArmTargetSpec::DirectPose(p) => {
+                            *p = pose;
+                        }
+                        _ => {
+                            arm.target = ArmTargetSpec::DirectPose(pose);
+                        }
+                    }
+                    b.sync_targets_ui();
+                    b.refresh_pose_and_scene();
+                }
+            }
+            AppController::schedule_debounced_compile_and_plan(&c_copy, DirtyFlags::PLAN);
+        });
+
+        let c_ik = Rc::clone(ctrl);
+        ps.on_preview_ik_targets(move || {
+            let mut b = c_ik.borrow_mut();
+            let mut tasks = Vec::new();
+            for (arm_s, arm_c) in b.spec.arms.iter().zip(b.workcell.arms.iter()) {
+                let pose = match &arm_s.target {
+                    ArmTargetSpec::ApproachPose { final_pose, .. } => final_pose,
+                    ArmTargetSpec::DirectPose(pose) => pose,
+                    _ => continue,
+                };
+                tasks.push(TaskPose::new(arm_c.tcp_frame, pose.to_isometry()));
+            }
+            if tasks.is_empty() {
+                b.set_worker_status(SolverStatus::Warning, 1.0, "No SE(3) targets in active scenario");
+                return;
+            }
+            match BatchIkSolver::default().solve_collision_free(
+                &CpuSimdBatchBackend,
+                &b.workcell.model,
+                &b.workcell.flat_model,
+                &b.workcell.env,
+                Some(&b.workcell.esdf),
+                &b.current_q,
+                &tasks,
+            ) {
+                Ok(cfg) => {
+                    b.playing = false;
+                    if let Some(ui) = b.ui_weak.upgrade() {
+                        ui.global::<TimelineState>().set_playing(false);
+                    }
+                    b.current_q = cfg.0;
+                    b.set_worker_status(
+                        SolverStatus::Converged,
+                        1.0,
+                        &format!("IK Preview solved ({} targets, 32 seeds)", tasks.len()),
+                    );
+                    b.refresh_pose_and_scene();
+                    b.sync_acm_ui();
+                }
+                Err(err) => {
+                    b.set_worker_status(SolverStatus::Warning, 1.0, &format!("IK Preview failed: {err}"));
+                }
+            }
+        });
     }
 
     // Scene & N-Arm Manager callbacks
@@ -1405,17 +1803,33 @@ fn bind_callbacks(window: &MainWindow, ctrl: &Rc<RefCell<AppController>>) {
         sc.on_select_tree_node(move |node_id| {
             let mut b = c.borrow_mut();
             b.selected_node_id = node_id;
+            b.selected_link_id = None;
+            b.selected_payload_name = None;
+            b.selected_obstacle_idx = None;
             if let Some(ui) = b.ui_weak.upgrade() {
                 let nodes = ui.global::<SceneState>().get_tree_nodes();
                 if let Some(n) = slint::Model::iter(&nodes).find(|n| n.node_id == node_id) {
                     if n.robot_id >= 0 {
-                        b.selected_arm_idx = n.robot_id as usize;
+                        b.selected_arm_idx = (n.robot_id as usize).min(b.spec.arms.len().saturating_sub(1));
+                    }
+                    match n.kind {
+                        SceneNodeKind::Link => {
+                            b.selected_link_id = Some(LinkId(n.entity_id as u16));
+                        }
+                        SceneNodeKind::Tool => {
+                            b.selected_payload_name = Some(n.label.to_string());
+                        }
+                        SceneNodeKind::Obstacle => {
+                            b.selected_obstacle_idx = Some(n.entity_id as usize);
+                        }
+                        _ => {}
                     }
                     let summary = format!("{} [{}]", n.label, n.badge);
                     ui.global::<SceneState>().set_selected_info_summary(SharedString::from(summary));
                 }
             }
             b.sync_scene_ui();
+            b.refresh_pose_and_scene();
         });
 
         let c = Rc::clone(ctrl);
@@ -1538,9 +1952,23 @@ fn bind_callbacks(window: &MainWindow, ctrl: &Rc<RefCell<AppController>>) {
         });
 
         let c = Rc::clone(ctrl);
-        sc.on_add_obstacle(move |_kind, is_wp| {
+        sc.on_add_obstacle(move |kind, is_wp| {
             let mut b = c.borrow_mut();
             let idx = b.spec.obstacles.len();
+            let shape = match kind {
+                PrimitiveKind::Cuboid => ShapePrimitiveSpec::Cuboid {
+                    half_extents: [0.06, 0.06, 0.05],
+                },
+                PrimitiveKind::Cylinder => ShapePrimitiveSpec::CylinderZ {
+                    half_height: 0.07,
+                    radius: 0.05,
+                },
+                PrimitiveKind::Capsule => ShapePrimitiveSpec::CapsuleZ {
+                    half_height: 0.06,
+                    radius: 0.04,
+                },
+                PrimitiveKind::Sphere => ShapePrimitiveSpec::Sphere { radius: 0.08 },
+            };
             b.spec.obstacles.push(ObstacleSpec {
                 uid: format!("obs_{idx}"),
                 label: if is_wp {
@@ -1548,19 +1976,142 @@ fn bind_callbacks(window: &MainWindow, ctrl: &Rc<RefCell<AppController>>) {
                 } else {
                     format!("Obstacle {idx}")
                 },
-                shape: ShapePrimitiveSpec::Sphere { radius: 0.08 },
+                shape,
                 pose: PoseSpec::translation(0.20, -0.25 + 0.15 * ((idx % 4) as f64), 0.45),
                 role: if is_wp {
                     ObstacleRole::Workpiece
                 } else {
                     ObstacleRole::StaticObstacle
                 },
-                color_rgba: [0.96, 0.42, 0.35, 1.0],
+                color_rgba: if is_wp {
+                    [0.95, 0.68, 0.22, 1.0]
+                } else {
+                    [0.96, 0.42, 0.35, 1.0]
+                },
                 safety_margin: None,
                 activation_distance: None,
                 carve_esdf: true,
             });
+            b.selected_link_id = None;
+            b.selected_payload_name = None;
+            b.selected_obstacle_idx = Some(idx);
+            b.expanded_keys.insert("group:obstacles".to_string());
             b.dispatch_compile_and_plan(DirtyFlags::OBSTACLES);
+        });
+
+        let c = Rc::clone(ctrl);
+        sc.on_add_workpiece_box(move || {
+            let mut b = c.borrow_mut();
+            let idx = b.spec.obstacles.len();
+            b.spec.obstacles.push(ObstacleSpec {
+                uid: format!("wp_box_{idx}"),
+                label: format!("Workpiece Box {idx}"),
+                shape: ShapePrimitiveSpec::Cuboid {
+                    half_extents: [0.06, 0.06, 0.05],
+                },
+                pose: PoseSpec::translation(0.0, 0.0, 0.42),
+                role: ObstacleRole::Workpiece,
+                color_rgba: [0.95, 0.68, 0.22, 1.0],
+                safety_margin: Some(0.004),
+                activation_distance: Some(0.020),
+                carve_esdf: true,
+            });
+            b.selected_link_id = None;
+            b.selected_payload_name = None;
+            b.selected_obstacle_idx = Some(idx);
+            b.expanded_keys.insert("group:obstacles".to_string());
+            b.dispatch_compile_and_plan(DirtyFlags::OBSTACLES);
+        });
+
+        let c = Rc::clone(ctrl);
+        sc.on_remove_obstacle(move |obs_idx| {
+            let mut b = c.borrow_mut();
+            let idx = obs_idx as usize;
+            if idx < b.spec.obstacles.len() {
+                b.spec.obstacles.remove(idx);
+                b.selected_obstacle_idx = if b.spec.obstacles.is_empty() {
+                    None
+                } else {
+                    Some(idx.min(b.spec.obstacles.len() - 1))
+                };
+                b.dispatch_compile_and_plan(DirtyFlags::OBSTACLES);
+            }
+        });
+
+        let c_obs = Rc::clone(ctrl);
+        sc.on_update_obstacle(
+            move |obs_idx, is_wp, carve_esdf, x, y, z, margin_mm, act_mm| {
+                {
+                    let mut b = c_obs.borrow_mut();
+                    if let Some(obs) = b.spec.obstacles.get_mut(obs_idx as usize) {
+                        if matches!(obs.role, ObstacleRole::Workpiece) != is_wp {
+                            obs.role = if is_wp {
+                                ObstacleRole::Workpiece
+                            } else {
+                                ObstacleRole::StaticObstacle
+                            };
+                        }
+                        obs.carve_esdf = carve_esdf;
+                        obs.pose.xyz = [x as f64, y as f64, z as f64];
+                        obs.safety_margin = Some((margin_mm.max(0.0) as f64) * 0.001);
+                        obs.activation_distance = Some((act_mm.max(0.0) as f64) * 0.001);
+                    }
+                    b.sync_scene_ui();
+                }
+                AppController::schedule_debounced_compile_and_plan(&c_obs, DirtyFlags::OBSTACLES);
+            },
+        );
+
+        let c_tool = Rc::clone(ctrl);
+        sc.on_update_arm_tool_params(move |robot_id, margin_mm, act_mm| {
+            {
+                let mut b = c_tool.borrow_mut();
+                if let Some(arm) = b.spec.arms.get_mut(robot_id as usize) {
+                    if let Some(mut custom) = arm.tool.expand(&arm.uid, arm.default_tcp_z) {
+                        custom.safety_margin = Some((margin_mm.max(0.0) as f64) * 0.001);
+                        custom.activation_distance = Some((act_mm.max(0.0) as f64) * 0.001);
+                        arm.tool = ToolPreset::Custom(Box::new(custom));
+                    }
+                }
+            }
+            AppController::schedule_debounced_compile_and_plan(&c_tool, DirtyFlags::TOPO);
+        });
+
+        let c_tl = Rc::clone(ctrl);
+        sc.on_toggle_tool_touch_link(move |robot_id, link_name, exempt| {
+            let mut b = c_tl.borrow_mut();
+            let r_idx = robot_id as usize;
+            let current_names: Vec<String> = b
+                .workcell
+                .arms
+                .get(r_idx)
+                .and_then(|arm_c| {
+                    let pid = arm_c.payload_id?;
+                    let pay = b.workcell.env.attached_payload(pid)?;
+                    Some(
+                        pay.touch_links
+                            .iter()
+                            .map(|&lid| b.workcell.model.link(lid).name.clone())
+                            .collect(),
+                    )
+                })
+                .unwrap_or_default();
+            if let Some(arm) = b.spec.arms.get_mut(r_idx) {
+                if let Some(mut custom) = arm.tool.expand(&arm.uid, arm.default_tcp_z) {
+                    let mut names = custom.touch_link_names.take().unwrap_or(current_names);
+                    let target_name = link_name.to_string();
+                    if exempt {
+                        if !names.contains(&target_name) {
+                            names.push(target_name);
+                        }
+                    } else {
+                        names.retain(|n| n != &target_name);
+                    }
+                    custom.touch_link_names = Some(names);
+                    arm.tool = ToolPreset::Custom(Box::new(custom));
+                    b.dispatch_compile_and_plan(DirtyFlags::TOPO);
+                }
+            }
         });
 
         let c = Rc::clone(ctrl);
@@ -1642,6 +2193,24 @@ fn bind_callbacks(window: &MainWindow, ctrl: &Rc<RefCell<AppController>>) {
             let mut b = c.borrow_mut();
             b.acm_selected_pair = Some((rk.to_string(), ck.to_string()));
             b.sync_acm_ui();
+            b.refresh_pose_and_scene();
+        });
+
+        let c = Rc::clone(ctrl);
+        acm.on_set_filters(move |name_filter, only_active| {
+            let mut b = c.borrow_mut();
+            b.acm_name_filter = name_filter.to_string();
+            b.acm_only_active_or_custom = only_active;
+            b.sync_acm_ui();
+        });
+
+        let c = Rc::clone(ctrl);
+        acm.on_reset_acm_from_srdf(move || {
+            let mut b = c.borrow_mut();
+            b.spec.rules.acm_overrides.clear();
+            b.spec.rules.pair_overrides.clear();
+            b.acm_selected_pair = None;
+            b.dispatch_compile_and_plan(DirtyFlags::RULES);
         });
 
         let c = Rc::clone(ctrl);
@@ -1746,8 +2315,20 @@ fn start_playback_timer(ctrl: &Rc<RefCell<AppController>>) {
         let dur = traj.metrics.duration_s.max(1e-3);
         let speed = SPEED_FACTORS[b.speed_index];
         b.playback_time += 0.016 * speed;
+        let looping = b
+            .ui_weak
+            .upgrade()
+            .is_none_or(|ui| ui.global::<TimelineState>().get_looping());
         if b.playback_time > dur {
-            b.playback_time %= dur;
+            if looping {
+                b.playback_time %= dur;
+            } else {
+                b.playback_time = dur;
+                b.playing = false;
+                if let Some(ui) = b.ui_weak.upgrade() {
+                    ui.global::<TimelineState>().set_playing(false);
+                }
+            }
         }
         let frac = (b.playback_time / dur).clamp(0.0, 1.0);
         let idx = ((frac * ((traj.frames.len() - 1) as f64)).round() as usize)
@@ -1781,6 +2362,9 @@ fn apply_cell_rule_to_spec(
     };
 
     if let (Some(a), Some(b)) = (entity(rk), entity(ck)) {
+        spec.rules
+            .pair_overrides
+            .retain(|p| !((p.a == a && p.b == b) || (p.a == b && p.b == a)));
         spec.rules.pair_overrides.push(crate::scene::PairRuleOverrideSpec {
             a,
             b,
@@ -1788,6 +2372,158 @@ fn apply_cell_rule_to_spec(
             margin,
             activation_distance: activation,
         });
+    }
+}
+
+fn colliding_pair_to_keys(workcell: &BuiltWorkcell, pair: &CollidingPair) -> (String, String) {
+    match *pair {
+        CollidingPair::LinkToLink { link_a, link_b } => {
+            (format!("L:{}", link_a.0), format!("L:{}", link_b.0))
+        }
+        CollidingPair::LinkToObstacle { link, obstacle } => {
+            (format!("L:{}", link.0), format!("O:{}", obstacle.0))
+        }
+        CollidingPair::PayloadToObstacle {
+            payload, obstacle, ..
+        } => {
+            let pname = workcell
+                .env
+                .attached_payloads()
+                .get(payload.0 as usize)
+                .map_or_else(String::new, |p| p.id.clone());
+            (format!("P:{pname}"), format!("O:{}", obstacle.0))
+        }
+        CollidingPair::PayloadToLink { payload, link, .. } => {
+            let pname = workcell
+                .env
+                .attached_payloads()
+                .get(payload.0 as usize)
+                .map_or_else(String::new, |p| p.id.clone());
+            (format!("P:{pname}"), format!("L:{}", link.0))
+        }
+        CollidingPair::PayloadToPayload {
+            payload_a,
+            payload_b,
+            ..
+        } => {
+            let pa = workcell
+                .env
+                .attached_payloads()
+                .get(payload_a.0 as usize)
+                .map_or_else(String::new, |p| p.id.clone());
+            let pb = workcell
+                .env
+                .attached_payloads()
+                .get(payload_b.0 as usize)
+                .map_or_else(String::new, |p| p.id.clone());
+            (format!("P:{pa}"), format!("P:{pb}"))
+        }
+    }
+}
+
+fn entity_world_point(workcell: &BuiltWorkcell, snap: &FrameSnapshot, key: &str) -> Option<[f64; 3]> {
+    match parse_entity(key)? {
+        UiEntity::Link(id) => snap
+            .link_poses
+            .get(id as usize)
+            .map(|iso| iso.translation.vector.into()),
+        UiEntity::Payload(name) => workcell
+            .payload_by_name
+            .get(&name)
+            .and_then(|pid| snap.payload_poses.get(pid.0 as usize))
+            .map(|iso| iso.translation.vector.into()),
+        UiEntity::Obstacle(oid) => snap
+            .obstacle_poses
+            .iter()
+            .find(|(id, _)| id.0 == oid)
+            .map(|(_, iso)| iso.translation.vector.into())
+            .or_else(|| {
+                workcell
+                    .obstacles
+                    .iter()
+                    .find(|o| o.obstacle_id.0 == oid)
+                    .map(|o| o.base_pose.translation.vector.into())
+            }),
+    }
+}
+
+fn push_unique<T: PartialEq>(list: &mut Vec<T>, val: T) {
+    if !list.contains(&val) {
+        list.push(val);
+    }
+}
+
+/// Builds 3D viewport highlights from selected entity state and the active ACM pair.
+pub(crate) fn build_scene_highlights(
+    workcell: &BuiltWorkcell,
+    snap: &FrameSnapshot,
+    selected_link: Option<LinkId>,
+    selected_payload: Option<&str>,
+    selected_obstacle: Option<usize>,
+    acm_pair: Option<&(String, String)>,
+) -> SceneHighlights {
+    let mut highlights = SceneHighlights::default();
+    if let Some(lid) = selected_link {
+        push_unique(&mut highlights.highlighted_links, lid);
+    }
+    if let Some(pname) = selected_payload {
+        push_unique(&mut highlights.highlighted_payloads, pname.to_string());
+    }
+    if let Some(oid) = selected_obstacle.and_then(|i| workcell.obstacles.get(i).map(|o| o.obstacle_id))
+    {
+        push_unique(&mut highlights.highlighted_obstacles, oid);
+    }
+
+    if let Some((rk, ck)) = acm_pair {
+        for key in [rk.as_str(), ck.as_str()] {
+            match parse_entity(key) {
+                Some(UiEntity::Link(id)) => {
+                    push_unique(&mut highlights.highlighted_links, LinkId(id));
+                }
+                Some(UiEntity::Payload(name)) => {
+                    push_unique(&mut highlights.highlighted_payloads, name);
+                }
+                Some(UiEntity::Obstacle(oid)) => {
+                    push_unique(&mut highlights.highlighted_obstacles, ObstacleId(oid));
+                }
+                None => {}
+            }
+        }
+        if rk != ck {
+            if let Some(w) = snap.witnesses.iter().find(|w| {
+                let (ka, kb) = colliding_pair_to_keys(workcell, &w.pair);
+                (ka == *rk && kb == *ck) || (ka == *ck && kb == *rk)
+            }) {
+                highlights.highlighted_pair_segment = Some((
+                    [
+                        w.witness_a_world.x,
+                        w.witness_a_world.y,
+                        w.witness_a_world.z,
+                    ],
+                    [
+                        w.witness_b_world.x,
+                        w.witness_b_world.y,
+                        w.witness_b_world.z,
+                    ],
+                ));
+            } else if let (Some(pa), Some(pb)) = (
+                entity_world_point(workcell, snap, rk),
+                entity_world_point(workcell, snap, ck),
+            ) {
+                highlights.highlighted_pair_segment = Some((pa, pb));
+            }
+        }
+    }
+
+    highlights
+}
+
+fn shape_to_primitive_kind(shape: &ShapePrimitiveSpec) -> PrimitiveKind {
+    match shape {
+        ShapePrimitiveSpec::Cuboid { .. } => PrimitiveKind::Cuboid,
+        ShapePrimitiveSpec::Sphere { .. } => PrimitiveKind::Sphere,
+        ShapePrimitiveSpec::CylinderZ { .. } => PrimitiveKind::Cylinder,
+        ShapePrimitiveSpec::CapsuleZ { .. } => PrimitiveKind::Capsule,
     }
 }
 
@@ -1820,5 +2556,67 @@ fn short_name(s: &str) -> String {
         trimmed.to_string()
     } else {
         trimmed.chars().take(8).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scene::{evaluate_frame_snapshot, preset_workcell, PresetId};
+
+    #[test]
+    fn scene_highlights_populates_pair_segment_for_tool_workpiece() {
+        let spec = preset_workcell(PresetId::ThreeArmCloseProximity);
+        let workcell = spec.compile(1).expect("three-arm preset compiles");
+        let mut ws = workcell.env.create_workspace(&workcell.model);
+        let snap = evaluate_frame_snapshot(&workcell, &workcell.q_start.0, &[], 5, None, &mut ws);
+
+        let tool_name = workcell.arms[0]
+            .payload_name
+            .as_ref()
+            .expect("arm0 has tool payload")
+            .clone();
+        let obs_id = workcell.obstacles[0].obstacle_id;
+        let pair = (format!("P:{tool_name}"), format!("O:{}", obs_id.0));
+
+        let hl = build_scene_highlights(&workcell, &snap, None, None, None, Some(&pair));
+        assert_eq!(hl.highlighted_payloads, vec![tool_name]);
+        assert_eq!(hl.highlighted_obstacles, vec![obs_id]);
+        assert!(hl.highlighted_pair_segment.is_some());
+    }
+
+    #[test]
+    fn apply_cell_rule_deduplicates_pair_overrides() {
+        let mut spec = preset_workcell(PresetId::ThreeArmCloseProximity);
+        let workcell = spec.compile(1).expect("preset compiles");
+        spec.rules.pair_overrides.clear();
+
+        let p0 = workcell.arms[0].payload_name.as_ref().unwrap();
+        let obs0 = format!("O:{}", workcell.obstacles[0].obstacle_id.0);
+        let key_p = format!("P:{p0}");
+
+        apply_cell_rule_to_spec(&mut spec, &workcell, &key_p, &obs0, true, Some(0.01), Some(0.05));
+        apply_cell_rule_to_spec(&mut spec, &workcell, &obs0, &key_p, true, Some(0.02), Some(0.08));
+
+        assert_eq!(spec.rules.pair_overrides.len(), 1);
+        assert_eq!(spec.rules.pair_overrides[0].margin, Some(0.02));
+        assert_eq!(spec.rules.pair_overrides[0].activation_distance, Some(0.08));
+    }
+
+    #[test]
+    fn custom_tool_touch_link_names_override_default_depth() {
+        let mut spec = preset_workcell(PresetId::ThreeArmCloseProximity);
+        let mut custom = spec.arms[0]
+            .tool
+            .expand(&spec.arms[0].uid, spec.arms[0].default_tcp_z)
+            .expect("arm0 tool expands");
+        custom.touch_link_names = Some(vec!["arm0_flange_link".to_string()]);
+        spec.arms[0].tool = ToolPreset::Custom(Box::new(custom));
+
+        let workcell = spec.compile(2).expect("compiled with custom touch_link_names");
+        let pid = workcell.arms[0].payload_id.expect("payload exists");
+        let payload = workcell.env.attached_payload(pid).expect("payload attached");
+        assert_eq!(payload.touch_links.len(), 1);
+        assert_eq!(workcell.model.link(payload.touch_links[0]).name, "arm0_flange_link");
     }
 }

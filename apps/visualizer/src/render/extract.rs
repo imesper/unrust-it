@@ -7,7 +7,7 @@ use nalgebra::{Isometry3, Translation3, UnitQuaternion, Vector3};
 use parry3d::shape::{SharedShape, TypedShape};
 use std::f64::consts::PI;
 use unrust_it::collision::{isometry_to_parry, parry_to_point, parry_to_vector};
-use unrust_it::{parry_to_isometry, CollidingPair, EsdfGridF32};
+use unrust_it::{parry_to_isometry, CollidingPair, EsdfGridF32, LinkId, ObstacleId};
 
 /// Per-instance GPU transform (`model_mat`) + RGBA color (`80` bytes).
 #[repr(C)]
@@ -94,6 +94,110 @@ pub struct RenderSceneData {
     pub esdf_slice: Option<EsdfSliceData>,
 }
 
+/// Interactive 3D selection & ACM-pair highlight specification.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SceneHighlights {
+    pub highlighted_links: Vec<LinkId>,
+    pub highlighted_payloads: Vec<String>,
+    pub highlighted_obstacles: Vec<ObstacleId>,
+    pub highlighted_pair_segment: Option<([f64; 3], [f64; 3])>,
+}
+
+/// Entity intersected by a 3D viewport picking ray.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PickedEntity {
+    Link(LinkId),
+    Payload(usize),
+    Obstacle(ObstacleId),
+}
+
+/// Intersects a world-space ray `(ray_origin, ray_dir)` against links, payloads, and obstacles.
+pub fn pick_entity_along_ray(
+    workcell: &BuiltWorkcell,
+    snapshot: &FrameSnapshot,
+    ray_origin: Vector3<f32>,
+    ray_dir: Vector3<f32>,
+) -> Option<PickedEntity> {
+    let dir = ray_dir.normalize();
+    let mut best_t = f32::INFINITY;
+    let mut best: Option<PickedEntity> = None;
+
+    for link in workcell.model.links() {
+        let Some(pose) = snapshot.link_poses.get(link.id.index()) else {
+            continue;
+        };
+        if let Some(geom) = workcell.env.link_geometry(link.id) {
+            for sph in &geom.local_spheres {
+                let c = pose.transform_point(&sph.center).coords.cast::<f32>();
+                let r = (sph.radius as f32).max(0.015);
+                if let Some(t) = ray_sphere_t(ray_origin, dir, c, r) {
+                    if t < best_t {
+                        best_t = t;
+                        best = Some(PickedEntity::Link(link.id));
+                    }
+                }
+            }
+        }
+    }
+
+    for (idx, payload) in workcell.env.attached_payloads().iter().enumerate() {
+        let Some(pose) = snapshot.payload_poses.get(idx) else {
+            continue;
+        };
+        for sph in &payload.geometry.local_spheres {
+            let c = pose.transform_point(&sph.center).coords.cast::<f32>();
+            let r = (sph.radius as f32).max(0.015);
+            if let Some(t) = ray_sphere_t(ray_origin, dir, c, r) {
+                if t < best_t {
+                    best_t = t;
+                    best = Some(PickedEntity::Payload(idx));
+                }
+            }
+        }
+    }
+
+    for (idx, _obs_meta) in workcell.obstacles.iter().enumerate() {
+        let Some(raw_obs) = workcell.env.obstacles.get(idx) else {
+            continue;
+        };
+        let obs_pose = snapshot
+            .obstacle_poses
+            .iter()
+            .find(|(oid, _)| oid.0 as usize == idx)
+            .map_or(raw_obs.pose, |(_, p)| *p);
+        let aabb = raw_obs.shape.compute_aabb(&isometry_to_parry(&obs_pose));
+        let c = parry_to_point(aabb.center()).coords.cast::<f32>();
+        let r = parry_to_vector(aabb.half_extents()).norm().max(0.02) as f32;
+        if let Some(t) = ray_sphere_t(ray_origin, dir, c, r) {
+            if t < best_t {
+                best_t = t;
+                best = Some(PickedEntity::Obstacle(ObstacleId(idx as u32)));
+            }
+        }
+    }
+
+    best
+}
+
+#[inline]
+fn ray_sphere_t(orig: Vector3<f32>, dir: Vector3<f32>, center: Vector3<f32>, r: f32) -> Option<f32> {
+    let oc = orig - center;
+    let b = oc.dot(&dir);
+    let c = oc.norm_squared() - r * r;
+    let disc = b * b - c;
+    if disc < 0.0 {
+        return None;
+    }
+    let sqrt_d = disc.sqrt();
+    let t0 = -b - sqrt_d;
+    if t0 > 0.0 {
+        Some(t0)
+    } else {
+        let t1 = -b + sqrt_d;
+        (t1 > 0.0).then_some(t1)
+    }
+}
+
 /// Extracts all visible 3D layers from `workcell`, `spec`, `snapshot`, and optional `trajectory`.
 pub fn extract_render_scene(
     workcell: &BuiltWorkcell,
@@ -103,8 +207,30 @@ pub fn extract_render_scene(
     camera_eye: Vector3<f32>,
     overlays: &OverlayFlags,
 ) -> RenderSceneData {
+    extract_render_scene_with_highlights(
+        workcell,
+        spec,
+        snapshot,
+        trajectory,
+        camera_eye,
+        overlays,
+        &SceneHighlights::default(),
+    )
+}
+
+/// Extracts all visible 3D layers while highlighting selected entities and/or an active ACM pair segment.
+pub fn extract_render_scene_with_highlights(
+    workcell: &BuiltWorkcell,
+    spec: &WorkcellSpec,
+    snapshot: &FrameSnapshot,
+    trajectory: Option<&PlaybackTrajectory>,
+    camera_eye: Vector3<f32>,
+    overlays: &OverlayFlags,
+    highlights: &SceneHighlights,
+) -> RenderSceneData {
     let mut out = RenderSceneData::default();
     let mut translucent_with_dist: Vec<(f32, SolidInstance)> = Vec::new();
+    let hl_cyan = [0.35, 0.94, 1.0, 1.0];
 
     if overlays.show_floor_grid {
         push_floor_grid(&mut out.grid_and_frame_lines, 1.0, 0.2);
@@ -124,7 +250,10 @@ pub fn extract_render_scene(
                 .get(arm_idx)
                 .map_or([0.22, 0.74, 0.97, 1.0], |a| a.color_rgba);
             // Subtle distal brightening along arm links for clearer visual articulation
-            let link_tint = tint_color(base_color, 0.92 + 0.04 * ((link.id.index() % 5) as f32));
+            let mut link_tint = tint_color(base_color, 0.92 + 0.04 * ((link.id.index() % 5) as f32));
+            if highlights.highlighted_links.contains(&link.id) {
+                link_tint = mix_color(link_tint, hl_cyan, 0.58);
+            }
 
             if let Some(geom) = workcell.env.link_geometry(link.id) {
                 for (sub_pose, sub_shape) in &geom.convex_shapes {
@@ -147,7 +276,10 @@ pub fn extract_render_scene(
                 .get(robot_idx)
                 .map_or([0.75, 0.80, 0.88, 1.0], |a| a.color_rgba);
             // Blend arm color toward brushed metallic titanium so tools stand out crisply from links
-            let tool_color = mix_color(arm_color, [0.84, 0.89, 0.96, 1.0], 0.45);
+            let mut tool_color = mix_color(arm_color, [0.84, 0.89, 0.96, 1.0], 0.45);
+            if highlights.highlighted_payloads.iter().any(|p| p == &payload.id) {
+                tool_color = mix_color(tool_color, hl_cyan, 0.58);
+            }
             for (sub_pose, sub_shape) in &payload.geometry.convex_shapes {
                 let world = *payload_pose * *sub_pose;
                 push_parry_shape_opaque(&mut out, &world, sub_shape, tool_color);
@@ -157,20 +289,25 @@ pub fn extract_render_scene(
 
     // 3. Static & dynamic obstacles / pedestal / workpiece
     for (idx, obs_meta) in workcell.obstacles.iter().enumerate() {
+        let oid = ObstacleId(idx as u32);
+        let mut color = obs_meta.color_rgba;
+        if highlights.highlighted_obstacles.contains(&oid) {
+            color = mix_color(color, hl_cyan, 0.58);
+        }
         let maybe_env_pose = snapshot
             .obstacle_poses
             .iter()
-            .find(|(oid, _)| oid.0 as usize == idx)
+            .find(|(id, _)| id.0 as usize == idx)
             .map(|(_, p)| *p);
         if let (Some(obs_pose), Some(raw_obs)) = (maybe_env_pose, workcell.env.obstacles.get(idx)) {
-            push_parry_shape_opaque(&mut out, &obs_pose, &raw_obs.shape, obs_meta.color_rgba);
+            push_parry_shape_opaque(&mut out, &obs_pose, &raw_obs.shape, color);
         } else {
             let (shape_pose, shape) = obs_meta.shape.to_parry_shape_and_pose();
             push_parry_shape_opaque(
                 &mut out,
                 &(obs_meta.base_pose * shape_pose),
                 &shape,
-                obs_meta.color_rgba,
+                color,
             );
         }
     }
@@ -364,6 +501,23 @@ pub fn extract_render_scene(
                 push_line(&mut out.xray_lines, pa, pb, color);
             }
         }
+    }
+
+    // 7b. Selected ACM Pair Highlight Witness Rod (Split 3D | ACM visual link)
+    if let Some((a, b)) = highlights.highlighted_pair_segment {
+        let pa = Vector3::new(a[0], a[1], a[2]);
+        let pb = Vector3::new(b[0], b[1], b[2]);
+        let col = [0.22, 0.96, 0.88, 1.0];
+        out.spheres.push(SolidInstance {
+            model_mat: translation_scale_mat4(pa, [0.0065, 0.0065, 0.0065]),
+            color: col,
+        });
+        out.spheres.push(SolidInstance {
+            model_mat: translation_scale_mat4(pb, [0.0065, 0.0065, 0.0065]),
+            color: col,
+        });
+        push_cylinder_between(&mut out.cylinders, pa, pb, 0.0035, col);
+        push_line(&mut out.xray_lines, pa, pb, col);
     }
 
     // 8. 3D ESDF 2D Slice
@@ -682,4 +836,56 @@ fn mix_color(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
         a[2] * k + b[2] * t,
         a[3] * k + b[3] * t,
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::render::OrbitCamera;
+    use crate::scene::{evaluate_frame_snapshot, preset_workcell, PresetId};
+
+    #[test]
+    fn raycast_picks_central_workpiece_in_three_arm_cell() {
+        let spec = preset_workcell(PresetId::ThreeArmCloseProximity);
+        let wc = spec.compile(1).unwrap();
+        let mut ws = wc.env.create_workspace(&wc.model);
+        let snap = evaluate_frame_snapshot(&wc, wc.q_start.as_slice(), &[], 5, None, &mut ws);
+
+        // Shoot ray straight toward central workpiece center (0.0, 0.0, 0.42)
+        let origin = Vector3::new(0.25, 0.0, 0.42);
+        let dir = Vector3::new(-1.0, 0.0, 0.0);
+        let picked = pick_entity_along_ray(&wc, &snap, origin, dir);
+        let wp_id = *wc.obstacle_by_uid.get("workpiece").unwrap();
+        assert_eq!(picked, Some(PickedEntity::Obstacle(wp_id)));
+    }
+
+    #[test]
+    fn extract_render_scene_with_highlights_emits_pair_segment_geometry() {
+        let spec = preset_workcell(PresetId::ThreeArmCloseProximity);
+        let wc = spec.compile(1).unwrap();
+        let mut ws = wc.env.create_workspace(&wc.model);
+        let snap = evaluate_frame_snapshot(&wc, wc.q_start.as_slice(), &[], 5, None, &mut ws);
+        let cam = OrbitCamera::default();
+        let overlays = OverlayFlags::default();
+
+        let base = extract_render_scene(&wc, &spec, &snap, None, cam.eye_position(), &overlays);
+        let hl = SceneHighlights {
+            highlighted_links: vec![wc.arms[0].flange_link],
+            highlighted_payloads: vec!["arm1_screwdriver".to_string()],
+            highlighted_obstacles: vec![*wc.obstacle_by_uid.get("workpiece").unwrap()],
+            highlighted_pair_segment: Some(([0.0, 0.0, 0.40], [0.05, 0.02, 0.44])),
+        };
+        let with_hl = extract_render_scene_with_highlights(
+            &wc,
+            &spec,
+            &snap,
+            None,
+            cam.eye_position(),
+            &overlays,
+            &hl,
+        );
+        assert_eq!(with_hl.spheres.len(), base.spheres.len() + 2);
+        assert_eq!(with_hl.cylinders.len(), base.cylinders.len() + 1);
+        assert_eq!(with_hl.xray_lines.len(), base.xray_lines.len() + 2);
+    }
 }

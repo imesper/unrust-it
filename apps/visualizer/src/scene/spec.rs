@@ -133,6 +133,7 @@ pub struct CustomToolSpec {
     pub safety_margin: Option<f64>,
     pub activation_distance: Option<f64>,
     pub touch_link_depth: usize,
+    pub touch_link_names: Option<Vec<String>>,
 }
 
 /// Preconfigured or custom tool attachment on an arm's flange.
@@ -142,7 +143,7 @@ pub enum ToolPreset {
     ParallelGripper,
     Screwdriver,
     InspectionProbe,
-    Custom(CustomToolSpec),
+    Custom(Box<CustomToolSpec>),
 }
 
 impl ToolPreset {
@@ -178,6 +179,7 @@ impl ToolPreset {
                 safety_margin: Some(0.004),
                 activation_distance: Some(0.015),
                 touch_link_depth: 3,
+                touch_link_names: None,
             }),
             Self::Screwdriver => Some(CustomToolSpec {
                 name: format!("{arm_uid}_screwdriver"),
@@ -203,6 +205,7 @@ impl ToolPreset {
                 safety_margin: Some(0.004),
                 activation_distance: Some(0.015),
                 touch_link_depth: 3,
+                touch_link_names: None,
             }),
             Self::InspectionProbe => Some(CustomToolSpec {
                 name: format!("{arm_uid}_probe"),
@@ -227,9 +230,10 @@ impl ToolPreset {
                 safety_margin: Some(0.004),
                 activation_distance: Some(0.015),
                 touch_link_depth: 3,
+                touch_link_names: None,
             }),
             Self::Custom(spec) => {
-                let mut cloned = spec.clone();
+                let mut cloned = (**spec).clone();
                 if cloned.tcp_offset_in_flange == PoseSpec::default() {
                     cloned.tcp_offset_in_flange = PoseSpec::translation(0.0, 0.0, default_tcp_z);
                 }

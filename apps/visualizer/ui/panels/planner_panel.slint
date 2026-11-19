@@ -26,11 +26,18 @@ export component PlannerPanel inherits Rectangle {
                 clicked => { root.active-tab = 0; }
             }
             Button {
-                text: "Joints / Jog";
+                text: "Targets & IK";
                 primary: root.active-tab == 1;
                 height: 26px;
                 horizontal-stretch: 1;
                 clicked => { root.active-tab = 1; }
+            }
+            Button {
+                text: "Joints / Jog";
+                primary: root.active-tab == 2;
+                height: 26px;
+                horizontal-stretch: 1;
+                clicked => { root.active-tab = 2; }
             }
         }
 
@@ -178,7 +185,144 @@ export component PlannerPanel inherits Rectangle {
             }
         }
 
-        if root.active-tab == 1: VerticalLayout {
+        if root.active-tab == 1: ScrollView {
+            vertical-stretch: 1;
+            VerticalLayout {
+                spacing: 8px;
+
+                SectionCard {
+                    title: "ARM TCP TARGETS (" + PlannerState.arm-targets.length + ")";
+                    if PlannerState.arm-targets.length == 0: Text {
+                        text: "This scenario uses direct joint goals or closed-chain constraints.";
+                        color: Theme.text-muted;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
+                    HorizontalLayout {
+                        spacing: 4px;
+                        for t in PlannerState.arm-targets: Button {
+                            text: t.arm-name;
+                            primary: PlannerState.selected-target-arm == t.robot-id;
+                            height: 24px;
+                            horizontal-stretch: 1;
+                            clicked => { PlannerState.selected-target-arm = t.robot-id; }
+                        }
+                    }
+
+                    for t in PlannerState.arm-targets: VerticalLayout {
+                        spacing: 6px;
+                        if t.robot-id == PlannerState.selected-target-arm: VerticalLayout {
+                            spacing: 6px;
+                            Text {
+                                text: "Target TCP: " + t.tcp-frame-name;
+                                color: t.accent;
+                                font-size: 11px;
+                                font-weight: 600;
+                            }
+                            ParamSlider {
+                                label: "Target X";
+                                unit: "m";
+                                minimum: -0.9;
+                                maximum: 0.9;
+                                step: 0.01;
+                                value: t.x;
+                                formatted-value: Math.round(t.x * 100.0) / 100.0;
+                                edited(v) => {
+                                    PlannerState.update-arm-target(t.robot-id, v, t.y, t.z, t.roll-deg, t.pitch-deg, t.yaw-deg, t.standoff-mm);
+                                }
+                            }
+                            ParamSlider {
+                                label: "Target Y";
+                                unit: "m";
+                                minimum: -0.9;
+                                maximum: 0.9;
+                                step: 0.01;
+                                value: t.y;
+                                formatted-value: Math.round(t.y * 100.0) / 100.0;
+                                edited(v) => {
+                                    PlannerState.update-arm-target(t.robot-id, t.x, v, t.z, t.roll-deg, t.pitch-deg, t.yaw-deg, t.standoff-mm);
+                                }
+                            }
+                            ParamSlider {
+                                label: "Target Z";
+                                unit: "m";
+                                minimum: 0.05;
+                                maximum: 1.25;
+                                step: 0.01;
+                                value: t.z;
+                                formatted-value: Math.round(t.z * 100.0) / 100.0;
+                                edited(v) => {
+                                    PlannerState.update-arm-target(t.robot-id, t.x, t.y, v, t.roll-deg, t.pitch-deg, t.yaw-deg, t.standoff-mm);
+                                }
+                            }
+                            ParamSlider {
+                                label: "Roll";
+                                unit: "deg";
+                                minimum: -180.0;
+                                maximum: 180.0;
+                                step: 1.0;
+                                value: t.roll-deg;
+                                formatted-value: Math.round(t.roll-deg);
+                                edited(v) => {
+                                    PlannerState.update-arm-target(t.robot-id, t.x, t.y, t.z, v, t.pitch-deg, t.yaw-deg, t.standoff-mm);
+                                }
+                            }
+                            ParamSlider {
+                                label: "Pitch";
+                                unit: "deg";
+                                minimum: -180.0;
+                                maximum: 180.0;
+                                step: 1.0;
+                                value: t.pitch-deg;
+                                formatted-value: Math.round(t.pitch-deg);
+                                edited(v) => {
+                                    PlannerState.update-arm-target(t.robot-id, t.x, t.y, t.z, t.roll-deg, v, t.yaw-deg, t.standoff-mm);
+                                }
+                            }
+                            ParamSlider {
+                                label: "Yaw";
+                                unit: "deg";
+                                minimum: -180.0;
+                                maximum: 180.0;
+                                step: 1.0;
+                                value: t.yaw-deg;
+                                formatted-value: Math.round(t.yaw-deg);
+                                edited(v) => {
+                                    PlannerState.update-arm-target(t.robot-id, t.x, t.y, t.z, t.roll-deg, t.pitch-deg, v, t.standoff-mm);
+                                }
+                            }
+                            ParamSlider {
+                                label: "Standoff";
+                                unit: "mm";
+                                minimum: 0.0;
+                                maximum: 200.0;
+                                step: 2.0;
+                                value: t.standoff-mm;
+                                formatted-value: Math.round(t.standoff-mm);
+                                edited(v) => {
+                                    PlannerState.update-arm-target(t.robot-id, t.x, t.y, t.z, t.roll-deg, t.pitch-deg, t.yaw-deg, v);
+                                }
+                            }
+                            Button {
+                                text: "Copy Current TCP Pose -> Target";
+                                height: 24px;
+                                clicked => { PlannerState.copy-current-tcp-to-target(t.robot-id); }
+                            }
+                        }
+                    }
+
+                    Button {
+                        text: "Solve IK Preview (Batch 32 Seeds)";
+                        primary: true;
+                        height: 28px;
+                        enabled: PlannerState.arm-targets.length > 0;
+                        clicked => { PlannerState.preview-ik-targets(); }
+                    }
+                }
+            }
+        }
+
+        if root.active-tab == 2: VerticalLayout {
             spacing: 6px;
             vertical-stretch: 1;
             Switch {

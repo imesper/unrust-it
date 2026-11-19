@@ -41,6 +41,13 @@ export component TimelineDock inherits Rectangle {
                     TimelineState.set-speed-index(self.current-index);
                 }
             }
+            Button {
+                text: "Loop";
+                primary: TimelineState.looping;
+                width: 44px;
+                height: 26px;
+                clicked => { TimelineState.looping = !TimelineState.looping; }
+            }
 
             // Stage-annotated custom scrubber
             scrubber := Rectangle {

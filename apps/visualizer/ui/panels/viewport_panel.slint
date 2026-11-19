@@ -151,19 +151,67 @@ export component ViewportPanel inherits Rectangle {
             Switch { text: "Arm Links (Convex)"; checked <=> ViewportState.show-links; toggled => { ViewportState.layers-changed(); } }
             Switch { text: "Attached Tools (Tier-2)"; checked <=> ViewportState.show-tool-convex; toggled => { ViewportState.layers-changed(); } }
             Switch { text: "Tier-1 Spheres (SoA)"; checked <=> ViewportState.show-tier1-spheres; toggled => { ViewportState.layers-changed(); } }
-            Switch { text: "3D ESDF Z-Slice Heatmap"; checked <=> ViewportState.show-esdf-slice; toggled => { ViewportState.layers-changed(); } }
-            if ViewportState.show-esdf-slice: ParamSlider {
-                label: "ESDF Z Height";
-                unit: "m";
-                minimum: ViewportState.esdf-slice-min-z;
-                maximum: ViewportState.esdf-slice-max-z;
-                step: 0.025;
-                value <=> ViewportState.esdf-slice-z;
-                formatted-value: Math.round(ViewportState.esdf-slice-z * 100.0) / 100.0;
-                edited => { ViewportState.layers-changed(); }
+            Switch { text: "3D ESDF Slice Heatmap"; checked <=> ViewportState.show-esdf-slice; toggled => { ViewportState.layers-changed(); } }
+            if ViewportState.show-esdf-slice: VerticalLayout {
+                spacing: 4px;
+                HorizontalLayout {
+                    spacing: 4px;
+                    Text { text: "Axis:"; color: Theme.text-muted; font-size: 11px; vertical-alignment: center; }
+                    Button {
+                        text: "X";
+                        primary: ViewportState.esdf-slice-axis == 0;
+                        height: 22px;
+                        horizontal-stretch: 1;
+                        clicked => { ViewportState.esdf-slice-axis = 0; ViewportState.layers-changed(); }
+                    }
+                    Button {
+                        text: "Y";
+                        primary: ViewportState.esdf-slice-axis == 1;
+                        height: 22px;
+                        horizontal-stretch: 1;
+                        clicked => { ViewportState.esdf-slice-axis = 1; ViewportState.layers-changed(); }
+                    }
+                    Button {
+                        text: "Z";
+                        primary: ViewportState.esdf-slice-axis == 2;
+                        height: 22px;
+                        horizontal-stretch: 1;
+                        clicked => { ViewportState.esdf-slice-axis = 2; ViewportState.layers-changed(); }
+                    }
+                }
+                ParamSlider {
+                    label: ViewportState.esdf-slice-axis == 0 ? "ESDF X Offset" : (ViewportState.esdf-slice-axis == 1 ? "ESDF Y Offset" : "ESDF Z Height");
+                    unit: "m";
+                    minimum: ViewportState.esdf-slice-min-z;
+                    maximum: ViewportState.esdf-slice-max-z;
+                    step: 0.025;
+                    value <=> ViewportState.esdf-slice-z;
+                    formatted-value: Math.round(ViewportState.esdf-slice-z * 100.0) / 100.0;
+                    edited => { ViewportState.layers-changed(); }
+                }
+                ParamSlider {
+                    label: "ESDF Opacity";
+                    unit: "";
+                    minimum: 0.1;
+                    maximum: 0.95;
+                    step: 0.05;
+                    value <=> ViewportState.esdf-opacity;
+                    formatted-value: Math.round(ViewportState.esdf-opacity * 100.0) + "%";
+                    edited => { ViewportState.layers-changed(); }
+                }
             }
             Switch { text: "MPPI Rollouts & Trails"; checked <=> ViewportState.show-mppi-ribbons; toggled => { ViewportState.layers-changed(); } }
             Switch { text: "Distance Witnesses"; checked <=> ViewportState.show-witnesses; toggled => { ViewportState.layers-changed(); } }
+            if ViewportState.show-witnesses: ParamSlider {
+                label: "Max Witnesses";
+                unit: "";
+                minimum: 1.0;
+                maximum: 16.0;
+                step: 1.0;
+                value: ViewportState.max-witnesses;
+                formatted-value: Math.round(ViewportState.max-witnesses);
+                edited(v) => { ViewportState.max-witnesses = Math.round(v); ViewportState.layers-changed(); }
+            }
             Switch { text: "X-Ray Witness Lines"; checked <=> ViewportState.witnesses-xray; toggled => { ViewportState.layers-changed(); } }
             Switch { text: "TCP / TF Frames"; checked <=> ViewportState.show-tf-frames; toggled => { ViewportState.layers-changed(); } }
             Switch { text: "Target & Standoff Ghosts"; checked <=> ViewportState.show-target-ghosts; toggled => { ViewportState.layers-changed(); } }

@@ -119,14 +119,26 @@ impl WorkcellSpec {
 
             let (payload_id, payload_name, tcp_offset) =
                 if let Some(tool) = arm_spec.tool.expand(&arm_spec.uid, arm_spec.default_tcp_z) {
-                    let mut touch_links = Vec::with_capacity(tool.touch_link_depth.max(1));
-                    let mut cur = Some(flange_link);
-                    for _ in 0..tool.touch_link_depth.max(1) {
-                        if let Some(lid) = cur {
-                            touch_links.push(lid);
-                            cur = model.link(lid).parent_link;
+                    let touch_links = if let Some(explicit) = &tool.touch_link_names {
+                        explicit
+                            .iter()
+                            .filter_map(|name| {
+                                model
+                                    .link_by_name(name)
+                                    .or_else(|| model.link_by_name(&format!("{prefix}{name}")))
+                            })
+                            .collect::<Vec<_>>()
+                    } else {
+                        let mut auto = Vec::with_capacity(tool.touch_link_depth.max(1));
+                        let mut cur = Some(flange_link);
+                        for _ in 0..tool.touch_link_depth.max(1) {
+                            if let Some(lid) = cur {
+                                auto.push(lid);
+                                cur = model.link(lid).parent_link;
+                            }
                         }
-                    }
+                        auto
+                    };
 
                     let mut shapes = Vec::with_capacity(tool.primitives.len());
                     for (sub_pose, sub_prim) in &tool.primitives {

@@ -30,7 +30,11 @@ export global SceneState {
     callback update-arm-base-pose(int, float, float, float, float);
     callback face-arm-origin(int);
     callback set-arm-tool-preset(int, ToolPresetKind);
+    callback update-arm-tool-params(int, float, float);
+    callback toggle-tool-touch-link(int, string, bool);
     callback add-obstacle(PrimitiveKind, bool);
+    callback add-workpiece-box();
+    callback update-obstacle(int, bool, bool, float, float, float, float, float);
     callback remove-obstacle(int);
     callback export-legacy-html();
     callback export-legacy-json();
@@ -55,6 +59,7 @@ export global AcmState {
     in-out property <float> bulk-tool-link-mm: 15.0;
 
     callback set-slice-mode(AcmSliceMode);
+    callback set-filters(string, bool);
     callback select-cell(string, string);
     callback toggle-cell-quick(string, string);
     callback apply-selected-pair-rule(string, string, AcmRuleKind, float, float);
@@ -109,6 +114,9 @@ export global PlannerState {
     callback set-cbf-params(float, float, float, float);
     callback set-mppi-params(int, int, int);
     callback set-joint-value(int, float);
+    callback update-arm-target(int, float, float, float, float, float, float, float);
+    callback copy-current-tcp-to-target(int);
+    callback preview-ik-targets();
     callback run-plan();
     callback cancel-plan();
 }
@@ -119,7 +127,9 @@ export global ViewportState {
     in-out property <bool> show-tool-convex: true;
     in-out property <bool> show-tier1-spheres: false;
     in-out property <bool> show-esdf-slice: false;
+    in-out property <int> esdf-slice-axis: 2;
     in-out property <float> esdf-slice-z: 0.42;
+    in-out property <float> esdf-opacity: 0.72;
     in-out property <float> esdf-slice-min-z: 0.0;
     in-out property <float> esdf-slice-max-z: 1.0;
     in-out property <bool> show-mppi-ribbons: true;

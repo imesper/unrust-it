@@ -1,4 +1,4 @@
-import { Button, ComboBox, ScrollView } from "std-widgets.slint";
+import { Button, ComboBox, ScrollView, Switch } from "std-widgets.slint";
 import { Theme } from "../theme.slint";
 import { PrimitiveKind, ToolPresetKind } from "../types.slint";
 import { SceneState } from "../state.slint";
@@ -63,7 +63,11 @@ export component ScenePanel inherits Rectangle {
                 spacing: 4px;
                 Button { text: "+ 6-DOF Arm"; height: 24px; horizontal-stretch: 1; clicked => { SceneState.add-arm-preset("6dof"); } }
                 Button { text: "+ 4-DOF Arm"; height: 24px; horizontal-stretch: 1; clicked => { SceneState.add-arm-preset("4dof"); } }
-                Button { text: "+ Obs"; height: 24px; clicked => { SceneState.add-obstacle(PrimitiveKind.sphere, false); } }
+            }
+            HorizontalLayout {
+                spacing: 4px;
+                Button { text: "+ Sphere Obs"; height: 24px; horizontal-stretch: 1; clicked => { SceneState.add-obstacle(PrimitiveKind.sphere, false); } }
+                Button { text: "+ Workpiece Box"; height: 24px; horizontal-stretch: 1; clicked => { SceneState.add-workpiece-box(); } }
             }
 
             ScrollView {
@@ -250,9 +254,209 @@ export component ScenePanel inherits Rectangle {
                         }
                     }
                     Text {
-                        text: "Tool: " + SceneState.selected-arm.tool-name + " · Margin: " + SceneState.selected-arm.tool-margin-mm + " mm";
+                        text: "Tool: " + SceneState.selected-arm.tool-name + " · Margin: " + Math.round(SceneState.selected-arm.tool-margin-mm) + " mm";
                         color: Theme.text-muted;
                         font-size: 11px;
+                    }
+                    if SceneState.selected-arm.tool-preset != ToolPresetKind.none: VerticalLayout {
+                        spacing: 5px;
+                        ParamSlider {
+                            label: "Tool Safety Margin";
+                            unit: "mm";
+                            minimum: 0.0;
+                            maximum: 30.0;
+                            step: 0.5;
+                            value: SceneState.selected-arm.tool-margin-mm;
+                            formatted-value: Math.round(SceneState.selected-arm.tool-margin-mm * 10.0) / 10.0;
+                            edited(v) => {
+                                SceneState.update-arm-tool-params(
+                                    SceneState.selected-arm.robot-id,
+                                    v,
+                                    SceneState.selected-arm.tool-activation-mm
+                                );
+                            }
+                        }
+                        ParamSlider {
+                            label: "Tool CBF Activation";
+                            unit: "mm";
+                            minimum: 0.0;
+                            maximum: 80.0;
+                            step: 1.0;
+                            value: SceneState.selected-arm.tool-activation-mm;
+                            formatted-value: Math.round(SceneState.selected-arm.tool-activation-mm);
+                            edited(v) => {
+                                SceneState.update-arm-tool-params(
+                                    SceneState.selected-arm.robot-id,
+                                    SceneState.selected-arm.tool-margin-mm,
+                                    v
+                                );
+                            }
+                        }
+                        if SceneState.selected-arm-touch-links.length > 0: Text {
+                            text: "TOUCH LINKS (SELF-EXEMPT)";
+                            color: Theme.text-muted;
+                            font-size: 10px;
+                            font-weight: 700;
+                        }
+                        for tl in SceneState.selected-arm-touch-links: Switch {
+                            text: tl.name;
+                            checked: tl.exempt;
+                            toggled => {
+                                SceneState.toggle-tool-touch-link(
+                                    SceneState.selected-arm.robot-id,
+                                    tl.name,
+                                    self.checked
+                                );
+                            }
+                        }
+                    }
+                }
+
+                if SceneState.has-selected-obstacle: SectionCard {
+                    title: "OBSTACLE (" + SceneState.selected-obstacle.name + ")";
+                    Switch {
+                        text: "Workpiece Role (WP)";
+                        checked: SceneState.selected-obstacle.is-workpiece;
+                        toggled => {
+                            SceneState.update-obstacle(
+                                SceneState.selected-obstacle.obstacle-id,
+                                self.checked,
+                                SceneState.selected-obstacle.carve-esdf,
+                                SceneState.selected-obstacle.pos-x,
+                                SceneState.selected-obstacle.pos-y,
+                                SceneState.selected-obstacle.pos-z,
+                                SceneState.selected-obstacle.margin-mm,
+                                SceneState.selected-obstacle.activation-mm
+                            );
+                        }
+                    }
+                    Switch {
+                        text: "Carve Into ESDF Grid";
+                        checked: SceneState.selected-obstacle.carve-esdf;
+                        toggled => {
+                            SceneState.update-obstacle(
+                                SceneState.selected-obstacle.obstacle-id,
+                                SceneState.selected-obstacle.is-workpiece,
+                                self.checked,
+                                SceneState.selected-obstacle.pos-x,
+                                SceneState.selected-obstacle.pos-y,
+                                SceneState.selected-obstacle.pos-z,
+                                SceneState.selected-obstacle.margin-mm,
+                                SceneState.selected-obstacle.activation-mm
+                            );
+                        }
+                    }
+                    ParamSlider {
+                        label: "Pos X";
+                        unit: "m";
+                        minimum: -1.0;
+                        maximum: 1.0;
+                        step: 0.01;
+                        value: SceneState.selected-obstacle.pos-x;
+                        formatted-value: Math.round(SceneState.selected-obstacle.pos-x * 100.0) / 100.0;
+                        edited(v) => {
+                            SceneState.update-obstacle(
+                                SceneState.selected-obstacle.obstacle-id,
+                                SceneState.selected-obstacle.is-workpiece,
+                                SceneState.selected-obstacle.carve-esdf,
+                                v,
+                                SceneState.selected-obstacle.pos-y,
+                                SceneState.selected-obstacle.pos-z,
+                                SceneState.selected-obstacle.margin-mm,
+                                SceneState.selected-obstacle.activation-mm
+                            );
+                        }
+                    }
+                    ParamSlider {
+                        label: "Pos Y";
+                        unit: "m";
+                        minimum: -1.0;
+                        maximum: 1.0;
+                        step: 0.01;
+                        value: SceneState.selected-obstacle.pos-y;
+                        formatted-value: Math.round(SceneState.selected-obstacle.pos-y * 100.0) / 100.0;
+                        edited(v) => {
+                            SceneState.update-obstacle(
+                                SceneState.selected-obstacle.obstacle-id,
+                                SceneState.selected-obstacle.is-workpiece,
+                                SceneState.selected-obstacle.carve-esdf,
+                                SceneState.selected-obstacle.pos-x,
+                                v,
+                                SceneState.selected-obstacle.pos-z,
+                                SceneState.selected-obstacle.margin-mm,
+                                SceneState.selected-obstacle.activation-mm
+                            );
+                        }
+                    }
+                    ParamSlider {
+                        label: "Pos Z";
+                        unit: "m";
+                        minimum: 0.0;
+                        maximum: 1.4;
+                        step: 0.01;
+                        value: SceneState.selected-obstacle.pos-z;
+                        formatted-value: Math.round(SceneState.selected-obstacle.pos-z * 100.0) / 100.0;
+                        edited(v) => {
+                            SceneState.update-obstacle(
+                                SceneState.selected-obstacle.obstacle-id,
+                                SceneState.selected-obstacle.is-workpiece,
+                                SceneState.selected-obstacle.carve-esdf,
+                                SceneState.selected-obstacle.pos-x,
+                                SceneState.selected-obstacle.pos-y,
+                                v,
+                                SceneState.selected-obstacle.margin-mm,
+                                SceneState.selected-obstacle.activation-mm
+                            );
+                        }
+                    }
+                    ParamSlider {
+                        label: "Obstacle Margin";
+                        unit: "mm";
+                        minimum: 0.0;
+                        maximum: 50.0;
+                        step: 1.0;
+                        value: SceneState.selected-obstacle.margin-mm;
+                        formatted-value: Math.round(SceneState.selected-obstacle.margin-mm);
+                        edited(v) => {
+                            SceneState.update-obstacle(
+                                SceneState.selected-obstacle.obstacle-id,
+                                SceneState.selected-obstacle.is-workpiece,
+                                SceneState.selected-obstacle.carve-esdf,
+                                SceneState.selected-obstacle.pos-x,
+                                SceneState.selected-obstacle.pos-y,
+                                SceneState.selected-obstacle.pos-z,
+                                v,
+                                SceneState.selected-obstacle.activation-mm
+                            );
+                        }
+                    }
+                    ParamSlider {
+                        label: "CBF Activation";
+                        unit: "mm";
+                        minimum: 0.0;
+                        maximum: 150.0;
+                        step: 2.0;
+                        value: SceneState.selected-obstacle.activation-mm;
+                        formatted-value: Math.round(SceneState.selected-obstacle.activation-mm);
+                        edited(v) => {
+                            SceneState.update-obstacle(
+                                SceneState.selected-obstacle.obstacle-id,
+                                SceneState.selected-obstacle.is-workpiece,
+                                SceneState.selected-obstacle.carve-esdf,
+                                SceneState.selected-obstacle.pos-x,
+                                SceneState.selected-obstacle.pos-y,
+                                SceneState.selected-obstacle.pos-z,
+                                SceneState.selected-obstacle.margin-mm,
+                                v
+                            );
+                        }
+                    }
+                    Button {
+                        text: "Remove Obstacle";
+                        height: 24px;
+                        clicked => {
+                            SceneState.remove-obstacle(SceneState.selected-obstacle.obstacle-id);
+                        }
                     }
                 }
 

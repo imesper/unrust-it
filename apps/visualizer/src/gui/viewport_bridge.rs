@@ -161,7 +161,12 @@ fn attach_wgpu30_zero_copy(
                     st.dirty = false;
 
                     if let Ok(img) = slint::Image::try_from(tex_clone) {
-                        ui.global::<ViewportState>().set_frame_image(img);
+                        let vp = ui.global::<ViewportState>();
+                        vp.set_frame_image(img);
+                        vp.set_hud_fps_label(slint::SharedString::from(format!(
+                            "{:.1} ms · wgpu 30",
+                            st.hud_frame_ms
+                        )));
                     }
                 }
                 slint::RenderingState::RenderingTeardown => {

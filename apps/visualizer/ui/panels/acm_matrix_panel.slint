@@ -1,4 +1,4 @@
-import { Button, ScrollView } from "std-widgets.slint";
+import { Button, LineEdit, Switch } from "std-widgets.slint";
 import { Theme } from "../theme.slint";
 import { AcmRuleKind, AcmSliceMode } from "../types.slint";
 import { AcmState } from "../state.slint";
@@ -55,21 +55,86 @@ export component AcmMatrixPanel inherits Rectangle {
                 height: 26px;
                 clicked => { AcmState.bulk-set-tool-workpiece-margin(3.0); }
             }
+            Button {
+                text: "Reset SRDF";
+                height: 26px;
+                clicked => { AcmState.reset-acm-from-srdf(); }
+            }
         }
 
-        // Scrollable Matrix Table
-        ScrollView {
-            vertical-stretch: 1;
-            VerticalLayout {
-                spacing: 2px;
+        // Filter & Live-Distance Bar
+        HorizontalLayout {
+            height: 28px;
+            spacing: 8px;
 
-                // Column header row
+            LineEdit {
+                placeholder-text: "Filter links / tools / obstacles...";
+                horizontal-stretch: 1;
+                height: 26px;
+                text: AcmState.name-filter;
+                edited(t) => {
+                    AcmState.name-filter = t;
+                    AcmState.set-filters(t, AcmState.only-active-or-custom);
+                }
+            }
+
+            Switch {
+                text: "Active / Custom Only";
+                checked <=> AcmState.only-active-or-custom;
+                toggled => {
+                    AcmState.set-filters(AcmState.name-filter, self.checked);
+                }
+            }
+        }
+
+        // Frozen-Header 2D Scrollable Matrix Table
+        Rectangle {
+            vertical-stretch: 1;
+            background: Theme.bg-panel;
+            border-color: Theme.border-subtle;
+            border-width: 1px;
+            border-radius: 5px;
+            clip: true;
+
+            property <length> row-hdr-w: 108px;
+            property <length> col-hdr-h: 26px;
+
+            // Top-left corner anchor
+            Rectangle {
+                x: 0px;
+                y: 0px;
+                width: parent.row-hdr-w;
+                height: parent.col-hdr-h;
+                background: Theme.bg-surface;
+                border-color: Theme.border-subtle;
+                border-width: 1px;
+                Text {
+                    text: "PAIR / d(t)";
+                    color: Theme.text-muted;
+                    font-size: 9px;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+
+            // Frozen top column headers (tracks horizontal scroll of body)
+            Flickable {
+                x: parent.row-hdr-w;
+                y: 0px;
+                width: max(1px, parent.width - parent.row-hdr-w);
+                height: parent.col-hdr-h;
+                interactive: false;
+                content-width: max(self.width, AcmState.col-headers.length * 52px + 4px);
+                content-height: parent.col-hdr-h;
+                content-x: body-flick.content-x;
+
                 HorizontalLayout {
+                    padding: 2px;
                     spacing: 2px;
-                    Rectangle { width: 96px; height: 24px; }
                     for col in AcmState.col-headers: Rectangle {
-                        width: 44px;
-                        height: 24px;
+                        width: 50px;
+                        height: 22px;
                         background: Theme.bg-surface;
                         border-radius: 3px;
                         Text {
@@ -82,17 +147,30 @@ export component AcmMatrixPanel inherits Rectangle {
                         }
                     }
                 }
+            }
 
-                // Matrix body rows
-                for row in AcmState.rows: HorizontalLayout {
+            // Frozen left row headers (tracks vertical scroll of body)
+            Flickable {
+                x: 0px;
+                y: parent.col-hdr-h;
+                width: parent.row-hdr-w;
+                height: max(1px, parent.height - parent.col-hdr-h);
+                interactive: false;
+                content-width: parent.row-hdr-w;
+                content-height: max(self.height, AcmState.rows.length * 30px + 4px);
+                content-y: body-flick.content-y;
+
+                VerticalLayout {
+                    padding: 2px;
                     spacing: 2px;
-                    Rectangle {
-                        width: 96px;
-                        height: 24px;
+                    for row in AcmState.rows: Rectangle {
+                        width: 104px;
+                        height: 28px;
                         background: Theme.bg-surface;
                         border-radius: 3px;
                         HorizontalLayout {
                             padding-left: 6px;
+                            padding-right: 4px;
                             Text {
                                 text: row.header.short-label;
                                 color: row.header.accent;
@@ -102,34 +180,61 @@ export component AcmMatrixPanel inherits Rectangle {
                             }
                         }
                     }
-                    for cell in row.cells: Rectangle {
-                        width: 44px;
-                        height: 24px;
-                        border-radius: 3px;
-                        background: cell.rule == AcmRuleKind.diagonal ? #0f131a
-                            : (cell.rule == AcmRuleKind.custom-margin && cell.margin-mm < 10.0 ? #2e1f47
-                            : (cell.rule == AcmRuleKind.custom-margin ? #3d2b12
-                            : (cell.rule == AcmRuleKind.enabled ? #153042
-                            : (cell.rule == AcmRuleKind.disabled-dynamic ? #381924 : #161b22))));
-                        border-width: cell.selected || cell.near-violation ? 2px : 1px;
-                        border-color: cell.near-violation ? Theme.status-danger
-                            : (cell.selected ? Theme.accent-primary : Theme.border-subtle);
+                }
+            }
 
-                        cell-touch := TouchArea {
-                            clicked => { AcmState.select-cell(cell.row-key, cell.col-key); }
-                            double-clicked => { AcmState.toggle-cell-quick(cell.row-key, cell.col-key); }
-                        }
+            // Scrollable matrix body
+            body-flick := Flickable {
+                x: parent.row-hdr-w;
+                y: parent.col-hdr-h;
+                width: max(1px, parent.width - parent.row-hdr-w);
+                height: max(1px, parent.height - parent.col-hdr-h);
+                content-width: max(self.width, AcmState.col-headers.length * 52px + 4px);
+                content-height: max(self.height, AcmState.rows.length * 30px + 4px);
 
-                        Text {
-                            text: cell.label;
-                            color: cell.rule == AcmRuleKind.diagonal ? #303846
-                                : (cell.rule == AcmRuleKind.custom-margin && cell.margin-mm < 10.0 ? #d8b4fe
-                                : (cell.rule == AcmRuleKind.custom-margin ? #fcd34d
-                                : (cell.rule == AcmRuleKind.enabled ? #7dd3fc : Theme.text-muted)));
-                            font-size: 10px;
-                            font-weight: 600;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
+                VerticalLayout {
+                    padding: 2px;
+                    spacing: 2px;
+                    for row in AcmState.rows: HorizontalLayout {
+                        spacing: 2px;
+                        for cell in row.cells: Rectangle {
+                            width: 50px;
+                            height: 28px;
+                            border-radius: 3px;
+                            background: cell.rule == AcmRuleKind.diagonal ? #0f131a
+                                : (cell.rule == AcmRuleKind.custom-margin && cell.margin-mm < 10.0 ? #2e1f47
+                                : (cell.rule == AcmRuleKind.custom-margin ? #3d2b12
+                                : (cell.rule == AcmRuleKind.enabled ? #153042
+                                : (cell.rule == AcmRuleKind.disabled-dynamic ? #381924 : #161b22))));
+                            border-width: cell.selected || cell.near-violation ? 2px : 1px;
+                            border-color: cell.near-violation ? Theme.status-danger
+                                : (cell.selected ? Theme.accent-primary : Theme.border-subtle);
+
+                            cell-touch := TouchArea {
+                                clicked => { AcmState.select-cell(cell.row-key, cell.col-key); }
+                                double-clicked => { AcmState.toggle-cell-quick(cell.row-key, cell.col-key); }
+                            }
+
+                            VerticalLayout {
+                                alignment: center;
+                                spacing: 0px;
+                                Text {
+                                    text: cell.label;
+                                    color: cell.rule == AcmRuleKind.diagonal ? #303846
+                                        : (cell.rule == AcmRuleKind.custom-margin && cell.margin-mm < 10.0 ? #d8b4fe
+                                        : (cell.rule == AcmRuleKind.custom-margin ? #fcd34d
+                                        : (cell.rule == AcmRuleKind.enabled ? #7dd3fc : Theme.text-muted)));
+                                    font-size: 9px;
+                                    font-weight: 700;
+                                    horizontal-alignment: center;
+                                }
+                                if cell.rule != AcmRuleKind.diagonal && cell.live-dist-mm > -900.0: Text {
+                                    text: Math.round(cell.live-dist-mm) + "mm";
+                                    color: cell.near-violation ? Theme.status-danger : Theme.text-muted;
+                                    font-size: 8px;
+                                    horizontal-alignment: center;
+                                }
+                            }
                         }
                     }
                 }
@@ -138,7 +243,7 @@ export component AcmMatrixPanel inherits Rectangle {
 
         // Pinned Bottom Pair Inspector Strip
         Rectangle {
-            height: 44px;
+            height: 48px;
             background: Theme.bg-panel;
             border-color: Theme.border-subtle;
             border-width: 1px;
@@ -147,50 +252,102 @@ export component AcmMatrixPanel inherits Rectangle {
             HorizontalLayout {
                 padding-left: 10px;
                 padding-right: 10px;
-                spacing: 10px;
+                spacing: 8px;
 
-                Text {
-                    text: AcmState.selected-pair.valid
-                        ? AcmState.selected-pair.pair-title + " (" + AcmState.selected-pair.pair-kind-badge + ")"
-                        : "Click any cell to inspect pair · Double-click to toggle Enabled/Disabled";
-                    color: Theme.text-primary;
-                    font-size: 11px;
-                    font-weight: 600;
-                    vertical-alignment: center;
+                VerticalLayout {
+                    alignment: center;
                     horizontal-stretch: 1;
+                    Text {
+                        text: AcmState.selected-pair.valid
+                            ? AcmState.selected-pair.pair-title + " (" + AcmState.selected-pair.pair-kind-badge + ")"
+                            : "Click any cell to inspect pair & 3D distance ray · Double-click to toggle Enabled/Disabled";
+                        color: Theme.text-primary;
+                        font-size: 11px;
+                        font-weight: 600;
+                    }
+                    if AcmState.selected-pair.valid: Text {
+                        text: "Live d(t): "
+                            + (AcmState.selected-pair.live-dist-mm > -900.0
+                                ? (Math.round(AcmState.selected-pair.live-dist-mm * 10.0) / 10.0) + " mm"
+                                : "Outside witness batch")
+                            + " · Active Margin: " + (Math.round(AcmState.selected-pair.margin-mm * 10.0) / 10.0)
+                            + " mm · CBF Act: " + Math.round(AcmState.selected-pair.activation-mm) + " mm";
+                        color: AcmState.selected-pair.live-dist-mm > -900.0 && AcmState.selected-pair.live-dist-mm <= AcmState.selected-pair.margin-mm + 5.0
+                            ? Theme.status-warn
+                            : Theme.text-muted;
+                        font-size: 10px;
+                    }
                 }
 
-                if AcmState.selected-pair.valid: Button {
-                    text: "Toggle Active";
-                    height: 26px;
-                    clicked => {
-                        AcmState.toggle-cell-quick(AcmState.selected-pair.row-key, AcmState.selected-pair.col-key);
+                if AcmState.selected-pair.valid: HorizontalLayout {
+                    spacing: 6px;
+                    Text {
+                        text: "Margin (mm):";
+                        color: Theme.text-muted;
+                        font-size: 10px;
+                        vertical-alignment: center;
                     }
-                }
-                if AcmState.selected-pair.valid: Button {
-                    text: "Set 4mm";
-                    height: 26px;
-                    clicked => {
-                        AcmState.apply-selected-pair-rule(
-                            AcmState.selected-pair.row-key,
-                            AcmState.selected-pair.col-key,
-                            AcmRuleKind.custom-margin,
-                            4.0,
-                            15.0
-                        );
+                    margin-edit := LineEdit {
+                        width: 56px;
+                        height: 26px;
+                        enabled: !AcmState.selected-pair.locked-adjacent;
+                        text: Math.round(AcmState.selected-pair.margin-mm * 10.0) / 10.0;
+                        accepted(t) => {
+                            if t.is-float() {
+                                AcmState.apply-selected-pair-rule(
+                                    AcmState.selected-pair.row-key,
+                                    AcmState.selected-pair.col-key,
+                                    AcmRuleKind.custom-margin,
+                                    t.to-float(),
+                                    act-edit.text.is-float() ? act-edit.text.to-float() : AcmState.selected-pair.activation-mm
+                                );
+                            }
+                        }
                     }
-                }
-                if AcmState.selected-pair.valid: Button {
-                    text: "Set 40mm";
-                    height: 26px;
-                    clicked => {
-                        AcmState.apply-selected-pair-rule(
-                            AcmState.selected-pair.row-key,
-                            AcmState.selected-pair.col-key,
-                            AcmRuleKind.custom-margin,
-                            40.0,
-                            160.0
-                        );
+                    Text {
+                        text: "Act (mm):";
+                        color: Theme.text-muted;
+                        font-size: 10px;
+                        vertical-alignment: center;
+                    }
+                    act-edit := LineEdit {
+                        width: 56px;
+                        height: 26px;
+                        enabled: !AcmState.selected-pair.locked-adjacent;
+                        text: Math.round(AcmState.selected-pair.activation-mm);
+                        accepted(t) => {
+                            if t.is-float() {
+                                AcmState.apply-selected-pair-rule(
+                                    AcmState.selected-pair.row-key,
+                                    AcmState.selected-pair.col-key,
+                                    AcmRuleKind.custom-margin,
+                                    margin-edit.text.is-float() ? margin-edit.text.to-float() : AcmState.selected-pair.margin-mm,
+                                    t.to-float()
+                                );
+                            }
+                        }
+                    }
+                    Button {
+                        text: "Apply";
+                        height: 26px;
+                        enabled: !AcmState.selected-pair.locked-adjacent;
+                        clicked => {
+                            AcmState.apply-selected-pair-rule(
+                                AcmState.selected-pair.row-key,
+                                AcmState.selected-pair.col-key,
+                                AcmRuleKind.custom-margin,
+                                margin-edit.text.is-float() ? margin-edit.text.to-float() : AcmState.selected-pair.margin-mm,
+                                act-edit.text.is-float() ? act-edit.text.to-float() : AcmState.selected-pair.activation-mm
+                            );
+                        }
+                    }
+                    Button {
+                        text: "Toggle Active";
+                        height: 26px;
+                        enabled: !AcmState.selected-pair.locked-adjacent;
+                        clicked => {
+                            AcmState.toggle-cell-quick(AcmState.selected-pair.row-key, AcmState.selected-pair.col-key);
+                        }
                     }
                 }
             }
