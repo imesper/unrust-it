@@ -1,0 +1,179 @@
+import { Button, ComboBox } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+import { TimelineState } from "../state.slint";
+import { TelemetryPlot } from "../widgets/telemetry_plot.slint";
+
+export component TimelineDock inherits Rectangle {
+    in-out property <bool> plots-collapsed: false;
+
+    background: Theme.bg-panel;
+    border-color: Theme.border-subtle;
+    border-width: 1px;
+
+    VerticalLayout {
+        padding: 6px;
+        spacing: 6px;
+
+        // Transport bar + Stage-Annotated Scrubber + Live Readouts
+        HorizontalLayout {
+            height: 30px;
+            spacing: 6px;
+
+            Button { text: "|<"; width: 28px; height: 26px; clicked => { TimelineState.seek-fraction(0.0); } }
+            Button { text: "<"; width: 26px; height: 26px; clicked => { TimelineState.step-frame(-1); } }
+            Button {
+                text: TimelineState.playing ? "❚❚" : "▶";
+                primary: true;
+                width: 34px;
+                height: 26px;
+                clicked => { TimelineState.toggle-play(); }
+            }
+            Button { text: ">"; width: 26px; height: 26px; clicked => { TimelineState.step-frame(1); } }
+            Button { text: ">|"; width: 28px; height: 26px; clicked => { TimelineState.seek-fraction(1.0); } }
+
+            ComboBox {
+                width: 68px;
+                height: 26px;
+                model: ["0.1x", "0.25x", "0.5x", "1.0x", "2.0x"];
+                current-index: TimelineState.speed-index;
+                selected => {
+                    TimelineState.speed-index = self.current-index;
+                    TimelineState.set-speed-index(self.current-index);
+                }
+            }
+
+            // Stage-annotated custom scrubber
+            scrubber := Rectangle {
+                horizontal-stretch: 1;
+                height: 22px;
+                y: 4px;
+                background: Theme.bg-canvas;
+                border-color: Theme.border-subtle;
+                border-width: 1px;
+                border-radius: 4px;
+                clip: true;
+
+                // Stage 1 band
+                Rectangle {
+                    x: 0px;
+                    y: 4px;
+                    height: 14px;
+                    width: TimelineState.stage1-end-fraction > 0.001
+                        ? TimelineState.stage1-end-fraction * parent.width
+                        : parent.width;
+                    background: #103247;
+                }
+                // Stage 2 band
+                if TimelineState.stage1-end-fraction > 0.001: Rectangle {
+                    x: TimelineState.stage1-end-fraction * parent.width;
+                    y: 4px;
+                    height: 14px;
+                    width: parent.width - self.x;
+                    background: #271b45;
+                }
+                // Alert ticks
+                for m in TimelineState.alert-markers: Rectangle {
+                    x: m.fraction * (parent.width - 2px);
+                    y: 2px;
+                    width: 2px;
+                    height: 18px;
+                    background: m.is-collision ? Theme.status-danger : Theme.status-warn;
+                }
+                // Playhead thumb
+                Rectangle {
+                    x: Math.clamp(TimelineState.playhead-fraction, 0.0, 1.0) * (parent.width - 6px);
+                    y: 1px;
+                    width: 6px;
+                    height: 20px;
+                    border-radius: 3px;
+                    background: #f8fafc;
+                }
+
+                scrub-touch := TouchArea {
+                    mouse-cursor: pointer;
+                    pointer-event(event) => {
+                        if event.kind == PointerEventKind.down && self.width > 1px {
+                            TimelineState.seek-fraction(Math.clamp(self.mouse-x / self.width, 0.0, 1.0));
+                        }
+                    }
+                    moved => {
+                        if self.pressed && self.width > 1px {
+                            TimelineState.seek-fraction(Math.clamp(self.mouse-x / self.width, 0.0, 1.0));
+                        }
+                    }
+                }
+            }
+
+            // Live readouts
+            Text {
+                text: TimelineState.time-text + " · " + TimelineState.stage-badge;
+                color: Theme.text-primary;
+                font-size: 10px;
+                font-weight: 600;
+                vertical-alignment: center;
+            }
+            Text {
+                text: "Clr: " + TimelineState.min-clearance-text;
+                color: Theme.status-color(TimelineState.min-clearance-severity);
+                font-size: 10px;
+                font-weight: 700;
+                vertical-alignment: center;
+            }
+            Text {
+                text: "|dq|: " + TimelineState.max-vel-text;
+                color: Theme.text-muted;
+                font-size: 10px;
+                vertical-alignment: center;
+            }
+
+            Button {
+                text: root.plots-collapsed ? "▲ Plots" : "▼";
+                height: 26px;
+                clicked => { root.plots-collapsed = !root.plots-collapsed; }
+            }
+        }
+
+        if !root.plots-collapsed: HorizontalLayout {
+            vertical-stretch: 1;
+            spacing: 6px;
+
+            TelemetryPlot {
+                horizontal-stretch: 1;
+                title: "MIN CLEARANCE VS MARGIN";
+                readout: TimelineState.min-clearance-text;
+                accent: Theme.accent-primary;
+                source: TimelineState.plot-min-clearance;
+                playhead-fraction: TimelineState.playhead-fraction;
+                scrub(f) => { TimelineState.seek-fraction(f); }
+                plot-resized(w, h) => { TimelineState.resize-plots(w, h); }
+            }
+            TelemetryPlot {
+                horizontal-stretch: 1;
+                title: "TOOL-TOOL & WORKPIECE (0-50 MM)";
+                readout: TimelineState.tool-clearance-text;
+                accent: Theme.accent-stage2;
+                source: TimelineState.plot-tool-clearance;
+                playhead-fraction: TimelineState.playhead-fraction;
+                scrub(f) => { TimelineState.seek-fraction(f); }
+            }
+            TelemetryPlot {
+                horizontal-stretch: 1;
+                title: "POSE / GRASP ERROR";
+                readout: TimelineState.pose-error-text;
+                accent: Theme.status-safe;
+                source: TimelineState.plot-pose-error;
+                playhead-fraction: TimelineState.playhead-fraction;
+                scrub(f) => { TimelineState.seek-fraction(f); }
+            }
+            TelemetryPlot {
+                horizontal-stretch: 1;
+                title: "PER-ARM MAX |dq/dt|";
+                readout: TimelineState.max-vel-text;
+                accent: Theme.status-warn;
+                source: TimelineState.plot-joint-vel;
+                playhead-fraction: TimelineState.playhead-fraction;
+                scrub(f) => { TimelineState.seek-fraction(f); }
+            }
+        }
+    }
+}

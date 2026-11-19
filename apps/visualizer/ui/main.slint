@@ -1,0 +1,184 @@
+import { Theme } from "theme.slint";
+import { CenterViewMode } from "types.slint";
+import {
+    AcmState, PlannerState, SceneState, TimelineState, ViewportState
+} from "state.slint";
+import { TopToolbar } from "panels/top_toolbar.slint";
+import { ScenePanel } from "panels/scene_panel.slint";
+import { ViewportPanel } from "panels/viewport_panel.slint";
+import { AcmMatrixPanel } from "panels/acm_matrix_panel.slint";
+import { PlannerPanel } from "panels/planner_panel.slint";
+import { TimelineDock } from "panels/timeline_dock.slint";
+
+export { SceneState, AcmState, PlannerState, ViewportState, TimelineState }
+
+export component MainWindow inherits Window {
+    title: "unrust-it Studio — Multi-Arm Path Planning & Collision Avoidance";
+    preferred-width: 1440px;
+    preferred-height: 900px;
+    min-width: 1080px;
+    min-height: 680px;
+    background: Theme.bg-canvas;
+
+    in-out property <CenterViewMode> center-mode: CenterViewMode.viewport-view;
+    in-out property <length> left-width: 280px;
+    in-out property <length> right-width: 310px;
+    in-out property <length> bottom-height: 175px;
+    in-out property <bool> left-collapsed: false;
+    in-out property <bool> right-collapsed: false;
+    in-out property <bool> plots-collapsed: false;
+
+    callback drain-worker-events();
+
+    FocusScope {
+        width: 100%;
+        height: 100%;
+
+        key-pressed(event) => {
+            if event.text == " " {
+                TimelineState.toggle-play();
+                return accept;
+            }
+            if event.text == Key.LeftArrow {
+                TimelineState.step-frame(-1);
+                return accept;
+            }
+            if event.text == Key.RightArrow {
+                TimelineState.step-frame(1);
+                return accept;
+            }
+            return reject;
+        }
+
+        VerticalLayout {
+            padding: 0px;
+            spacing: 0px;
+
+            TopToolbar {
+                center-mode <=> root.center-mode;
+                left-collapsed <=> root.left-collapsed;
+                right-collapsed <=> root.right-collapsed;
+            }
+
+            // Middle 3-column dock
+            HorizontalLayout {
+                vertical-stretch: 1;
+                spacing: 0px;
+
+                if !root.left-collapsed: ScenePanel {
+                    width: root.left-width;
+                }
+
+                if !root.left-collapsed: Rectangle {
+                    width: 5px;
+                    background: l-split.has-hover || l-split.pressed ? Theme.accent-primary : Theme.border-subtle;
+                    l-split := TouchArea {
+                        property <length> drag-start-w: 280px;
+                        property <length> drag-start-x: 0px;
+                        mouse-cursor: ew-resize;
+                        pointer-event(e) => {
+                            if e.kind == PointerEventKind.down {
+                                self.drag-start-w = root.left-width;
+                                self.drag-start-x = self.mouse-x;
+                            }
+                        }
+                        moved => {
+                            if self.pressed {
+                                root.left-width = Math.clamp(
+                                    self.drag-start-w + (self.mouse-x - self.drag-start-x),
+                                    220px,
+                                    440px
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // Center Workspace: 3D View | ACM Matrix | Split View
+                Rectangle {
+                    horizontal-stretch: 1;
+                    background: Theme.bg-canvas;
+
+                    if root.center-mode == CenterViewMode.viewport-view: ViewportPanel {
+                        width: 100%;
+                        height: 100%;
+                    }
+                    if root.center-mode == CenterViewMode.acm-matrix: AcmMatrixPanel {
+                        width: 100%;
+                        height: 100%;
+                    }
+                    if root.center-mode == CenterViewMode.split-view: HorizontalLayout {
+                        width: 100%;
+                        height: 100%;
+                        spacing: 4px;
+                        ViewportPanel {
+                            horizontal-stretch: 1;
+                        }
+                        AcmMatrixPanel {
+                            horizontal-stretch: 1;
+                        }
+                    }
+                }
+
+                if !root.right-collapsed: Rectangle {
+                    width: 5px;
+                    background: r-split.has-hover || r-split.pressed ? Theme.accent-primary : Theme.border-subtle;
+                    r-split := TouchArea {
+                        property <length> drag-start-w: 310px;
+                        property <length> drag-start-x: 0px;
+                        mouse-cursor: ew-resize;
+                        pointer-event(e) => {
+                            if e.kind == PointerEventKind.down {
+                                self.drag-start-w = root.right-width;
+                                self.drag-start-x = self.mouse-x;
+                            }
+                        }
+                        moved => {
+                            if self.pressed {
+                                root.right-width = Math.clamp(
+                                    self.drag-start-w - (self.mouse-x - self.drag-start-x),
+                                    250px,
+                                    460px
+                                );
+                            }
+                        }
+                    }
+                }
+
+                if !root.right-collapsed: PlannerPanel {
+                    width: root.right-width;
+                }
+            }
+
+            if !root.plots-collapsed: Rectangle {
+                height: 5px;
+                background: b-split.has-hover || b-split.pressed ? Theme.accent-primary : Theme.border-subtle;
+                b-split := TouchArea {
+                    property <length> drag-start-h: 175px;
+                    property <length> drag-start-y: 0px;
+                    mouse-cursor: ns-resize;
+                    pointer-event(e) => {
+                        if e.kind == PointerEventKind.down {
+                            self.drag-start-h = root.bottom-height;
+                            self.drag-start-y = self.mouse-y;
+                        }
+                    }
+                    moved => {
+                        if self.pressed {
+                            root.bottom-height = Math.clamp(
+                                self.drag-start-h - (self.mouse-y - self.drag-start-y),
+                                110px,
+                                360px
+                            );
+                        }
+                    }
+                }
+            }
+
+            TimelineDock {
+                height: root.plots-collapsed ? 42px : root.bottom-height;
+                plots-collapsed <=> root.plots-collapsed;
+            }
+        }
+    }
+}

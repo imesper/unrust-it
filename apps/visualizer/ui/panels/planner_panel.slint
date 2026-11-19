@@ -1,0 +1,295 @@
+import { Button, ProgressIndicator, ScrollView, Switch } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+import { SolverStatus } from "../types.slint";
+import { PlannerState, SceneState } from "../state.slint";
+import { SectionCard } from "../widgets/section_card.slint";
+import { ParamSlider } from "../widgets/param_slider.slint";
+
+export component PlannerPanel inherits Rectangle {
+    in-out property <int> active-tab: 0; // 0 = Plan & Control, 1 = Joints / Live Jog
+
+    background: Theme.bg-panel;
+    border-color: Theme.border-subtle;
+    border-width: 1px;
+
+    VerticalLayout {
+        padding: 8px;
+        spacing: 8px;
+
+        HorizontalLayout {
+            spacing: 4px;
+            Button {
+                text: "Plan & CBF";
+                primary: root.active-tab == 0;
+                height: 26px;
+                horizontal-stretch: 1;
+                clicked => { root.active-tab = 0; }
+            }
+            Button {
+                text: "Joints / Jog";
+                primary: root.active-tab == 1;
+                height: 26px;
+                horizontal-stretch: 1;
+                clicked => { root.active-tab = 1; }
+            }
+        }
+
+        if root.active-tab == 0: ScrollView {
+            vertical-stretch: 1;
+            VerticalLayout {
+                spacing: 8px;
+
+                SectionCard {
+                    title: "ARM PRIORITY WEIGHTS (QP-CBF)";
+                    for arm in SceneState.arms: ParamSlider {
+                        label: arm.name;
+                        unit: "x";
+                        minimum: 0.2;
+                        maximum: 6.0;
+                        step: 0.1;
+                        value: arm.priority-weight;
+                        formatted-value: Math.round(arm.priority-weight * 10.0) / 10.0;
+                        edited(v) => { PlannerState.set-arm-priority(arm.robot-id, v); }
+                    }
+                }
+
+                SectionCard {
+                    title: "CBF & DEADLOCK AVOIDANCE";
+                    ParamSlider {
+                        label: "Default Body Margin";
+                        unit: "mm";
+                        minimum: 5.0;
+                        maximum: 100.0;
+                        step: 1.0;
+                        value <=> PlannerState.safety-margin-mm;
+                        formatted-value: Math.round(PlannerState.safety-margin-mm);
+                        edited => {
+                            PlannerState.set-cbf-params(
+                                PlannerState.safety-margin-mm,
+                                PlannerState.cbf-activation-mm,
+                                PlannerState.cbf-gamma,
+                                PlannerState.tangential-curl-gain
+                            );
+                        }
+                    }
+                    ParamSlider {
+                        label: "CBF Activation Dist";
+                        unit: "mm";
+                        minimum: 30.0;
+                        maximum: 350.0;
+                        step: 5.0;
+                        value <=> PlannerState.cbf-activation-mm;
+                        formatted-value: Math.round(PlannerState.cbf-activation-mm);
+                        edited => {
+                            PlannerState.set-cbf-params(
+                                PlannerState.safety-margin-mm,
+                                PlannerState.cbf-activation-mm,
+                                PlannerState.cbf-gamma,
+                                PlannerState.tangential-curl-gain
+                            );
+                        }
+                    }
+                    ParamSlider {
+                        label: "CBF Decay (gamma)";
+                        unit: "1/s";
+                        minimum: 1.0;
+                        maximum: 20.0;
+                        step: 0.5;
+                        value <=> PlannerState.cbf-gamma;
+                        formatted-value: Math.round(PlannerState.cbf-gamma * 10.0) / 10.0;
+                        edited => {
+                            PlannerState.set-cbf-params(
+                                PlannerState.safety-margin-mm,
+                                PlannerState.cbf-activation-mm,
+                                PlannerState.cbf-gamma,
+                                PlannerState.tangential-curl-gain
+                            );
+                        }
+                    }
+                    ParamSlider {
+                        label: "Tangential Curl Gain";
+                        minimum: 0.0;
+                        maximum: 1.5;
+                        step: 0.05;
+                        value <=> PlannerState.tangential-curl-gain;
+                        formatted-value: Math.round(PlannerState.tangential-curl-gain * 100.0) / 100.0;
+                        edited => {
+                            PlannerState.set-cbf-params(
+                                PlannerState.safety-margin-mm,
+                                PlannerState.cbf-activation-mm,
+                                PlannerState.cbf-gamma,
+                                PlannerState.tangential-curl-gain
+                            );
+                        }
+                    }
+                }
+
+                SectionCard {
+                    title: "BATCHED MPPI PARAMETERS";
+                    ParamSlider {
+                        label: "Rollouts (B)";
+                        minimum: 16.0;
+                        maximum: 128.0;
+                        step: 8.0;
+                        value: PlannerState.mppi-rollouts;
+                        formatted-value: PlannerState.mppi-rollouts;
+                        edited(v) => {
+                            PlannerState.mppi-rollouts = Math.round(v);
+                            PlannerState.set-mppi-params(
+                                PlannerState.mppi-rollouts,
+                                PlannerState.mppi-horizon,
+                                PlannerState.mppi-iterations
+                            );
+                        }
+                    }
+                    ParamSlider {
+                        label: "Horizon (H)";
+                        minimum: 8.0;
+                        maximum: 40.0;
+                        step: 2.0;
+                        value: PlannerState.mppi-horizon;
+                        formatted-value: PlannerState.mppi-horizon;
+                        edited(v) => {
+                            PlannerState.mppi-horizon = Math.round(v);
+                            PlannerState.set-mppi-params(
+                                PlannerState.mppi-rollouts,
+                                PlannerState.mppi-horizon,
+                                PlannerState.mppi-iterations
+                            );
+                        }
+                    }
+                    ParamSlider {
+                        label: "Iterations";
+                        minimum: 5.0;
+                        maximum: 60.0;
+                        step: 5.0;
+                        value: PlannerState.mppi-iterations;
+                        formatted-value: PlannerState.mppi-iterations;
+                        edited(v) => {
+                            PlannerState.mppi-iterations = Math.round(v);
+                            PlannerState.set-mppi-params(
+                                PlannerState.mppi-rollouts,
+                                PlannerState.mppi-horizon,
+                                PlannerState.mppi-iterations
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        if root.active-tab == 1: VerticalLayout {
+            spacing: 6px;
+            vertical-stretch: 1;
+            Switch {
+                text: "Live FK & Convex Witness Mode";
+                checked <=> PlannerState.live-jog-mode;
+            }
+            ScrollView {
+                vertical-stretch: 1;
+                VerticalLayout {
+                    spacing: 4px;
+                    for j in PlannerState.joints: ParamSlider {
+                        label: j.name;
+                        unit: "rad";
+                        minimum: j.min-val;
+                        maximum: j.max-val;
+                        step: 0.02;
+                        value: j.value;
+                        formatted-value: Math.round(j.value * 100.0) / 100.0;
+                        edited(v) => { PlannerState.set-joint-value(j.q-index, v); }
+                    }
+                }
+            }
+        }
+
+        // Pinned Execution Footer
+        Rectangle {
+            background: Theme.bg-surface;
+            border-color: Theme.border-subtle;
+            border-width: 1px;
+            border-radius: 6px;
+
+            VerticalLayout {
+                padding: 8px;
+                spacing: 6px;
+
+                HorizontalLayout {
+                    spacing: 6px;
+                    Button {
+                        text: PlannerState.status == SolverStatus.running ? "Planning..." : "▶ Plan / Re-run";
+                        primary: true;
+                        height: 30px;
+                        horizontal-stretch: 1;
+                        clicked => { PlannerState.run-plan(); }
+                    }
+                    if PlannerState.status == SolverStatus.running: Button {
+                        text: "Stop";
+                        height: 30px;
+                        clicked => { PlannerState.cancel-plan(); }
+                    }
+                }
+
+                ProgressIndicator {
+                    height: 6px;
+                    progress: PlannerState.status == SolverStatus.running ? PlannerState.progress : 1.0;
+                    indeterminate: PlannerState.status == SolverStatus.running && PlannerState.progress < 0.0;
+                }
+
+                Text {
+                    text: PlannerState.status-message;
+                    color: Theme.text-muted;
+                    font-size: 10px;
+                }
+
+                GridLayout {
+                    spacing: 4px;
+                    Row {
+                        Rectangle {
+                            background: Theme.bg-canvas;
+                            border-radius: 4px;
+                            height: 32px;
+                            VerticalLayout {
+                                padding: 4px;
+                                Text { text: "SOLVE"; color: Theme.text-muted; font-size: 8px; font-weight: 700; }
+                                Text { text: PlannerState.diag-solve-ms; color: Theme.text-primary; font-size: 10px; font-weight: 600; }
+                            }
+                        }
+                        Rectangle {
+                            background: Theme.bg-canvas;
+                            border-radius: 4px;
+                            height: 32px;
+                            VerticalLayout {
+                                padding: 4px;
+                                Text { text: "POSE ERR"; color: Theme.text-muted; font-size: 8px; font-weight: 700; }
+                                Text { text: PlannerState.diag-pose-err; color: Theme.text-primary; font-size: 10px; font-weight: 600; }
+                            }
+                        }
+                    }
+                    Row {
+                        Rectangle {
+                            background: Theme.bg-canvas;
+                            border-radius: 4px;
+                            height: 32px;
+                            VerticalLayout {
+                                padding: 4px;
+                                Text { text: "BODY CLR"; color: Theme.text-muted; font-size: 8px; font-weight: 700; }
+                                Text { text: PlannerState.diag-min-body-clr; color: Theme.status-safe; font-size: 10px; font-weight: 600; }
+                            }
+                        }
+                        Rectangle {
+                            background: Theme.bg-canvas;
+                            border-radius: 4px;
+                            height: 32px;
+                            VerticalLayout {
+                                padding: 4px;
+                                Text { text: "TOOL CLR"; color: Theme.text-muted; font-size: 8px; font-weight: 700; }
+                                Text { text: PlannerState.diag-min-tool-clr; color: Theme.accent-stage2; font-size: 10px; font-weight: 600; }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

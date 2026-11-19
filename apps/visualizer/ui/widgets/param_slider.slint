@@ -1,0 +1,44 @@
+import { Slider } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+
+export component ParamSlider inherits VerticalLayout {
+    in property <string> label;
+    in property <string> unit: "";
+    in property <float> minimum: 0.0;
+    in property <float> maximum: 1.0;
+    in property <float> step: 0.01;
+    in property <string> formatted-value;
+    in-out property <float> value;
+    callback edited(float);
+
+    spacing: 2px;
+
+    HorizontalLayout {
+        Text {
+            text: root.label;
+            color: Theme.text-muted;
+            font-size: 11px;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+        Text {
+            text: root.formatted-value + (root.unit == "" ? "" : " " + root.unit);
+            color: Theme.text-primary;
+            font-size: 11px;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
+    }
+
+    Slider {
+        height: 20px;
+        minimum: root.minimum;
+        maximum: root.maximum;
+        step: root.step;
+        value: root.value;
+        changed(v) => {
+            root.value = v;
+            root.edited(v);
+        }
+    }
+}

@@ -1,0 +1,199 @@
+import { Button, ScrollView } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+import { AcmRuleKind, AcmSliceMode } from "../types.slint";
+import { AcmState } from "../state.slint";
+
+export component AcmMatrixPanel inherits Rectangle {
+    background: Theme.bg-canvas;
+    border-color: Theme.border-subtle;
+    border-width: 1px;
+
+    VerticalLayout {
+        padding: 8px;
+        spacing: 8px;
+
+        // Slice filter tabs
+        HorizontalLayout {
+            spacing: 4px;
+            Button {
+                text: "Inter-Arm Body";
+                primary: AcmState.slice-mode == AcmSliceMode.inter-arm;
+                height: 26px;
+                clicked => { AcmState.set-slice-mode(AcmSliceMode.inter-arm); }
+            }
+            Button {
+                text: "Self-Collision";
+                primary: AcmState.slice-mode == AcmSliceMode.self-collision;
+                height: 26px;
+                clicked => { AcmState.set-slice-mode(AcmSliceMode.self-collision); }
+            }
+            Button {
+                text: "Tools & Workpieces";
+                primary: AcmState.slice-mode == AcmSliceMode.tools-and-workpieces;
+                height: 26px;
+                clicked => { AcmState.set-slice-mode(AcmSliceMode.tools-and-workpieces); }
+            }
+            Button {
+                text: "Links x Obstacles";
+                primary: AcmState.slice-mode == AcmSliceMode.links-and-obstacles;
+                height: 26px;
+                clicked => { AcmState.set-slice-mode(AcmSliceMode.links-and-obstacles); }
+            }
+            Rectangle { horizontal-stretch: 1; }
+            Button {
+                text: "Body 40mm";
+                height: 26px;
+                clicked => { AcmState.bulk-set-inter-arm-margin(40.0); }
+            }
+            Button {
+                text: "Tool-Tool 4mm";
+                height: 26px;
+                clicked => { AcmState.bulk-set-tool-tool-margin(4.0); }
+            }
+            Button {
+                text: "Tool-WP 3mm";
+                height: 26px;
+                clicked => { AcmState.bulk-set-tool-workpiece-margin(3.0); }
+            }
+        }
+
+        // Scrollable Matrix Table
+        ScrollView {
+            vertical-stretch: 1;
+            VerticalLayout {
+                spacing: 2px;
+
+                // Column header row
+                HorizontalLayout {
+                    spacing: 2px;
+                    Rectangle { width: 96px; height: 24px; }
+                    for col in AcmState.col-headers: Rectangle {
+                        width: 44px;
+                        height: 24px;
+                        background: Theme.bg-surface;
+                        border-radius: 3px;
+                        Text {
+                            text: col.short-label;
+                            color: col.accent;
+                            font-size: 10px;
+                            font-weight: 700;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+
+                // Matrix body rows
+                for row in AcmState.rows: HorizontalLayout {
+                    spacing: 2px;
+                    Rectangle {
+                        width: 96px;
+                        height: 24px;
+                        background: Theme.bg-surface;
+                        border-radius: 3px;
+                        HorizontalLayout {
+                            padding-left: 6px;
+                            Text {
+                                text: row.header.short-label;
+                                color: row.header.accent;
+                                font-size: 10px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                    for cell in row.cells: Rectangle {
+                        width: 44px;
+                        height: 24px;
+                        border-radius: 3px;
+                        background: cell.rule == AcmRuleKind.diagonal ? #0f131a
+                            : (cell.rule == AcmRuleKind.custom-margin && cell.margin-mm < 10.0 ? #2e1f47
+                            : (cell.rule == AcmRuleKind.custom-margin ? #3d2b12
+                            : (cell.rule == AcmRuleKind.enabled ? #153042
+                            : (cell.rule == AcmRuleKind.disabled-dynamic ? #381924 : #161b22))));
+                        border-width: cell.selected || cell.near-violation ? 2px : 1px;
+                        border-color: cell.near-violation ? Theme.status-danger
+                            : (cell.selected ? Theme.accent-primary : Theme.border-subtle);
+
+                        cell-touch := TouchArea {
+                            clicked => { AcmState.select-cell(cell.row-key, cell.col-key); }
+                            double-clicked => { AcmState.toggle-cell-quick(cell.row-key, cell.col-key); }
+                        }
+
+                        Text {
+                            text: cell.label;
+                            color: cell.rule == AcmRuleKind.diagonal ? #303846
+                                : (cell.rule == AcmRuleKind.custom-margin && cell.margin-mm < 10.0 ? #d8b4fe
+                                : (cell.rule == AcmRuleKind.custom-margin ? #fcd34d
+                                : (cell.rule == AcmRuleKind.enabled ? #7dd3fc : Theme.text-muted)));
+                            font-size: 10px;
+                            font-weight: 600;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Pinned Bottom Pair Inspector Strip
+        Rectangle {
+            height: 44px;
+            background: Theme.bg-panel;
+            border-color: Theme.border-subtle;
+            border-width: 1px;
+            border-radius: 5px;
+
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: 10px;
+                spacing: 10px;
+
+                Text {
+                    text: AcmState.selected-pair.valid
+                        ? AcmState.selected-pair.pair-title + " (" + AcmState.selected-pair.pair-kind-badge + ")"
+                        : "Click any cell to inspect pair · Double-click to toggle Enabled/Disabled";
+                    color: Theme.text-primary;
+                    font-size: 11px;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+
+                if AcmState.selected-pair.valid: Button {
+                    text: "Toggle Active";
+                    height: 26px;
+                    clicked => {
+                        AcmState.toggle-cell-quick(AcmState.selected-pair.row-key, AcmState.selected-pair.col-key);
+                    }
+                }
+                if AcmState.selected-pair.valid: Button {
+                    text: "Set 4mm";
+                    height: 26px;
+                    clicked => {
+                        AcmState.apply-selected-pair-rule(
+                            AcmState.selected-pair.row-key,
+                            AcmState.selected-pair.col-key,
+                            AcmRuleKind.custom-margin,
+                            4.0,
+                            15.0
+                        );
+                    }
+                }
+                if AcmState.selected-pair.valid: Button {
+                    text: "Set 40mm";
+                    height: 26px;
+                    clicked => {
+                        AcmState.apply-selected-pair-rule(
+                            AcmState.selected-pair.row-key,
+                            AcmState.selected-pair.col-key,
+                            AcmRuleKind.custom-margin,
+                            40.0,
+                            160.0
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

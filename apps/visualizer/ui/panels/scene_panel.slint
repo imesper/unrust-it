@@ -1,0 +1,271 @@
+import { Button, ComboBox, ScrollView } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+import { PrimitiveKind, ToolPresetKind } from "../types.slint";
+import { SceneState } from "../state.slint";
+import { SectionCard } from "../widgets/section_card.slint";
+import { ParamSlider } from "../widgets/param_slider.slint";
+
+export component ScenePanel inherits Rectangle {
+    in-out property <int> active-tab: 0; // 0 = Scene Tree, 1 = Inspector
+
+    background: Theme.bg-panel;
+    border-color: Theme.border-subtle;
+    border-width: 1px;
+
+    VerticalLayout {
+        padding: 8px;
+        spacing: 8px;
+
+        // Summary metrics bar
+        Rectangle {
+            height: 28px;
+            background: Theme.bg-surface;
+            border-color: Theme.border-subtle;
+            border-width: 1px;
+            border-radius: 4px;
+            HorizontalLayout {
+                padding-left: 8px;
+                padding-right: 8px;
+                Text {
+                    text: "Arms: " + SceneState.arms.length + " · DOF: " + SceneState.total-dof + " · Tools: " + SceneState.total-tools;
+                    color: Theme.text-primary;
+                    font-size: 11px;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        // Sub-tabs
+        HorizontalLayout {
+            spacing: 4px;
+            Button {
+                text: "Scene Tree";
+                primary: root.active-tab == 0;
+                height: 26px;
+                horizontal-stretch: 1;
+                clicked => { root.active-tab = 0; }
+            }
+            Button {
+                text: "Inspector";
+                primary: root.active-tab == 1;
+                height: 26px;
+                horizontal-stretch: 1;
+                clicked => { root.active-tab = 1; }
+            }
+        }
+
+        if root.active-tab == 0: VerticalLayout {
+            spacing: 6px;
+            vertical-stretch: 1;
+
+            HorizontalLayout {
+                spacing: 4px;
+                Button { text: "+ 6-DOF Arm"; height: 24px; horizontal-stretch: 1; clicked => { SceneState.add-arm-preset("6dof"); } }
+                Button { text: "+ 4-DOF Arm"; height: 24px; horizontal-stretch: 1; clicked => { SceneState.add-arm-preset("4dof"); } }
+                Button { text: "+ Obs"; height: 24px; clicked => { SceneState.add-obstacle(PrimitiveKind.sphere, false); } }
+            }
+
+            ScrollView {
+                vertical-stretch: 1;
+                VerticalLayout {
+                    spacing: 2px;
+                    for node in SceneState.tree-nodes: Rectangle {
+                        height: 24px;
+                        border-radius: 4px;
+                        background: node.selected ? #17344d : (row-touch.has-hover ? Theme.bg-hover : transparent);
+                        border-color: node.selected ? Theme.accent-primary : transparent;
+                        border-width: node.selected ? 1px : 0px;
+
+                        row-touch := TouchArea {
+                            clicked => {
+                                SceneState.select-tree-node(node.node-id);
+                            }
+                        }
+
+                        HorizontalLayout {
+                            padding-left: 6px + node.depth * 12px;
+                            padding-right: 6px;
+                            spacing: 6px;
+
+                            if node.has-children: TouchArea {
+                                width: 14px;
+                                clicked => { SceneState.toggle-tree-expand(node.node-id); }
+                                Text {
+                                    text: node.expanded ? "▾" : "▸";
+                                    color: Theme.text-muted;
+                                    font-size: 11px;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            if !node.has-children: Rectangle { width: 14px; }
+
+                            Rectangle {
+                                width: 8px;
+                                height: 8px;
+                                y: 8px;
+                                border-radius: 4px;
+                                background: node.accent;
+                            }
+
+                            Text {
+                                text: node.label;
+                                color: Theme.text-primary;
+                                font-size: 11px;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+
+                            if node.badge != "": Rectangle {
+                                height: 16px;
+                                y: 4px;
+                                background: Theme.bg-canvas;
+                                border-color: Theme.border-subtle;
+                                border-width: 1px;
+                                border-radius: 3px;
+                                HorizontalLayout {
+                                    padding-left: 5px;
+                                    padding-right: 5px;
+                                    Text {
+                                        text: node.badge;
+                                        color: Theme.text-muted;
+                                        font-size: 9px;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Button {
+                text: "Arrange Arms on Ring (0.56 m)";
+                height: 24px;
+                clicked => { SceneState.arrange-arms-ring(0.56); }
+            }
+        }
+
+        if root.active-tab == 1: ScrollView {
+            vertical-stretch: 1;
+            VerticalLayout {
+                spacing: 8px;
+
+                if SceneState.selected-arm-index >= 0: SectionCard {
+                    title: "SELECTED ARM · " + SceneState.selected-arm.name;
+                    Text {
+                        text: SceneState.selected-arm.source-label + " · " + SceneState.selected-arm.dof + " DOF · " + SceneState.selected-arm.link-count + " links";
+                        color: Theme.text-muted;
+                        font-size: 11px;
+                    }
+                    ParamSlider {
+                        label: "Base X";
+                        unit: "m";
+                        minimum: -1.5;
+                        maximum: 1.5;
+                        step: 0.02;
+                        value: SceneState.selected-arm.base-x;
+                        formatted-value: Math.round(SceneState.selected-arm.base-x * 100.0) / 100.0;
+                        edited(v) => {
+                            SceneState.update-arm-base-pose(
+                                SceneState.selected-arm.robot-id,
+                                v,
+                                SceneState.selected-arm.base-y,
+                                SceneState.selected-arm.base-z,
+                                SceneState.selected-arm.base-yaw-deg
+                            );
+                        }
+                    }
+                    ParamSlider {
+                        label: "Base Y";
+                        unit: "m";
+                        minimum: -1.5;
+                        maximum: 1.5;
+                        step: 0.02;
+                        value: SceneState.selected-arm.base-y;
+                        formatted-value: Math.round(SceneState.selected-arm.base-y * 100.0) / 100.0;
+                        edited(v) => {
+                            SceneState.update-arm-base-pose(
+                                SceneState.selected-arm.robot-id,
+                                SceneState.selected-arm.base-x,
+                                v,
+                                SceneState.selected-arm.base-z,
+                                SceneState.selected-arm.base-yaw-deg
+                            );
+                        }
+                    }
+                    ParamSlider {
+                        label: "Base Yaw";
+                        unit: "deg";
+                        minimum: -180.0;
+                        maximum: 180.0;
+                        step: 5.0;
+                        value: SceneState.selected-arm.base-yaw-deg;
+                        formatted-value: Math.round(SceneState.selected-arm.base-yaw-deg);
+                        edited(v) => {
+                            SceneState.update-arm-base-pose(
+                                SceneState.selected-arm.robot-id,
+                                SceneState.selected-arm.base-x,
+                                SceneState.selected-arm.base-y,
+                                SceneState.selected-arm.base-z,
+                                v
+                            );
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 6px;
+                        Button {
+                            text: "Face Origin";
+                            height: 24px;
+                            horizontal-stretch: 1;
+                            clicked => { SceneState.face-arm-origin(SceneState.selected-arm.robot-id); }
+                        }
+                        Button {
+                            text: "Remove Arm";
+                            height: 24px;
+                            enabled: SceneState.arms.length > 1;
+                            clicked => { SceneState.remove-arm(SceneState.selected-arm.robot-id); }
+                        }
+                    }
+                }
+
+                if SceneState.selected-arm-index >= 0: SectionCard {
+                    title: "ATTACHED TOOL (PAYLOAD)";
+                    ComboBox {
+                        height: 26px;
+                        model: ["None (Detached)", "Parallel Gripper", "Precision Screwdriver", "Inspection Probe"];
+                        current-index: SceneState.selected-arm.tool-preset == ToolPresetKind.none ? 0
+                            : (SceneState.selected-arm.tool-preset == ToolPresetKind.parallel-gripper ? 1
+                            : (SceneState.selected-arm.tool-preset == ToolPresetKind.screwdriver ? 2 : 3));
+                        selected => {
+                            if self.current-index == 0 {
+                                SceneState.set-arm-tool-preset(SceneState.selected-arm.robot-id, ToolPresetKind.none);
+                            } else if self.current-index == 1 {
+                                SceneState.set-arm-tool-preset(SceneState.selected-arm.robot-id, ToolPresetKind.parallel-gripper);
+                            } else if self.current-index == 2 {
+                                SceneState.set-arm-tool-preset(SceneState.selected-arm.robot-id, ToolPresetKind.screwdriver);
+                            } else {
+                                SceneState.set-arm-tool-preset(SceneState.selected-arm.robot-id, ToolPresetKind.probe);
+                            }
+                        }
+                    }
+                    Text {
+                        text: "Tool: " + SceneState.selected-arm.tool-name + " · Margin: " + SceneState.selected-arm.tool-margin-mm + " mm";
+                        color: Theme.text-muted;
+                        font-size: 11px;
+                    }
+                }
+
+                SectionCard {
+                    title: "DETAILS";
+                    Text {
+                        text: SceneState.selected-info-summary;
+                        color: Theme.text-primary;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+        }
+    }
+}

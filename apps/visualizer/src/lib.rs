@@ -1,8 +1,12 @@
 //! Multi-arm simulation scenario generator, declarative scene engine, and JSON/HTML exporter for `unrust-it`.
 
+#[cfg(any(feature = "gui", feature = "gui-readback"))]
+pub mod gui;
+pub mod plots;
 #[cfg(feature = "render")]
 pub mod render;
 pub mod scene;
+pub mod worker;
 
 use nalgebra::{Isometry3, SVector, Translation3};
 use parry3d::shape::{Ball, SharedShape};
