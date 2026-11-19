@@ -2153,7 +2153,7 @@ impl BatchIkSolver {
     }
 
     /// Solves multi-target 6-DOF inverse kinematics across `num_seeds` initial seeds,
-    /// returning the lowest-cost collision-free [`Configuration`].
+    /// returning the lowest-cost collision-free [`crate::robot::Configuration`].
     #[allow(clippy::too_many_arguments)]
     pub fn solve_collision_free<B: BatchRolloutBackend>(
         &self,

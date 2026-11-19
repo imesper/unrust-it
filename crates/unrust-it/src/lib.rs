@@ -1,10 +1,85 @@
-//! Building blocks for planning collision-free paths and dynamic manipulation
-//! for single- and multi-arm robotic systems in 3D space.
+//! High-performance path planning, dynamic manipulation, and collision avoidance
+//! for single- and multi-arm ($K \ge 3$) robotic systems in 3D space.
 //!
-//! `unrust-it` separates immutable robot topology ([`MultiRobotModel`]) from
-//! pre-allocated per-thread workspaces ([`TransformBuffer`], [`CollisionWorkspace`])
-//! to support both multi-threaded global motion planning and zero-allocation
-//! real-time reactive collision avoidance.
+//! # Architecture Overview
+//!
+//! `unrust-it` is organized around two core design invariants:
+//!
+//! 1. **Dual-precision compute**:
+//!    - **Exact `f64` layer** ([`robot`], [`kinematics`], [`collision`], [`manifold`],
+//!      [`trajectory`], [`control`], [`planner`]) powered by `nalgebra` and `parry3d-f64` for
+//!      analytical geometric Jacobians, GJK/EPA signed distances, closed-chain constraints,
+//!      TOPP-RA time parameterization, and 1 kHz CBF reactive control.
+//!    - **Batched `f32` rollout layer** ([`batch`]) evaluating $B \times H$ states in one
+//!      dispatch via `wide::f32x8` + `rayon` ([`CpuSimdBatchBackend`]) and `wgpu` WGSL compute
+//!      shaders (`WgpuBatchBackend` / resident `GpuRobotContext` when the `gpu` feature is enabled).
+//! 2. **Zero-allocation hot paths**:
+//!    Immutable `Send + Sync` topology ([`MultiRobotModel`]) and scenes ([`CollisionEnvironment`])
+//!    are strictly separated from pre-allocated per-thread scratchpads ([`TransformBuffer`],
+//!    [`CollisionWorkspace`], [`ReactiveServoController`]).
+//!
+//! # Module Guide
+//!
+//! - [`robot`]: Kinematic trees, joint types/limits, `PlanningGroup`, `AttachedPayload`, and `MultiRobotModel`.
+//! - [`kinematics`]: Single-pass FK, analytical $6 \times N_{\text{dof}}$ Jacobians, screw-axis distance projection, DLS IK.
+//! - [`collision`]: Tier-1 `f64x4` SIMD SSV spheres/capsules, Tier-2 `parry3d` convex shapes, hardware-`CTZ` bitset ACM, BVH broad-phase, Lipschitz segment checking.
+//! - [`manifold`]: Holonomic `ConstraintManifold` and closed-chain grasp projection.
+//! - [`trajectory`]: $C^2$ `CubicSplinePath`, `ToppraTrajectory`, and `JerkLimitedTrajectory`.
+//! - [`control`]: 1 kHz `ReactiveServoController` with priority-weighted QP-CBF, tangential curl, and velocity dampers.
+//! - [`planner`]: Bidirectional `RrtPlanner` and two-stage close-proximity `TwoStageApproachPlanner`.
+//! - [`batch`]: `FlatRobotModelF32`, `EsdfGridF32`, `BatchIkSolver`, `BatchMppiOptimizer`, SIMD/GPU backends.
+//!
+//! # Feature Flags
+//!
+//! - `gpu` *(enabled by default)*: Enables `wgpu` WGSL compute shaders (`WgpuBatchBackend`, `GpuRobotContext`).
+//!   Disable default features for pure CPU SIMD (`f32x8` + `rayon`) headless deployments.
+//!
+//! # Quick Start
+//!
+//! ```rust
+//! use nalgebra::{Isometry3, Point3, UnitVector3, Vector3};
+//! use parry3d::shape::{Ball, SharedShape};
+//! use std::f64::consts::PI;
+//! use std::sync::Arc;
+//! use unrust_it::{
+//!     AllowedCollisionMatrix, CollisionEnvironment, Configuration, GeometryTier, JointLimit,
+//!     LinkGeometry, MultiRobotModel, PathPlanner, Robot, RobotId, RrtPlanner, Target, TaskPose,
+//! };
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let mut model = MultiRobotModel::new();
+//! let limit = JointLimit::new(-PI, PI);
+//! let segs = [
+//!     (UnitVector3::new_normalize(Vector3::z()), Vector3::new(0.0, 0.0, 0.2), limit, 0.05),
+//!     (UnitVector3::new_normalize(Vector3::y()), Vector3::new(0.0, 0.0, 0.4), limit, 0.04),
+//! ];
+//! let left = model.add_serial_arm(RobotId(0), "left", Isometry3::translation(0.0, 0.35, 0.0), &segs, Isometry3::translation(0.0, 0.0, 0.2))?;
+//! let right = model.add_serial_arm(RobotId(1), "right", Isometry3::translation(0.0, -0.35, 0.0), &segs, Isometry3::translation(0.0, 0.0, 0.2))?;
+//!
+//! let mut env = CollisionEnvironment::new();
+//! env.set_acm(AllowedCollisionMatrix::from_model(&model));
+//! for l in model.links() {
+//!     env.set_link_geometry(l.id, LinkGeometry::from_capsule(Point3::origin(), Point3::new(0.0, 0.0, 0.2), l.bounding_radius));
+//! }
+//! env.add_obstacle(SharedShape::new(Ball::new(0.08)), Isometry3::translation(0.4, 0.0, 0.4));
+//!
+//! let mut ws = env.create_workspace(&model);
+//! let mut witnesses = Vec::new();
+//! let start = Configuration::new(vec![0.0, 0.2, 0.0, -0.2]);
+//! env.query_signed_distances(&model, start.as_slice(), 1.0, GeometryTier::Convex, &mut ws, &mut witnesses)?;
+//!
+//! let mut buf = model.create_transform_buffer();
+//! model.forward_kinematics(&[0.2, 0.5, -0.2, -0.5], &mut buf)?;
+//! let target = Target::MultiPose(vec![
+//!     TaskPose::new(left.end_effectors[0], *buf.frame_pose(left.end_effectors[0])),
+//!     TaskPose::new(right.end_effectors[0], *buf.frame_pose(right.end_effectors[0])),
+//! ]);
+//!
+//! let path = RrtPlanner::new(env).plan_path(&Robot::from_model(Arc::new(model)), start, target)?;
+//! assert!(path.len() >= 2);
+//! # Ok(())
+//! # }
+//! ```
 
 pub mod batch;
 pub mod collision;

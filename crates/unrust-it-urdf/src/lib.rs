@@ -1,6 +1,40 @@
 //! URDF and MoveIt SRDF parser with automatic multi-tier collision geometry
 //! decomposition (`BoundingSphere`, `LinkCapsule`, and `parry3d` convex shapes)
 //! for `unrust-it`.
+//!
+//! Supports loading one or many robots with explicit `prefix` namespacing and
+//! world base mounting into a shared [`MultiRobotModel`] and [`CollisionEnvironment`]:
+//! - From XML strings: [`load_urdf_str`], [`add_urdf_to_scene`], [`apply_srdf_str`].
+//! - From filesystem paths: [`load_urdf_file`], [`add_urdf_file_to_scene`], [`apply_srdf_file`].
+//! - Built-in validated workcell fixtures: [`presets`] (`ARM_4DOF_URDF`/`SRDF`, `ARM_6DOF_URDF`/`SRDF`).
+//!
+//! # Example
+//!
+//! ```rust
+//! use nalgebra::Isometry3;
+//! use unrust_it::{CollisionEnvironment, MultiRobotModel, RobotId};
+//! use unrust_it_urdf::presets::{ARM_6DOF_SRDF, ARM_6DOF_URDF};
+//! use unrust_it_urdf::{add_urdf_to_scene, apply_srdf_str};
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let mut model = MultiRobotModel::new();
+//! let mut env = CollisionEnvironment::new();
+//!
+//! let arm0 = add_urdf_to_scene(
+//!     &mut model,
+//!     &mut env,
+//!     ARM_6DOF_URDF,
+//!     RobotId(0),
+//!     "arm0_",
+//!     Isometry3::translation(0.55, 0.0, 0.0),
+//! )?;
+//! apply_srdf_str(&mut model, &mut env, ARM_6DOF_SRDF, "arm0_")?;
+//!
+//! assert_eq!(arm0.q_indices.len(), 6);
+//! assert!(model.link_by_name("arm0_flange_link").is_some());
+//! # Ok(())
+//! # }
+//! ```
 
 use nalgebra::{Isometry3, Point3, Translation3, UnitQuaternion, UnitVector3, Vector3};
 use parry3d::bounding_volume::{Aabb, BoundingVolume};
