@@ -2,12 +2,14 @@
 //! closed-chain manifold stabilization, velocity-damper joint bounds, and Control Barrier Functions (CBFs).
 
 use crate::collision::{
-    CollisionEnvironment, CollisionError, CollisionWorkspace, GeometryTier, SignedDistanceWitness,
+    CollidingPair, CollisionEnvironment, CollisionError, CollisionWorkspace, GeometryTier,
+    SignedDistanceWitness,
 };
 use crate::kinematics::KinematicsError;
 use crate::manifold::ConstraintManifold;
-use crate::robot::{FrameId, MultiRobotModel, RobotError};
-use nalgebra::{DMatrix, DVector, Isometry3, SVector};
+use crate::robot::{FrameId, LinkId, MultiRobotModel, RobotError, RobotId};
+use nalgebra::{DMatrix, DVector, Isometry3, Point3, SVector, Vector3};
+use std::collections::BTreeMap;
 use thiserror::Error;
 
 /// Errors raised by the real-time reactive servo controller.
@@ -35,16 +37,34 @@ pub struct ServoTarget {
     pub desired_pose: Option<Isometry3<f64>>,
     /// Proportional feedback gain $K_p$ on pose error (`1/s`).
     pub pose_gain: f64,
+    /// Active twist dimensions `[vx, vy, vz, wx, wy, wz]` tracked by DLS IK.
+    pub active_dims: [bool; 6],
 }
 
 impl ServoTarget {
-    /// Creates a pose-tracking servo target with proportional gain `pose_gain`.
+    /// Creates a full 6-DOF pose-tracking servo target with proportional gain `pose_gain`.
     pub fn pose(frame: FrameId, desired_pose: Isometry3<f64>, pose_gain: f64) -> Self {
         Self {
             frame,
             feedforward_twist: SVector::zeros(),
             desired_pose: Some(desired_pose),
             pose_gain,
+            active_dims: [true; 6],
+        }
+    }
+
+    /// Creates a 3-DOF Cartesian position-only servo target (`[vx, vy, vz]` active).
+    pub fn position(frame: FrameId, desired_position: Point3<f64>, pose_gain: f64) -> Self {
+        Self {
+            frame,
+            feedforward_twist: SVector::zeros(),
+            desired_pose: Some(Isometry3::translation(
+                desired_position.x,
+                desired_position.y,
+                desired_position.z,
+            )),
+            pose_gain,
+            active_dims: [true, true, true, false, false, false],
         }
     }
 
@@ -55,6 +75,7 @@ impl ServoTarget {
             feedforward_twist,
             desired_pose: None,
             pose_gain: 0.0,
+            active_dims: [true; 6],
         }
     }
 }
@@ -64,9 +85,9 @@ impl ServoTarget {
 pub struct ReactiveServoConfig {
     /// Control loop timestep $\Delta t$ in seconds (e.g., `0.001` for 1 kHz).
     pub dt: f64,
-    /// Minimum allowable safety clearance $d_{\min}$ in meters.
+    /// Default minimum allowable safety clearance $d_{\min}$ in meters when no pair-specific margin is configured.
     pub safety_margin: f64,
-    /// Distance threshold $d_{\text{act}}$ below which CBF collision avoidance inequalities activate.
+    /// Default distance threshold $d_{\text{act}}$ below which CBF collision avoidance inequalities activate.
     pub cbf_activation_distance: f64,
     /// Control Barrier Function decay rate $\gamma > 0$ ($\dot{d} + \gamma (d - d_{\min}) \ge 0$).
     pub cbf_gamma: f64,
@@ -74,6 +95,16 @@ pub struct ReactiveServoConfig {
     pub damping: f64,
     /// Null-space posture attraction gain toward neutral configuration.
     pub posture_gain: f64,
+    /// Per-arm metric weights for priority-weighted QP-CBF (higher weight resists yielding; default `1.0`).
+    pub arm_priorities: BTreeMap<RobotId, f64>,
+    /// Gain for tangential symmetry-breaking curl injected when CBF constraints oppose nominal motion.
+    pub tangential_curl_gain: f64,
+    /// Maximum Dykstra active-set iterations per control tick for the priority-weighted QP-CBF.
+    pub qp_max_iterations: usize,
+    /// Soft-slack quadratic penalty regularization $\rho \ge 0$ preventing QP infeasibility when constraints conflict.
+    pub qp_slack_reg: f64,
+    /// Discrete-time CBF curvature safety buffer (meters) added to `d_min` so forward Euler steps stay strictly clear.
+    pub cbf_margin_padding: f64,
 }
 
 impl Default for ReactiveServoConfig {
@@ -85,18 +116,41 @@ impl Default for ReactiveServoConfig {
             cbf_gamma: 5.0,
             damping: 0.03,
             posture_gain: 0.5,
+            arm_priorities: BTreeMap::new(),
+            tangential_curl_gain: 0.35,
+            qp_max_iterations: 30,
+            qp_slack_reg: 1e-5,
+            cbf_margin_padding: 0.001,
         }
     }
 }
 
-/// Pre-allocated, real-time reactive velocity controller with Control Barrier Function (CBF)
-/// self-collision, inter-arm collision, and environment obstacle avoidance.
+impl ReactiveServoConfig {
+    /// Sets the priority weight for `robot` in the QP-CBF objective (`priority > 1.0` holds course while lower-priority arms yield).
+    pub fn with_arm_priority(mut self, robot: RobotId, priority: f64) -> Self {
+        self.arm_priorities.insert(robot, priority.max(1e-3));
+        self
+    }
+}
+
+/// Pre-allocated, real-time reactive velocity controller with priority-weighted QP Control Barrier
+/// Function (CBF) self-collision, inter-arm collision, attached tool/payload avoidance, and symmetry breaking.
 pub struct ReactiveServoController {
     /// Controller tuning parameters.
     pub config: ReactiveServoConfig,
     workspace: CollisionWorkspace,
     witnesses: Vec<SignedDistanceWitness>,
     j_dist_row: Vec<f64>,
+    j_tan_row: Vec<f64>,
+    curl_dq: Vec<f64>,
+    inv_dof_weights: Vec<f64>,
+    cbf_a_rows: Vec<f64>,
+    cbf_b_rhs: Vec<f64>,
+    cbf_a_winv_a: Vec<f64>,
+    cbf_lambdas: Vec<f64>,
+    qp_p_box: Vec<f64>,
+    lb: Vec<f64>,
+    ub: Vec<f64>,
 }
 
 impl ReactiveServoController {
@@ -106,11 +160,22 @@ impl ReactiveServoController {
         env: &CollisionEnvironment,
         config: ReactiveServoConfig,
     ) -> Self {
+        let dof = model.dof();
         Self {
             config,
             workspace: env.create_workspace(model),
-            witnesses: Vec::with_capacity(32),
-            j_dist_row: vec![0.0; model.dof()],
+            witnesses: Vec::with_capacity(64),
+            j_dist_row: vec![0.0; dof],
+            j_tan_row: vec![0.0; dof],
+            curl_dq: vec![0.0; dof],
+            inv_dof_weights: vec![1.0; dof],
+            cbf_a_rows: Vec::with_capacity(64 * dof),
+            cbf_b_rhs: Vec::with_capacity(64),
+            cbf_a_winv_a: Vec::with_capacity(64),
+            cbf_lambdas: Vec::with_capacity(64),
+            qp_p_box: vec![0.0; dof],
+            lb: vec![0.0; dof],
+            ub: vec![0.0; dof],
         }
     }
 
@@ -135,11 +200,26 @@ impl ReactiveServoController {
             }));
         }
 
-        // 1. Evaluate FK and query all signed distance witnesses within cbf_activation_distance
+        // Refresh inverse priority weights per DOF
+        self.inv_dof_weights.resize(dof, 1.0);
+        for k in 0..dof {
+            let robot_id = model.joint(model.actuated_joint(k)).robot;
+            let w = self
+                .config
+                .arm_priorities
+                .get(&robot_id)
+                .copied()
+                .unwrap_or(1.0)
+                .max(1e-3);
+            self.inv_dof_weights[k] = 1.0 / w;
+        }
+
+        // 1. Evaluate FK and query all signed distance witnesses within max configured activation distance
+        let max_act = env.max_activation_distance(self.config.cbf_activation_distance);
         env.query_signed_distances(
             model,
             q_current,
-            self.config.cbf_activation_distance,
+            max_act,
             GeometryTier::Convex,
             &mut self.workspace,
             &mut self.witnesses,
@@ -152,13 +232,17 @@ impl ReactiveServoController {
             dq[k] = self.config.posture_gain * (q_mid - q_current[k]);
         }
 
-        if !targets.is_empty() {
-            let m = 6 * targets.len();
+        let m: usize = targets
+            .iter()
+            .map(|t| t.active_dims.iter().filter(|&&b| b).count())
+            .sum();
+        if m > 0 {
             let mut v_des = DVector::<f64>::zeros(m);
             let mut j_task = DMatrix::<f64>::zeros(m, dof);
+            let mut j_full = DMatrix::<f64>::zeros(6, dof);
+            let mut row_cursor = 0;
 
-            for (i, target) in targets.iter().enumerate() {
-                let row_off = 6 * i;
+            for target in targets {
                 let mut twist = target.feedforward_twist;
                 if let Some(des_pose) = &target.desired_pose {
                     let curr_pose = self.workspace.transforms.frame_pose(target.frame);
@@ -172,11 +256,20 @@ impl ReactiveServoController {
                     twist[4] += target.pose_gain * rot_err.y;
                     twist[5] += target.pose_gain * rot_err.z;
                 }
+                model.geometric_jacobian(
+                    &self.workspace.transforms,
+                    target.frame,
+                    j_full.as_view_mut(),
+                )?;
                 for r in 0..6 {
-                    v_des[row_off + r] = twist[r];
+                    if target.active_dims[r] {
+                        v_des[row_cursor] = twist[r];
+                        for c in 0..dof {
+                            j_task[(row_cursor, c)] = j_full[(r, c)];
+                        }
+                        row_cursor += 1;
+                    }
                 }
-                let sub_j = j_task.view_mut((row_off, 0), (6, dof));
-                model.geometric_jacobian(&self.workspace.transforms, target.frame, sub_j)?;
             }
 
             let mut gram = &j_task * j_task.transpose();
@@ -214,8 +307,8 @@ impl ReactiveServoController {
 
         // 4. Compute velocity-damper joint position, velocity, and acceleration box bounds
         let dt = self.config.dt.max(1e-4);
-        let mut lb = vec![0.0; dof];
-        let mut ub = vec![0.0; dof];
+        self.lb.resize(dof, 0.0);
+        self.ub.resize(dof, 0.0);
         for (k, lim) in model.dof_limits().iter().enumerate() {
             let v_max = lim.max_velocity;
             let a_max = lim.max_acceleration;
@@ -229,53 +322,229 @@ impl ReactiveServoController {
             } else {
                 v_max
             };
-            lb[k] = (-v_max).max(dq_current[k] - a_max * dt).max(pos_lb);
-            ub[k] = v_max.min(dq_current[k] + a_max * dt).min(pos_ub);
-            if lb[k] > ub[k] {
-                let mid = 0.5 * (lb[k] + ub[k]);
-                lb[k] = mid;
-                ub[k] = mid;
+            self.lb[k] = (-v_max).max(dq_current[k] - a_max * dt).max(pos_lb);
+            self.ub[k] = v_max.min(dq_current[k] + a_max * dt).min(pos_ub);
+            if self.lb[k] > self.ub[k] {
+                let mid = 0.5 * (self.lb[k] + self.ub[k]);
+                self.lb[k] = mid;
+                self.ub[k] = mid;
             }
         }
 
-        // 5. Iterative Control Barrier Function (CBF) half-space & box-bound projection:
-        //    For each witness i: J_dist_i * dq >= -gamma * (d_i - safety_margin)
+        // 5. Build active per-pair CBF constraints and compute tangential symmetry-breaking curl
         self.j_dist_row.resize(dof, 0.0);
-        for _iter in 0..10 {
-            for w in &self.witnesses {
-                w.compute_distance_jacobian(
-                    model,
-                    &self.workspace.transforms,
-                    &mut self.j_dist_row,
-                );
-                let norm_sq: f64 = self.j_dist_row.iter().map(|&v| v * v).sum();
-                if norm_sq <= 1e-12 {
-                    continue;
-                }
-                let j_dot_dq: f64 = self
+        self.j_tan_row.resize(dof, 0.0);
+        self.curl_dq.resize(dof, 0.0);
+        self.curl_dq.fill(0.0);
+        self.cbf_a_rows.clear();
+        self.cbf_b_rhs.clear();
+        self.cbf_a_winv_a.clear();
+
+        for w in &self.witnesses {
+            let d_min = env.effective_pair_margin(&w.pair, self.config.safety_margin)
+                + self.config.cbf_margin_padding.max(0.0);
+            let d_act = env
+                .effective_pair_activation(&w.pair, self.config.cbf_activation_distance)
+                .max(d_min + 1e-3);
+            if w.signed_distance > d_act {
+                continue;
+            }
+
+            w.compute_distance_jacobian(
+                model,
+                &self.workspace.transforms,
+                &mut self.j_dist_row,
+            );
+            let a_winv_a: f64 = self
+                .j_dist_row
+                .iter()
+                .zip(self.inv_dof_weights.iter())
+                .map(|(&j, &iw)| j * j * iw)
+                .sum();
+            if a_winv_a <= 1e-12 {
+                continue;
+            }
+
+            let b_i = -self.config.cbf_gamma * (w.signed_distance - d_min);
+            self.cbf_a_rows.extend_from_slice(&self.j_dist_row);
+            self.cbf_b_rhs.push(b_i);
+            self.cbf_a_winv_a.push(a_winv_a);
+
+            if self.config.tangential_curl_gain > 0.0 {
+                let j_dot_dq_nom: f64 = self
                     .j_dist_row
                     .iter()
                     .zip(dq.iter())
                     .map(|(&j, &v)| j * v)
                     .sum();
-                let h = w.signed_distance - self.config.safety_margin;
-                let min_rate = -self.config.cbf_gamma * h;
+                let violation = (b_i - j_dot_dq_nom).max(0.0);
+                if violation > 1e-9 {
+                    let up = if w.normal_world.z.abs() < 0.9 {
+                        Vector3::z()
+                    } else {
+                        Vector3::x()
+                    };
+                    let tangent_raw = up.cross(&w.normal_world);
+                    let t_norm = tangent_raw.norm();
+                    if t_norm > 1e-9 {
+                        let mut tangent = tangent_raw / t_norm;
+                        self.j_tan_row.fill(0.0);
+                        match w.pair {
+                            CollidingPair::LinkToObstacle { link, .. }
+                            | CollidingPair::PayloadToObstacle {
+                                parent_link: link, ..
+                            } => {
+                                model.accumulate_point_jacobian_projection(
+                                    &self.workspace.transforms,
+                                    link,
+                                    &w.witness_a_world,
+                                    &tangent,
+                                    1.0,
+                                    &mut self.j_tan_row,
+                                );
+                            }
+                            CollidingPair::LinkToLink { link_a, link_b }
+                            | CollidingPair::PayloadToLink {
+                                parent_link: link_a,
+                                link: link_b,
+                                ..
+                            }
+                            | CollidingPair::PayloadToPayload {
+                                parent_link_a: link_a,
+                                parent_link_b: link_b,
+                                ..
+                            } => {
+                                let root_a = root_link_of(model, link_a);
+                                let root_b = root_link_of(model, link_b);
+                                if root_a != root_b {
+                                    let base_dir = self
+                                        .workspace
+                                        .transforms
+                                        .link_pose(root_a)
+                                        .translation
+                                        .vector
+                                        - self
+                                            .workspace
+                                            .transforms
+                                            .link_pose(root_b)
+                                            .translation
+                                            .vector;
+                                    if base_dir.dot(&tangent) < -0.1 * base_dir.norm() {
+                                        tangent = -tangent;
+                                    }
+                                }
+                                model.accumulate_point_jacobian_projection(
+                                    &self.workspace.transforms,
+                                    link_a,
+                                    &w.witness_a_world,
+                                    &tangent,
+                                    1.0,
+                                    &mut self.j_tan_row,
+                                );
+                                model.accumulate_point_jacobian_projection(
+                                    &self.workspace.transforms,
+                                    link_b,
+                                    &w.witness_b_world,
+                                    &tangent,
+                                    -1.0,
+                                    &mut self.j_tan_row,
+                                );
+                            }
+                        }
 
-                if j_dot_dq < min_rate {
-                    let alpha = (min_rate - j_dot_dq) / norm_sq;
-                    for (k, &j_val) in self.j_dist_row.iter().enumerate() {
-                        dq[k] += alpha * j_val;
+                        let t_winv_t: f64 = self
+                            .j_tan_row
+                            .iter()
+                            .zip(self.inv_dof_weights.iter())
+                            .map(|(&jt, &iw)| jt * jt * iw)
+                            .sum();
+                        if t_winv_t > 1e-12 {
+                            let tan_dot_dq: f64 = self
+                                .j_tan_row
+                                .iter()
+                                .zip(dq.iter())
+                                .map(|(&jt, &v)| jt * v)
+                                .sum();
+                            let dir_sign = if tan_dot_dq < -1e-6 { -1.0 } else { 1.0 };
+                            let prox = ((d_act - w.signed_distance)
+                                / (d_act - d_min).max(1e-4))
+                            .clamp(0.0, 1.0);
+                            let scale = dir_sign
+                                * self.config.tangential_curl_gain
+                                * prox
+                                * violation
+                                / (t_winv_t + 1e-4);
+                            for k in 0..dof {
+                                self.curl_dq[k] +=
+                                    scale * self.inv_dof_weights[k] * self.j_tan_row[k];
+                            }
+                        }
                     }
                 }
             }
+        }
 
-            // Clamp onto velocity-damper box bounds
-            for k in 0..dof {
-                dq[k] = dq[k].clamp(lb[k], ub[k]);
+        // Inject tangential curl into the nominal command BEFORE QP safety projection
+        for k in 0..dof {
+            dq[k] += self.curl_dq[k];
+        }
+
+        // 6. Priority-weighted soft-slack QP-CBF with box bounds via Dykstra's projection in W-metric
+        let num_cbf = self.cbf_b_rhs.len();
+        let rho = self.config.qp_slack_reg.max(0.0);
+        self.cbf_lambdas.clear();
+        self.cbf_lambdas.resize(num_cbf, 0.0);
+        self.qp_p_box.resize(dof, 0.0);
+        self.qp_p_box.fill(0.0);
+
+        let max_iters = self.config.qp_max_iterations.max(1);
+        for _iter in 0..max_iters {
+            let mut max_delta = 0.0_f64;
+
+            for i in 0..num_cbf {
+                let a_i = &self.cbf_a_rows[i * dof..(i + 1) * dof];
+                let a_winv_a_raw = self.cbf_a_winv_a[i];
+                let dot_curr: f64 = a_i.iter().zip(dq.iter()).map(|(&a, &v)| a * v).sum();
+                let y_dot_a = dot_curr - self.cbf_lambdas[i] * a_winv_a_raw;
+                let new_lambda =
+                    ((self.cbf_b_rhs[i] - y_dot_a) / (a_winv_a_raw + rho)).max(0.0);
+                let d_lam = new_lambda - self.cbf_lambdas[i];
+                if d_lam.abs() > 1e-12 {
+                    for k in 0..dof {
+                        let step = d_lam * self.inv_dof_weights[k] * a_i[k];
+                        dq[k] += step;
+                        max_delta = max_delta.max(step.abs());
+                    }
+                    self.cbf_lambdas[i] = new_lambda;
+                }
             }
+
+            for k in 0..dof {
+                let y_k = dq[k] - self.qp_p_box[k];
+                let clamped = y_k.clamp(self.lb[k], self.ub[k]);
+                max_delta = max_delta.max((clamped - dq[k]).abs());
+                self.qp_p_box[k] = clamped - y_k;
+                dq[k] = clamped;
+            }
+
+            if max_delta < 1e-7 {
+                break;
+            }
+        }
+
+        for k in 0..dof {
+            dq[k] = dq[k].clamp(self.lb[k], self.ub[k]);
         }
 
         out_dq_cmd.copy_from_slice(dq.as_slice());
         Ok(())
     }
+}
+
+#[inline]
+fn root_link_of(model: &MultiRobotModel, mut link: LinkId) -> LinkId {
+    while let Some(parent) = model.link(link).parent_link {
+        link = parent;
+    }
+    link
 }

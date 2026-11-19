@@ -1,7 +1,6 @@
 //! Robot descriptions, multi-arm kinematic forests, and strongly typed configuration spaces.
 
 use nalgebra::{DVector, Isometry3, Point3, UnitVector3, Vector3};
-use parry3d::shape::SharedShape;
 use std::f64::consts::{PI, TAU};
 use std::sync::Arc;
 use thiserror::Error;
@@ -52,6 +51,18 @@ impl FrameId {
 /// Strongly typed identifier for an environment obstacle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ObstacleId(pub u32);
+
+/// Strongly typed dense index for an attached payload or tool in a [`crate::collision::CollisionEnvironment`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PayloadId(pub u16);
+
+impl PayloadId {
+    /// Index as `usize` for slice lookups.
+    #[inline]
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
 
 /// A joint's inclusive limits, expressed in radians (revolute) or meters (prismatic).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -520,22 +531,7 @@ impl PlanningGroup {
     }
 }
 
-/// An object dynamically grasped by or attached to a robot link.
-#[derive(Debug, Clone)]
-pub struct AttachedPayload {
-    /// Unique identifier for the payload.
-    pub id: String,
-    /// Link to which this payload is rigidly attached.
-    pub parent_link: LinkId,
-    /// Pose of the payload relative to `parent_link`.
-    pub local_pose: Isometry3<f64>,
-    /// Collision geometry of the payload.
-    pub shape: SharedShape,
-    /// Payload mass in kilograms (for dynamic manipulation).
-    pub mass: f64,
-    /// Links allowed to touch this payload without triggering collision (e.g., gripper fingers).
-    pub touch_links: Vec<LinkId>,
-}
+pub use crate::collision::AttachedPayload;
 
 /// Immutable topological and kinodynamic description of a single- or multi-arm robotic system.
 ///

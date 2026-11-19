@@ -307,8 +307,9 @@ pub fn add_urdf_to_scene(
             for j in (i + 1)..prev_num_links {
                 let li = LinkId(i as u16);
                 let lj = LinkId(j as u16);
-                if !prev.is_pair_active(li, lj) {
-                    new_acm.set_rule(li, lj, CollisionRule::DisabledDefault);
+                let prev_rule = prev.rule(li, lj);
+                if prev_rule != CollisionRule::Enabled {
+                    new_acm.set_rule(li, lj, prev_rule);
                 }
             }
         }

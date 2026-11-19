@@ -9,8 +9,8 @@
 //! 3. **Branchless geometric primitives** (link sphere trees + 3D ESDF voxel grids)
 //!    with zero GJK/EPA while-loop warp divergence.
 
-use crate::collision::{AllowedCollisionMatrix, CollisionEnvironment};
-use crate::robot::{FrameAttachment, FrameId, JointType, LinkId, MultiRobotModel};
+use crate::collision::{AllowedCollisionMatrix, CollidingPair, CollisionEnvironment};
+use crate::robot::{FrameAttachment, FrameId, JointType, LinkId, MultiRobotModel, PayloadId};
 use bytemuck::{Pod, Zeroable};
 use nalgebra::{Isometry3, Point3, Vector3};
 use rayon::prelude::*;
@@ -22,6 +22,9 @@ pub const JOINT_KIND_FIXED: u32 = 0;
 pub const JOINT_KIND_REVOLUTE: u32 = 1;
 /// Prismatic linear joint (`u32` tag).
 pub const JOINT_KIND_PRISMATIC: u32 = 2;
+
+/// Flag on [`FlatLinkSphereF32::flags`] indicating the sphere belongs to an attached payload/tool.
+pub const SPHERE_FLAG_PAYLOAD: u32 = 1;
 
 /// GPU-ready `#[repr(C)]` flat joint descriptor (`f32`, 64 bytes, 16-byte aligned).
 #[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
@@ -47,21 +50,25 @@ pub struct FlatJointF32 {
     pub max_pos: f32,
 }
 
-/// GPU-ready `#[repr(C)]` sphere primitive attached to a robot link (`f32`, 32 bytes, 16-byte aligned).
+/// GPU-ready `#[repr(C)]` sphere primitive attached to a robot link or payload (`f32`, 32 bytes, 16-byte aligned).
 #[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
 #[repr(C)]
 pub struct FlatLinkSphereF32 {
-    /// Local sphere center `[x, y, z]` in link coordinates.
+    /// Local sphere center `[x, y, z]` in owning link coordinates.
     pub local_center: [f32; 3],
     /// Sphere radius in meters.
     pub radius: f32,
     /// Owning link index (`0..num_links`).
     pub link_index: u32,
-    /// Padding for 16-byte alignment in GPU storage buffers.
-    pub _pad: [u32; 3],
+    /// Minimum safety margin (meters) applied against ESDF obstacles.
+    pub esdf_margin: f32,
+    /// Optional per-sphere ESDF activation distance override (`<= 0.0` falls back to global uniform).
+    pub esdf_activation: f32,
+    /// Bit flags (`SPHERE_FLAG_PAYLOAD` if this sphere originates from an attached payload/tool).
+    pub flags: u32,
 }
 
-/// GPU-ready `#[repr(C)]` active self/inter-arm sphere collision pair (`f32`, 16 bytes, 16-byte aligned).
+/// GPU-ready `#[repr(C)]` active self/inter-arm/tool sphere collision pair (`f32`, 16 bytes, 16-byte aligned).
 #[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
 #[repr(C)]
 pub struct FlatSpherePairF32 {
@@ -69,10 +76,10 @@ pub struct FlatSpherePairF32 {
     pub sphere_a: u32,
     /// Second sphere index in `FlatRobotModelF32::spheres`.
     pub sphere_b: u32,
-    /// Combined radius plus safety margin ($r_a + r_b + d_{\text{margin}}$).
+    /// Combined radius plus pair-specific safety margin ($r_a + r_b + d_{\text{margin}}$).
     pub combined_radius: f32,
-    /// Padding for 16-byte alignment.
-    pub _pad: u32,
+    /// Optional per-pair activation distance override (`<= 0.0` falls back to global uniform).
+    pub activation_distance: f32,
 }
 
 /// GPU-ready `#[repr(C)]` end-effector frame descriptor (`f32`, 32 bytes, 16-byte aligned).
@@ -138,9 +145,19 @@ pub struct FlatRobotModelF32 {
 }
 
 impl FlatRobotModelF32 {
-    /// Compiles a [`MultiRobotModel`] and [`CollisionEnvironment`]
-    /// into a contiguous GPU/SIMD-friendly `f32` model.
+    /// Compiles a [`MultiRobotModel`] and [`CollisionEnvironment`] (including attached payloads/tools)
+    /// into a contiguous GPU/SIMD-friendly `f32` model with `0.0` fallback default margin.
     pub fn compile(model: &MultiRobotModel, env: &CollisionEnvironment) -> Self {
+        Self::compile_with_default_margin(model, env, 0.0)
+    }
+
+    /// Compiles a [`MultiRobotModel`] and [`CollisionEnvironment`] (including attached payloads/tools
+    /// and per-pair safety margins/activations) into a contiguous GPU/SIMD-friendly `f32` model.
+    pub fn compile_with_default_margin(
+        model: &MultiRobotModel,
+        env: &CollisionEnvironment,
+        default_margin: f64,
+    ) -> Self {
         let dof = model.dof();
         let num_links = model.num_links();
         let mut joints = Vec::with_capacity(num_links);
@@ -188,12 +205,41 @@ impl FlatRobotModelF32 {
                         local_center: [s.center.x as f32, s.center.y as f32, s.center.z as f32],
                         radius: s.radius as f32,
                         link_index: link_idx as u32,
-                        _pad: [0; 3],
+                        esdf_margin: default_margin as f32,
+                        esdf_activation: 0.0,
+                        flags: 0,
                     });
                 }
             }
             let end = spheres.len();
             *range_slot = start..end;
+        }
+
+        let payloads = env.attached_payloads();
+        let mut payload_sphere_ranges = vec![0..0; payloads.len()];
+        for (p_idx, payload) in payloads.iter().enumerate() {
+            if payload.parent_link.index() >= num_links {
+                continue;
+            }
+            let start = spheres.len();
+            let esdf_margin = payload.safety_margin.unwrap_or(default_margin) as f32;
+            let esdf_activation = payload.activation_distance.unwrap_or(0.0) as f32;
+            for s in &payload.geometry.local_spheres {
+                let local_in_link = payload.local_pose.transform_point(&s.center);
+                spheres.push(FlatLinkSphereF32 {
+                    local_center: [
+                        local_in_link.x as f32,
+                        local_in_link.y as f32,
+                        local_in_link.z as f32,
+                    ],
+                    radius: s.radius as f32,
+                    link_index: payload.parent_link.0 as u32,
+                    esdf_margin,
+                    esdf_activation,
+                    flags: SPHERE_FLAG_PAYLOAD,
+                });
+            }
+            payload_sphere_ranges[p_idx] = start..spheres.len();
         }
 
         let default_acm;
@@ -207,7 +253,9 @@ impl FlatRobotModelF32 {
 
         let mut active_self_pairs = Vec::new();
         acm.for_each_active_pair(|link_a, link_b| {
-            let margin = acm.pair_margin(link_a, link_b) as f32;
+            let pair = CollidingPair::LinkToLink { link_a, link_b };
+            let margin = env.effective_pair_margin(&pair, default_margin) as f32;
+            let act = env.custom_pair_activation(&pair).unwrap_or(0.0) as f32;
             let range_a = &link_sphere_ranges[link_a.index()];
             let range_b = &link_sphere_ranges[link_b.index()];
             for sa in range_a.clone() {
@@ -216,11 +264,89 @@ impl FlatRobotModelF32 {
                         sphere_a: sa as u32,
                         sphere_b: sb as u32,
                         combined_radius: spheres[sa].radius + spheres[sb].radius + margin,
-                        _pad: 0,
+                        activation_distance: act,
                     });
                 }
             }
         });
+
+        // Payload <-> Non-Touch Link sphere pairs
+        for (p_idx, payload) in payloads.iter().enumerate() {
+            if payload.parent_link.index() >= num_links {
+                continue;
+            }
+            let range_p = &payload_sphere_ranges[p_idx];
+            if range_p.is_empty() {
+                continue;
+            }
+            let payload_id = PayloadId(p_idx as u16);
+            for (link_idx, range_l) in link_sphere_ranges.iter().enumerate() {
+                if range_l.is_empty() {
+                    continue;
+                }
+                let link_id = LinkId(link_idx as u16);
+                if link_id == payload.parent_link
+                    || payload.touch_links.contains(&link_id)
+                    || !env.is_payload_link_enabled(&payload.id, link_id)
+                {
+                    continue;
+                }
+                let pair = CollidingPair::PayloadToLink {
+                    payload: payload_id,
+                    parent_link: payload.parent_link,
+                    link: link_id,
+                };
+                let margin = env.effective_pair_margin(&pair, default_margin) as f32;
+                let act = env.custom_pair_activation(&pair).unwrap_or(0.0) as f32;
+                for sa in range_p.clone() {
+                    for sb in range_l.clone() {
+                        active_self_pairs.push(FlatSpherePairF32 {
+                            sphere_a: sa as u32,
+                            sphere_b: sb as u32,
+                            combined_radius: spheres[sa].radius + spheres[sb].radius + margin,
+                            activation_distance: act,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Payload <-> Payload sphere pairs (tool-to-tool)
+        for p_a in 0..payloads.len() {
+            let pa = &payloads[p_a];
+            let range_a = &payload_sphere_ranges[p_a];
+            if pa.parent_link.index() >= num_links || range_a.is_empty() {
+                continue;
+            }
+            for (p_b, pb) in payloads.iter().enumerate().skip(p_a + 1) {
+                let range_b = &payload_sphere_ranges[p_b];
+                if pb.parent_link.index() >= num_links
+                    || range_b.is_empty()
+                    || pa.parent_link == pb.parent_link
+                    || !env.is_payload_pair_enabled(&pa.id, &pb.id)
+                {
+                    continue;
+                }
+                let pair = CollidingPair::PayloadToPayload {
+                    payload_a: PayloadId(p_a as u16),
+                    parent_link_a: pa.parent_link,
+                    payload_b: PayloadId(p_b as u16),
+                    parent_link_b: pb.parent_link,
+                };
+                let margin = env.effective_pair_margin(&pair, default_margin) as f32;
+                let act = env.custom_pair_activation(&pair).unwrap_or(0.0) as f32;
+                for sa in range_a.clone() {
+                    for sb in range_b.clone() {
+                        active_self_pairs.push(FlatSpherePairF32 {
+                            sphere_a: sa as u32,
+                            sphere_b: sb as u32,
+                            combined_radius: spheres[sa].radius + spheres[sb].radius + margin,
+                            activation_distance: act,
+                        });
+                    }
+                }
+            }
+        }
 
         let mut end_effectors = Vec::new();
         for group in model.groups() {
@@ -736,16 +862,28 @@ impl BatchRolloutBackend for CpuSimdBatchBackend {
                     let dy = sa[1] - sb[1];
                     let dz = sa[2] - sb[2];
                     let d = (dx * dx + dy * dy + dz * dz).sqrt() - pair.combined_radius;
-                    total_cost += smooth_hinge_cost(d, act, inv_two_act);
+                    let (pair_act, pair_inv_two_act) = if pair.activation_distance > 0.0 {
+                        let a = pair.activation_distance.max(1e-4);
+                        (a, 0.5 / a)
+                    } else {
+                        (act, inv_two_act)
+                    };
+                    total_cost += smooth_hinge_cost(d, pair_act, pair_inv_two_act);
                 }
 
                 if let Some(grid) = esdf {
-                    for s in spheres_b {
+                    for (s_meta, s) in model.spheres.iter().zip(spheres_b.iter()) {
                         if let Some((voxel_d, _grad)) =
                             grid.sample_distance_and_gradient([s[0], s[1], s[2]])
                         {
-                            let d = voxel_d - s[3];
-                            total_cost += smooth_hinge_cost(d, act, inv_two_act);
+                            let d = voxel_d - (s[3] + s_meta.esdf_margin);
+                            let (s_act, s_inv_two_act) = if s_meta.esdf_activation > 0.0 {
+                                let a = s_meta.esdf_activation.max(1e-4);
+                                (a, 0.5 / a)
+                            } else {
+                                (act, inv_two_act)
+                            };
+                            total_cost += smooth_hinge_cost(d, s_act, s_inv_two_act);
                         }
                     }
                 }

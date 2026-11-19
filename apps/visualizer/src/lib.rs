@@ -231,7 +231,12 @@ fn sample_frame(
         .into_iter()
         .take(5)
         .map(|w| {
-            let is_inter_arm = matches!(w.pair, CollidingPair::LinkToLink { .. });
+            let is_inter_arm = matches!(
+                w.pair,
+                CollidingPair::LinkToLink { .. }
+                    | CollidingPair::PayloadToLink { .. }
+                    | CollidingPair::PayloadToPayload { .. }
+            );
             (
                 [
                     w.witness_a_world.x,

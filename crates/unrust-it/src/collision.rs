@@ -3,13 +3,14 @@
 
 use crate::kinematics::{KinematicsError, TransformBuffer};
 use crate::robot::{
-    AttachedPayload, Configuration, LinkId, MultiRobotModel, ObstacleId, Robot, RobotError,
+    Configuration, JointType, LinkId, MultiRobotModel, ObstacleId, PayloadId, Robot, RobotError,
 };
-use nalgebra::{Isometry3, Point3, Vector3};
+use nalgebra::{Isometry3, Point3, Quaternion, Translation3, UnitQuaternion, Vector3};
 use parry3d::bounding_volume::{Aabb, BoundingVolume};
 use parry3d::math::{Pose as ParryPose, Rotation as ParryRotation, Vector as ParryVector};
 use parry3d::partitioning::{Bvh, BvhBuildStrategy};
-use parry3d::shape::SharedShape;
+use parry3d::shape::{SharedShape, TypedShape};
+use std::collections::HashMap;
 use std::ops::Range;
 use thiserror::Error;
 use wide::f64x4;
@@ -39,6 +40,19 @@ pub fn isometry_to_parry(iso: &Isometry3<f64>) -> ParryPose {
         ParryVector::new(t.x, t.y, t.z),
         ParryRotation::from_xyzw(q.x, q.y, q.z, q.w),
     )
+}
+
+/// Converts a `parry3d` `Pose` (`f64`) into a `nalgebra::Isometry3<f64>`.
+#[inline]
+pub fn parry_to_isometry(pose: &ParryPose) -> Isometry3<f64> {
+    let t = Translation3::new(pose.translation.x, pose.translation.y, pose.translation.z);
+    let q = UnitQuaternion::from_quaternion(Quaternion::new(
+        pose.rotation.w,
+        pose.rotation.x,
+        pose.rotation.y,
+        pose.rotation.z,
+    ));
+    Isometry3::from_parts(t, q)
 }
 
 /// Converts a `parry3d` `Vector` (`f64`) into a `nalgebra::Point3<f64>`.
@@ -183,7 +197,143 @@ pub fn closest_points_segments(
     (p1 + d1 * s, p2 + d2 * t)
 }
 
-/// Multi-tier collision geometry attached to a single robot link.
+#[inline]
+fn aabb_is_valid(aabb: &Aabb) -> bool {
+    aabb.mins.x <= aabb.maxs.x && aabb.mins.y <= aabb.maxs.y && aabb.mins.z <= aabb.maxs.z
+}
+
+fn sample_spheres_along_segment_capped(
+    endpoint_a: Point3<f64>,
+    endpoint_b: Point3<f64>,
+    radius: f64,
+    max_spheres: usize,
+) -> Vec<BoundingSphere> {
+    let r = radius.max(1e-4);
+    let seg_vec = endpoint_b - endpoint_a;
+    let len = seg_vec.norm();
+    if len <= 1e-6 {
+        return vec![BoundingSphere::new(endpoint_a, r)];
+    }
+    let num_spheres = ((len / r.max(1e-3)).ceil() as usize).clamp(1, max_spheres.max(2)) + 1;
+    let mut spheres = Vec::with_capacity(num_spheres);
+    for i in 0..num_spheres {
+        let alpha = (i as f64) / ((num_spheres - 1) as f64);
+        spheres.push(BoundingSphere::new(endpoint_a + seg_vec * alpha, r));
+    }
+    spheres
+}
+
+fn decompose_cuboid_endpoints(
+    local_pose: &Isometry3<f64>,
+    hx: f64,
+    hy: f64,
+    hz: f64,
+) -> (Point3<f64>, Point3<f64>, f64) {
+    let hx = hx.abs().max(1e-4);
+    let hy = hy.abs().max(1e-4);
+    let hz = hz.abs().max(1e-4);
+    if hx >= hy && hx >= hz {
+        let r_cross = hy.hypot(hz);
+        let span = (hx - 0.5 * r_cross).max(0.0);
+        let sphere_r = if span <= 1e-9 {
+            (hx * hx + hy * hy + hz * hz).sqrt()
+        } else {
+            r_cross.hypot(hx - span)
+        };
+        (
+            local_pose.transform_point(&Point3::new(-span, 0.0, 0.0)),
+            local_pose.transform_point(&Point3::new(span, 0.0, 0.0)),
+            sphere_r,
+        )
+    } else if hy >= hx && hy >= hz {
+        let r_cross = hx.hypot(hz);
+        let span = (hy - 0.5 * r_cross).max(0.0);
+        let sphere_r = if span <= 1e-9 {
+            (hx * hx + hy * hy + hz * hz).sqrt()
+        } else {
+            r_cross.hypot(hy - span)
+        };
+        (
+            local_pose.transform_point(&Point3::new(0.0, -span, 0.0)),
+            local_pose.transform_point(&Point3::new(0.0, span, 0.0)),
+            sphere_r,
+        )
+    } else {
+        let r_cross = hx.hypot(hy);
+        let span = (hz - 0.5 * r_cross).max(0.0);
+        let sphere_r = if span <= 1e-9 {
+            (hx * hx + hy * hy + hz * hz).sqrt()
+        } else {
+            r_cross.hypot(hz - span)
+        };
+        (
+            local_pose.transform_point(&Point3::new(0.0, 0.0, -span)),
+            local_pose.transform_point(&Point3::new(0.0, 0.0, span)),
+            sphere_r,
+        )
+    }
+}
+
+/// Automatically decomposes a `parry3d` `SharedShape` at `local_pose` into tight Tier-1
+/// bounding spheres suitable for SIMD and GPU batched rollout evaluation.
+pub fn decompose_shape_to_spheres(
+    local_pose: &Isometry3<f64>,
+    shape: &SharedShape,
+) -> Vec<BoundingSphere> {
+    match shape.as_typed_shape() {
+        TypedShape::Ball(b) => {
+            vec![BoundingSphere::new(
+                local_pose.transform_point(&Point3::origin()),
+                b.radius.max(1e-4),
+            )]
+        }
+        TypedShape::Capsule(c) => {
+            let a = local_pose.transform_point(&parry_to_point(c.segment.a));
+            let b = local_pose.transform_point(&parry_to_point(c.segment.b));
+            sample_spheres_along_segment_capped(a, b, c.radius.max(1e-4), 12)
+        }
+        TypedShape::Cylinder(c) => {
+            // parry3d::shape::Cylinder is always aligned along local Y.
+            let hh = c.half_height.max(0.0);
+            let a = local_pose.transform_point(&Point3::new(0.0, -hh, 0.0));
+            let b = local_pose.transform_point(&Point3::new(0.0, hh, 0.0));
+            sample_spheres_along_segment_capped(a, b, c.radius.max(1e-4), 12)
+        }
+        TypedShape::Cuboid(b) => {
+            let (p_a, p_b, sphere_r) = decompose_cuboid_endpoints(
+                local_pose,
+                b.half_extents.x,
+                b.half_extents.y,
+                b.half_extents.z,
+            );
+            sample_spheres_along_segment_capped(p_a, p_b, sphere_r, 12)
+        }
+        TypedShape::Compound(comp) => {
+            let mut out = Vec::new();
+            for (sub_pose, sub_shape) in comp.shapes() {
+                let combined = local_pose * parry_to_isometry(sub_pose);
+                out.extend(decompose_shape_to_spheres(&combined, sub_shape));
+            }
+            if out.is_empty() {
+                let parry_pose = isometry_to_parry(local_pose);
+                let aabb = shape.compute_aabb(&parry_pose);
+                let center = parry_to_point(aabb.center());
+                let radius = parry_to_vector(aabb.half_extents()).norm().max(1e-4);
+                out.push(BoundingSphere::new(center, radius));
+            }
+            out
+        }
+        _ => {
+            let parry_pose = isometry_to_parry(local_pose);
+            let aabb = shape.compute_aabb(&parry_pose);
+            let center = parry_to_point(aabb.center());
+            let radius = parry_to_vector(aabb.half_extents()).norm().max(1e-4);
+            vec![BoundingSphere::new(center, radius)]
+        }
+    }
+}
+
+/// Multi-tier collision geometry attached to a single robot link or tool payload.
 #[derive(Debug, Clone)]
 pub struct LinkGeometry {
     /// Local-frame bounding AABB enclosing all representations of this link.
@@ -197,35 +347,159 @@ pub struct LinkGeometry {
 }
 
 impl LinkGeometry {
-    /// Creates a link geometry from a single `parry3d` shape and automatically populates a Tier-1 sphere/capsule bound.
-    pub fn from_shape(local_pose: Isometry3<f64>, shape: SharedShape) -> Self {
-        let parry_pose = isometry_to_parry(&local_pose);
-        let local_aabb = shape.compute_aabb(&parry_pose);
+    fn single_shape_capsule(local_pose: &Isometry3<f64>, shape: &SharedShape) -> Option<LinkCapsule> {
+        match shape.as_typed_shape() {
+            TypedShape::Ball(b) => {
+                let p = local_pose.transform_point(&Point3::origin());
+                Some(LinkCapsule::new(p, p, b.radius.max(1e-4)))
+            }
+            TypedShape::Capsule(c) => Some(LinkCapsule::new(
+                local_pose.transform_point(&parry_to_point(c.segment.a)),
+                local_pose.transform_point(&parry_to_point(c.segment.b)),
+                c.radius.max(1e-4),
+            )),
+            TypedShape::Cylinder(c) => {
+                let hh = c.half_height.max(0.0);
+                Some(LinkCapsule::new(
+                    local_pose.transform_point(&Point3::new(0.0, -hh, 0.0)),
+                    local_pose.transform_point(&Point3::new(0.0, hh, 0.0)),
+                    c.radius.max(1e-4),
+                ))
+            }
+            TypedShape::Cuboid(b) => {
+                let (p_a, p_b, sphere_r) = decompose_cuboid_endpoints(
+                    local_pose,
+                    b.half_extents.x,
+                    b.half_extents.y,
+                    b.half_extents.z,
+                );
+                Some(LinkCapsule::new(p_a, p_b, sphere_r))
+            }
+            _ => {
+                let aabb = shape.compute_aabb(&isometry_to_parry(local_pose));
+                let center = parry_to_point(aabb.center());
+                let radius = parry_to_vector(aabb.half_extents()).norm().max(1e-4);
+                Some(LinkCapsule::new(center, center, radius))
+            }
+        }
+    }
+
+    fn capsule_from_aabb(local_aabb: &Aabb) -> Option<LinkCapsule> {
+        if !aabb_is_valid(local_aabb) {
+            return None;
+        }
         let center = parry_to_point(local_aabb.center());
-        let half_extents = parry_to_vector(local_aabb.half_extents());
-        let radius = half_extents.norm();
+        let radius = parry_to_vector(local_aabb.half_extents()).norm().max(1e-4);
+        Some(LinkCapsule::new(center, center, radius))
+    }
+
+    /// Creates a link geometry from a single `parry3d` shape and automatically populates tight Tier-1 spheres/capsule.
+    pub fn from_shape(local_pose: Isometry3<f64>, shape: SharedShape) -> Self {
+        Self::from_convex_shapes(vec![(local_pose, shape)])
+    }
+
+    /// Creates a multi-part compound geometry from multiple posed convex shapes,
+    /// decomposing each sub-shape into tight Tier-1 spheres.
+    pub fn from_convex_shapes(shapes: Vec<(Isometry3<f64>, SharedShape)>) -> Self {
+        let mut local_aabb = Aabb::new_invalid();
+        let mut local_spheres = Vec::new();
+        for (pose, shape) in &shapes {
+            let aabb = shape.compute_aabb(&isometry_to_parry(pose));
+            if aabb_is_valid(&local_aabb) {
+                local_aabb.merge(&aabb);
+            } else {
+                local_aabb = aabb;
+            }
+            local_spheres.extend(decompose_shape_to_spheres(pose, shape));
+        }
+
+        let bounding_capsule = if shapes.len() == 1 {
+            Self::single_shape_capsule(&shapes[0].0, &shapes[0].1)
+        } else {
+            Self::capsule_from_aabb(&local_aabb)
+        };
+
         Self {
             local_aabb,
-            bounding_capsule: Some(LinkCapsule::new(center, center, radius)),
-            local_spheres: vec![BoundingSphere::new(center, radius)],
-            convex_shapes: vec![(local_pose, shape)],
+            bounding_capsule,
+            local_spheres,
+            convex_shapes: shapes,
         }
+    }
+
+    /// Creates a compound geometry from explicit convex sub-shapes and custom Tier-1 spheres.
+    ///
+    /// If `local_spheres` is empty, each convex sub-shape is automatically decomposed into spheres.
+    pub fn from_compound(
+        shapes: Vec<(Isometry3<f64>, SharedShape)>,
+        local_spheres: Vec<BoundingSphere>,
+    ) -> Self {
+        if local_spheres.is_empty() {
+            return Self::from_convex_shapes(shapes);
+        }
+        let mut local_aabb = Aabb::new_invalid();
+        for (pose, shape) in &shapes {
+            let aabb = shape.compute_aabb(&isometry_to_parry(pose));
+            if aabb_is_valid(&local_aabb) {
+                local_aabb.merge(&aabb);
+            } else {
+                local_aabb = aabb;
+            }
+        }
+        if !aabb_is_valid(&local_aabb) {
+            for s in &local_spheres {
+                let half = ParryVector::splat(s.radius);
+                let c = ParryVector::new(s.center.x, s.center.y, s.center.z);
+                let aabb = Aabb::from_half_extents(c, half);
+                if aabb_is_valid(&local_aabb) {
+                    local_aabb.merge(&aabb);
+                } else {
+                    local_aabb = aabb;
+                }
+            }
+        }
+        let bounding_capsule = Self::capsule_from_aabb(&local_aabb);
+        Self {
+            local_aabb,
+            bounding_capsule,
+            local_spheres,
+            convex_shapes: shapes,
+        }
+    }
+
+    /// Appends another posed convex shape to this compound geometry and updates its AABB and Tier-1 spheres.
+    pub fn add_shape(&mut self, local_pose: Isometry3<f64>, shape: SharedShape) {
+        let aabb = shape.compute_aabb(&isometry_to_parry(&local_pose));
+        if aabb_is_valid(&self.local_aabb) {
+            self.local_aabb.merge(&aabb);
+        } else {
+            self.local_aabb = aabb;
+        }
+        self.local_spheres
+            .extend(decompose_shape_to_spheres(&local_pose, &shape));
+        self.convex_shapes.push((local_pose, shape));
+        self.bounding_capsule = if self.convex_shapes.len() == 1 {
+            Self::single_shape_capsule(&self.convex_shapes[0].0, &self.convex_shapes[0].1)
+        } else {
+            Self::capsule_from_aabb(&self.local_aabb)
+        };
+    }
+
+    /// Returns the maximum radial extent from the link/payload local origin across all bounding AABB corners.
+    #[inline]
+    pub fn max_extent_from_origin(&self) -> f64 {
+        if !aabb_is_valid(&self.local_aabb) {
+            return 0.0;
+        }
+        let mx = self.local_aabb.mins.x.abs().max(self.local_aabb.maxs.x.abs());
+        let my = self.local_aabb.mins.y.abs().max(self.local_aabb.maxs.y.abs());
+        let mz = self.local_aabb.mins.z.abs().max(self.local_aabb.maxs.z.abs());
+        (mx * mx + my * my + mz * mz).sqrt()
     }
 
     /// Creates a link geometry from a capsule (generating both Tier-1 spheres/capsule and a Tier-2 `parry3d` capsule).
     pub fn from_capsule(endpoint_a: Point3<f64>, endpoint_b: Point3<f64>, radius: f64) -> Self {
-        let seg_vec = endpoint_b - endpoint_a;
-        let len = seg_vec.norm();
-        let num_spheres = ((len / radius.max(1e-3)).ceil() as usize).clamp(1, 8) + 1;
-        let mut local_spheres = Vec::with_capacity(num_spheres);
-        for i in 0..num_spheres {
-            let alpha = if num_spheres > 1 {
-                i as f64 / (num_spheres - 1) as f64
-            } else {
-                0.5
-            };
-            local_spheres.push(BoundingSphere::new(endpoint_a + seg_vec * alpha, radius));
-        }
+        let local_spheres = sample_spheres_along_segment_capped(endpoint_a, endpoint_b, radius, 8);
 
         let parry_capsule = SharedShape::new(parry3d::shape::Capsule::new(
             ParryVector::new(endpoint_a.x, endpoint_a.y, endpoint_a.z),
@@ -249,7 +523,103 @@ impl LinkGeometry {
     }
 }
 
-/// Structure-of-Arrays (SoA) batch storage of world-space spheres across all links.
+/// An object or end-of-arm tool dynamically grasped by or attached to a robot link.
+#[derive(Debug, Clone)]
+pub struct AttachedPayload {
+    /// Unique identifier for the payload or tool.
+    pub id: String,
+    /// Link to which this payload is rigidly attached.
+    pub parent_link: LinkId,
+    /// Pose of the payload relative to `parent_link`.
+    pub local_pose: Isometry3<f64>,
+    /// Multi-tier collision geometry of the payload (compound Tier-2 shapes + Tier-1 spheres).
+    pub geometry: LinkGeometry,
+    /// Payload mass in kilograms (for dynamic manipulation).
+    pub mass: f64,
+    /// Links allowed to touch this payload without triggering collision (e.g., flange, wrist, fingers).
+    pub touch_links: Vec<LinkId>,
+    /// Optional payload-specific safety margin override in meters (e.g., 3-5 mm for tool tips).
+    pub safety_margin: Option<f64>,
+    /// Optional payload-specific CBF/MPPI activation distance override in meters.
+    pub activation_distance: Option<f64>,
+}
+
+impl AttachedPayload {
+    /// Creates an attached payload or tool from a [`LinkGeometry`].
+    pub fn new(
+        id: impl Into<String>,
+        parent_link: LinkId,
+        local_pose: Isometry3<f64>,
+        geometry: LinkGeometry,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            parent_link,
+            local_pose,
+            geometry,
+            mass: 0.0,
+            touch_links: vec![parent_link],
+            safety_margin: None,
+            activation_distance: None,
+        }
+    }
+
+    /// Creates an attached payload from a single `parry3d` shape.
+    pub fn from_shape(
+        id: impl Into<String>,
+        parent_link: LinkId,
+        local_pose: Isometry3<f64>,
+        shape: SharedShape,
+    ) -> Self {
+        Self::new(
+            id,
+            parent_link,
+            local_pose,
+            LinkGeometry::from_shape(Isometry3::identity(), shape),
+        )
+    }
+
+    /// Creates an attached compound tool or grasped object from multiple posed `parry3d` shapes.
+    pub fn from_compound(
+        id: impl Into<String>,
+        parent_link: LinkId,
+        local_pose: Isometry3<f64>,
+        shapes: Vec<(Isometry3<f64>, SharedShape)>,
+    ) -> Self {
+        Self::new(
+            id,
+            parent_link,
+            local_pose,
+            LinkGeometry::from_convex_shapes(shapes),
+        )
+    }
+
+    /// Sets the payload mass in kilograms.
+    pub fn with_mass(mut self, mass: f64) -> Self {
+        self.mass = mass;
+        self
+    }
+
+    /// Sets the links allowed to touch this payload without triggering collisions.
+    pub fn with_touch_links(mut self, touch_links: Vec<LinkId>) -> Self {
+        self.touch_links = touch_links;
+        self
+    }
+
+    /// Sets a default safety margin override (meters) for this payload against external bodies.
+    pub fn with_safety_margin(mut self, margin: f64) -> Self {
+        self.safety_margin = Some(margin);
+        self
+    }
+
+    /// Sets a default activation distance override (meters) for this payload in CBF/batch checks.
+    pub fn with_activation_distance(mut self, activation: f64) -> Self {
+        self.activation_distance = Some(activation);
+        self
+    }
+}
+
+/// Structure-of-Arrays (SoA) batch storage of world-space spheres across all links and attached payloads.
 ///
 /// Enables branchless 4-wide `f64x4` SIMD distance and collision sweeps.
 #[derive(Debug, Clone, Default)]
@@ -264,9 +634,47 @@ pub struct WorldSphereSoA {
     pub radius: Vec<f64>,
     /// Range `link_ranges[link_id.index()]` into `cx, cy, cz, radius` for each link.
     pub link_ranges: Vec<Range<usize>>,
+    /// Range `payload_ranges[payload_id.index()]` into `cx, cy, cz, radius` for each attached payload.
+    pub payload_ranges: Vec<Range<usize>>,
 }
 
 impl WorldSphereSoA {
+    /// Finds the closest signed-distance witness between sphere ranges `range_a` and `range_b`
+    /// within `cutoff` meters.
+    pub fn closest_spheres_witness(
+        &self,
+        range_a: &Range<usize>,
+        range_b: &Range<usize>,
+        cutoff: f64,
+    ) -> Option<ShapeWitness> {
+        if range_a.is_empty() || range_b.is_empty() {
+            return None;
+        }
+        let mut best: Option<ShapeWitness> = None;
+        for ia in range_a.clone() {
+            let ca = Point3::new(self.cx[ia], self.cy[ia], self.cz[ia]);
+            let ra = self.radius[ia];
+            for ib in range_b.clone() {
+                let cb = Point3::new(self.cx[ib], self.cy[ib], self.cz[ib]);
+                let rb = self.radius[ib];
+                let diff = ca - cb;
+                let center_dist = diff.norm();
+                let dist = center_dist - (ra + rb);
+                if dist <= cutoff && best.as_ref().is_none_or(|b| dist < b.0) {
+                    let normal = if center_dist > 1e-12 {
+                        diff / center_dist
+                    } else {
+                        Vector3::z()
+                    };
+                    let p_a = ca - normal * ra;
+                    let p_b = cb + normal * rb;
+                    best = Some((dist, p_a, p_b, normal));
+                }
+            }
+        }
+        best
+    }
+
     /// Checks using `f64x4` SIMD whether any sphere in `range_a` overlaps (within `margin`)
     /// any sphere in `range_b`.
     #[inline]
@@ -429,9 +837,47 @@ impl AllowedCollisionMatrix {
     /// Returns the custom safety margin for `(a, b)` (`0.0` for `CollisionRule::Enabled`).
     #[inline]
     pub fn pair_margin(&self, a: LinkId, b: LinkId) -> f64 {
+        self.custom_margin(a, b).unwrap_or(0.0)
+    }
+
+    /// Returns `Some(margin)` if `(a, b)` is configured with [`CollisionRule::CustomMargin`].
+    #[inline]
+    pub fn custom_margin(&self, a: LinkId, b: LinkId) -> Option<f64> {
+        let (i, j) = (a.index(), b.index());
+        if i == j || i >= self.num_links || j >= self.num_links {
+            return None;
+        }
         match self.rule(a, b) {
-            CollisionRule::CustomMargin(m) => m,
-            _ => 0.0,
+            CollisionRule::CustomMargin(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    /// Assigns `CollisionRule::CustomMargin(margin)` to all currently active inter-arm link pairs
+    /// (`model.link(a).robot != model.link(b).robot`), preserving all disabled pairs.
+    pub fn set_inter_arm_margin(&mut self, model: &MultiRobotModel, margin: f64) {
+        let mut pairs = Vec::new();
+        self.for_each_active_pair(|a, b| {
+            if model.link(a).robot != model.link(b).robot {
+                pairs.push((a, b));
+            }
+        });
+        for (a, b) in pairs {
+            self.set_rule(a, b, CollisionRule::CustomMargin(margin));
+        }
+    }
+
+    /// Assigns `CollisionRule::CustomMargin(margin)` to all currently active same-arm link pairs
+    /// (`model.link(a).robot == model.link(b).robot`), preserving all disabled pairs.
+    pub fn set_self_collision_margin(&mut self, model: &MultiRobotModel, margin: f64) {
+        let mut pairs = Vec::new();
+        self.for_each_active_pair(|a, b| {
+            if model.link(a).robot == model.link(b).robot {
+                pairs.push((a, b));
+            }
+        });
+        for (a, b) in pairs {
+            self.set_rule(a, b, CollisionRule::CustomMargin(margin));
         }
     }
 
@@ -504,6 +950,35 @@ pub enum CollidingPair {
         /// Second link ID.
         link_b: LinkId,
     },
+    /// An attached payload/tool and a static environment obstacle.
+    PayloadToObstacle {
+        /// Attached payload ID.
+        payload: PayloadId,
+        /// Robot link carrying the payload.
+        parent_link: LinkId,
+        /// Environment obstacle ID.
+        obstacle: ObstacleId,
+    },
+    /// An attached payload/tool and another robot link.
+    PayloadToLink {
+        /// Attached payload ID.
+        payload: PayloadId,
+        /// Robot link carrying the payload.
+        parent_link: LinkId,
+        /// Other robot link ID.
+        link: LinkId,
+    },
+    /// Two attached payloads/tools (e.g., tool-to-tool clearance between two arms).
+    PayloadToPayload {
+        /// First attached payload ID.
+        payload_a: PayloadId,
+        /// Robot link carrying payload A.
+        parent_link_a: LinkId,
+        /// Second attached payload ID.
+        payload_b: PayloadId,
+        /// Robot link carrying payload B.
+        parent_link_b: LinkId,
+    },
 }
 
 /// Differentiable signed-distance witness between two bodies for reactive QP/CBF control and TrajOpt.
@@ -533,7 +1008,10 @@ impl SignedDistanceWitness {
     ) {
         out_j_dist.fill(0.0);
         match self.pair {
-            CollidingPair::LinkToObstacle { link, .. } => {
+            CollidingPair::LinkToObstacle { link, .. }
+            | CollidingPair::PayloadToObstacle {
+                parent_link: link, ..
+            } => {
                 model.accumulate_point_jacobian_projection(
                     transforms,
                     link,
@@ -543,7 +1021,17 @@ impl SignedDistanceWitness {
                     out_j_dist,
                 );
             }
-            CollidingPair::LinkToLink { link_a, link_b } => {
+            CollidingPair::LinkToLink { link_a, link_b }
+            | CollidingPair::PayloadToLink {
+                parent_link: link_a,
+                link: link_b,
+                ..
+            }
+            | CollidingPair::PayloadToPayload {
+                parent_link_a: link_a,
+                parent_link_b: link_b,
+                ..
+            } => {
                 model.accumulate_point_jacobian_projection(
                     transforms,
                     link_a,
@@ -572,6 +1060,10 @@ pub struct CollisionWorkspace {
     pub transforms: TransformBuffer,
     /// World-space AABBs for every link (`len = num_links`).
     pub link_aabbs: Vec<Aabb>,
+    /// World-space poses for every attached payload (`len = num_payloads`).
+    pub payload_poses: Vec<Isometry3<f64>>,
+    /// World-space AABBs for every attached payload (`len = num_payloads`).
+    pub payload_aabbs: Vec<Aabb>,
     /// World-space transformed Tier-1 spheres in SoA layout.
     pub world_spheres: WorldSphereSoA,
     /// Scratch buffer for continuous collision interpolation.
@@ -582,7 +1074,8 @@ impl CollisionWorkspace {
     /// Creates a pre-allocated collision workspace sized for `model` and `env`.
     pub fn new(model: &MultiRobotModel, env: &CollisionEnvironment) -> Self {
         let num_links = model.num_links();
-        let total_spheres: usize = (0..num_links)
+        let num_payloads = env.attached_payloads.len();
+        let link_spheres: usize = (0..num_links)
             .map(|i| {
                 env.link_geometries
                     .get(i)
@@ -590,16 +1083,25 @@ impl CollisionWorkspace {
                     .map_or(0, |g| g.local_spheres.len())
             })
             .sum();
+        let payload_spheres: usize = env
+            .attached_payloads
+            .iter()
+            .map(|p| p.geometry.local_spheres.len())
+            .sum();
+        let total_spheres = link_spheres + payload_spheres;
 
         Self {
             transforms: model.create_transform_buffer(),
             link_aabbs: vec![Aabb::new_invalid(); num_links],
+            payload_poses: vec![Isometry3::identity(); num_payloads],
+            payload_aabbs: vec![Aabb::new_invalid(); num_payloads],
             world_spheres: WorldSphereSoA {
                 cx: vec![0.0; total_spheres],
                 cy: vec![0.0; total_spheres],
                 cz: vec![0.0; total_spheres],
                 radius: vec![0.0; total_spheres],
                 link_ranges: vec![0..0; num_links],
+                payload_ranges: vec![0..0; num_payloads],
             },
             scratch_q: vec![0.0; model.dof()],
         }
@@ -624,6 +1126,50 @@ impl Obstacle {
     }
 }
 
+/// Per-pair collision rule for attached payloads, tools, and environment obstacles.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PayloadPairRule {
+    /// Whether collision checks and CBF witnesses are active for this pair.
+    pub enabled: bool,
+    /// Optional custom minimum allowed separation margin in meters.
+    pub margin: Option<f64>,
+    /// Optional custom CBF activation distance in meters.
+    pub activation_distance: Option<f64>,
+}
+
+impl Default for PayloadPairRule {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            margin: None,
+            activation_distance: None,
+        }
+    }
+}
+
+#[inline]
+fn canonical_link_pair(a: LinkId, b: LinkId) -> (LinkId, LinkId) {
+    if a <= b { (a, b) } else { (b, a) }
+}
+
+#[inline]
+fn canonical_payload_pair(a: &str, b: &str) -> (String, String) {
+    if a <= b {
+        (a.to_string(), b.to_string())
+    } else {
+        (b.to_string(), a.to_string())
+    }
+}
+
+#[inline]
+fn combine_optional_max(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.max(y)),
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
+    }
+}
+
 /// Multi-arm collision scene holding environment obstacles (indexed by a `Bvh`),
 /// multi-tier robot link geometries, an [`AllowedCollisionMatrix`], and attached payloads.
 #[derive(Debug, Default, Clone)]
@@ -636,8 +1182,22 @@ pub struct CollisionEnvironment {
     link_geometries: Vec<Option<LinkGeometry>>,
     /// Allowed Collision Matrix governing link-to-link self and inter-arm collision pairs.
     acm: Option<AllowedCollisionMatrix>,
-    /// Dynamically grasped/attached payloads.
+    /// Dynamically grasped/attached payloads and tools.
     attached_payloads: Vec<AttachedPayload>,
+    /// Custom CBF activation distances for active `(link_a, link_b)` pairs.
+    link_pair_activations: HashMap<(LinkId, LinkId), f64>,
+    /// Per-obstacle default safety margins indexed by `ObstacleId`.
+    obstacle_margins: Vec<Option<f64>>,
+    /// Per-obstacle default CBF activation distances indexed by `ObstacleId`.
+    obstacle_activations: Vec<Option<f64>>,
+    /// Per-pair overrides for `(link, obstacle)`.
+    link_obstacle_rules: HashMap<(LinkId, ObstacleId), PayloadPairRule>,
+    /// Per-pair overrides for `(payload_a, payload_b)`.
+    payload_pair_rules: HashMap<(String, String), PayloadPairRule>,
+    /// Per-pair overrides for `(payload_id, obstacle)`.
+    payload_obstacle_rules: HashMap<(String, ObstacleId), PayloadPairRule>,
+    /// Per-pair overrides for `(payload_id, link)`.
+    payload_link_rules: HashMap<(String, LinkId), PayloadPairRule>,
 }
 
 impl CollisionEnvironment {
@@ -650,6 +1210,8 @@ impl CollisionEnvironment {
     pub fn add_obstacle(&mut self, shape: SharedShape, pose: Isometry3<f64>) -> ObstacleId {
         let id = ObstacleId(self.obstacles.len() as u32);
         self.obstacles.push(Obstacle { shape, pose });
+        self.obstacle_margins.push(None);
+        self.obstacle_activations.push(None);
         self.rebuild_bvh();
         id
     }
@@ -700,10 +1262,16 @@ impl CollisionEnvironment {
         self.acm.as_mut()
     }
 
-    /// Attaches a grasped payload to a robot link.
-    pub fn attach_payload(&mut self, payload: AttachedPayload) {
-        self.attached_payloads.retain(|p| p.id != payload.id);
-        self.attached_payloads.push(payload);
+    /// Attaches a grasped payload or tool to a robot link (replacing any existing payload with the same `id`).
+    pub fn attach_payload(&mut self, payload: AttachedPayload) -> PayloadId {
+        if let Some(pos) = self.attached_payloads.iter().position(|p| p.id == payload.id) {
+            self.attached_payloads[pos] = payload;
+            PayloadId(pos as u16)
+        } else {
+            let id = PayloadId(self.attached_payloads.len() as u16);
+            self.attached_payloads.push(payload);
+            id
+        }
     }
 
     /// Detaches a grasped payload by its ID.
@@ -712,12 +1280,430 @@ impl CollisionEnvironment {
         Some(self.attached_payloads.swap_remove(pos))
     }
 
+    /// Returns all currently attached payloads and tools.
+    #[inline]
+    pub fn attached_payloads(&self) -> &[AttachedPayload] {
+        &self.attached_payloads
+    }
+
+    /// Returns an attached payload by [`PayloadId`].
+    #[inline]
+    pub fn attached_payload(&self, id: PayloadId) -> Option<&AttachedPayload> {
+        self.attached_payloads.get(id.index())
+    }
+
+    /// Configures a custom safety margin on an active `(link_a, link_b)` pair in the ACM.
+    pub fn set_link_pair_margin(&mut self, a: LinkId, b: LinkId, margin: f64) {
+        if let Some(acm) = &mut self.acm {
+            if acm.is_pair_active(a, b) {
+                acm.set_rule(a, b, CollisionRule::CustomMargin(margin));
+            }
+        }
+    }
+
+    /// Configures a custom CBF/MPPI activation distance for `(link_a, link_b)`.
+    pub fn set_link_pair_activation(&mut self, a: LinkId, b: LinkId, activation: f64) {
+        self.link_pair_activations
+            .insert(canonical_link_pair(a, b), activation);
+    }
+
+    /// Configures a default safety margin (meters) for an environment obstacle across all links/payloads.
+    pub fn set_obstacle_margin(&mut self, obstacle: ObstacleId, margin: f64) {
+        let idx = obstacle.0 as usize;
+        if self.obstacle_margins.len() <= idx {
+            self.obstacle_margins.resize(idx + 1, None);
+        }
+        self.obstacle_margins[idx] = Some(margin);
+    }
+
+    /// Configures a default CBF activation distance (meters) for an environment obstacle.
+    pub fn set_obstacle_activation(&mut self, obstacle: ObstacleId, activation: f64) {
+        let idx = obstacle.0 as usize;
+        if self.obstacle_activations.len() <= idx {
+            self.obstacle_activations.resize(idx + 1, None);
+        }
+        self.obstacle_activations[idx] = Some(activation);
+    }
+
+    /// Configures a custom safety margin for a specific `(link, obstacle)` pair.
+    pub fn set_link_obstacle_margin(&mut self, link: LinkId, obstacle: ObstacleId, margin: f64) {
+        self.link_obstacle_rules
+            .entry((link, obstacle))
+            .or_default()
+            .margin = Some(margin);
+    }
+
+    /// Configures a custom CBF activation distance for a specific `(link, obstacle)` pair.
+    pub fn set_link_obstacle_activation(
+        &mut self,
+        link: LinkId,
+        obstacle: ObstacleId,
+        activation: f64,
+    ) {
+        self.link_obstacle_rules
+            .entry((link, obstacle))
+            .or_default()
+            .activation_distance = Some(activation);
+    }
+
+    /// Enables or disables collision checking between `link` and `obstacle`.
+    pub fn set_link_obstacle_enabled(&mut self, link: LinkId, obstacle: ObstacleId, enabled: bool) {
+        self.link_obstacle_rules
+            .entry((link, obstacle))
+            .or_default()
+            .enabled = enabled;
+    }
+
+    /// Configures a custom safety margin between two attached payloads/tools `(id_a, id_b)`.
+    pub fn set_payload_pair_margin(&mut self, id_a: &str, id_b: &str, margin: f64) {
+        self.payload_pair_rules
+            .entry(canonical_payload_pair(id_a, id_b))
+            .or_default()
+            .margin = Some(margin);
+    }
+
+    /// Configures a custom CBF/MPPI activation distance between two attached payloads/tools `(id_a, id_b)`.
+    pub fn set_payload_pair_activation(&mut self, id_a: &str, id_b: &str, activation: f64) {
+        self.payload_pair_rules
+            .entry(canonical_payload_pair(id_a, id_b))
+            .or_default()
+            .activation_distance = Some(activation);
+    }
+
+    /// Enables or disables collision checking between two attached payloads `(id_a, id_b)`.
+    pub fn set_payload_pair_enabled(&mut self, id_a: &str, id_b: &str, enabled: bool) {
+        self.payload_pair_rules
+            .entry(canonical_payload_pair(id_a, id_b))
+            .or_default()
+            .enabled = enabled;
+    }
+
+    /// Configures a custom safety margin between payload `payload_id` and `obstacle`.
+    pub fn set_payload_obstacle_margin(
+        &mut self,
+        payload_id: &str,
+        obstacle: ObstacleId,
+        margin: f64,
+    ) {
+        self.payload_obstacle_rules
+            .entry((payload_id.to_string(), obstacle))
+            .or_default()
+            .margin = Some(margin);
+    }
+
+    /// Configures a custom CBF activation distance between payload `payload_id` and `obstacle`.
+    pub fn set_payload_obstacle_activation(
+        &mut self,
+        payload_id: &str,
+        obstacle: ObstacleId,
+        activation: f64,
+    ) {
+        self.payload_obstacle_rules
+            .entry((payload_id.to_string(), obstacle))
+            .or_default()
+            .activation_distance = Some(activation);
+    }
+
+    /// Enables or disables collision checking between payload `payload_id` and `obstacle`.
+    pub fn set_payload_obstacle_enabled(
+        &mut self,
+        payload_id: &str,
+        obstacle: ObstacleId,
+        enabled: bool,
+    ) {
+        self.payload_obstacle_rules
+            .entry((payload_id.to_string(), obstacle))
+            .or_default()
+            .enabled = enabled;
+    }
+
+    /// Configures a custom safety margin between payload `payload_id` and `link`.
+    pub fn set_payload_link_margin(&mut self, payload_id: &str, link: LinkId, margin: f64) {
+        self.payload_link_rules
+            .entry((payload_id.to_string(), link))
+            .or_default()
+            .margin = Some(margin);
+    }
+
+    /// Configures a custom CBF/MPPI activation distance between payload `payload_id` and `link`.
+    pub fn set_payload_link_activation(
+        &mut self,
+        payload_id: &str,
+        link: LinkId,
+        activation: f64,
+    ) {
+        self.payload_link_rules
+            .entry((payload_id.to_string(), link))
+            .or_default()
+            .activation_distance = Some(activation);
+    }
+
+    /// Enables or disables collision checking between payload `payload_id` and `link`.
+    pub fn set_payload_link_enabled(&mut self, payload_id: &str, link: LinkId, enabled: bool) {
+        self.payload_link_rules
+            .entry((payload_id.to_string(), link))
+            .or_default()
+            .enabled = enabled;
+    }
+
+    /// Returns whether collision checking between two payloads is enabled.
+    #[inline]
+    pub fn is_payload_pair_enabled(&self, id_a: &str, id_b: &str) -> bool {
+        if self.payload_pair_rules.is_empty() {
+            return true;
+        }
+        self.payload_pair_rules
+            .get(&canonical_payload_pair(id_a, id_b))
+            .is_none_or(|r| r.enabled)
+    }
+
+    /// Returns whether collision checking between `payload_id` and `obstacle` is enabled.
+    #[inline]
+    pub fn is_payload_obstacle_enabled(&self, payload_id: &str, obstacle: ObstacleId) -> bool {
+        if self.payload_obstacle_rules.is_empty() {
+            return true;
+        }
+        self.payload_obstacle_rules
+            .iter()
+            .find(|((pid, obs), _)| *obs == obstacle && pid == payload_id)
+            .is_none_or(|(_, r)| r.enabled)
+    }
+
+    /// Returns whether collision checking between `payload_id` and `link` is enabled.
+    #[inline]
+    pub fn is_payload_link_enabled(&self, payload_id: &str, link: LinkId) -> bool {
+        if self.payload_link_rules.is_empty() {
+            return true;
+        }
+        self.payload_link_rules
+            .iter()
+            .find(|((pid, l), _)| *l == link && pid == payload_id)
+            .is_none_or(|(_, r)| r.enabled)
+    }
+
+    /// Returns whether collision checking between `link` and `obstacle` is enabled.
+    #[inline]
+    pub fn is_link_obstacle_enabled(&self, link: LinkId, obstacle: ObstacleId) -> bool {
+        self.link_obstacle_rules
+            .get(&(link, obstacle))
+            .is_none_or(|r| r.enabled)
+    }
+
+    /// Returns the custom per-pair safety margin (meters) configured for `pair`, if any.
+    pub fn custom_pair_margin(&self, pair: &CollidingPair) -> Option<f64> {
+        match *pair {
+            CollidingPair::LinkToLink { link_a, link_b } => {
+                self.acm.as_ref().and_then(|acm| acm.custom_margin(link_a, link_b))
+            }
+            CollidingPair::LinkToObstacle { link, obstacle } => self
+                .link_obstacle_rules
+                .get(&(link, obstacle))
+                .and_then(|r| r.margin)
+                .or_else(|| {
+                    self.obstacle_margins
+                        .get(obstacle.0 as usize)
+                        .copied()
+                        .flatten()
+                }),
+            CollidingPair::PayloadToPayload {
+                payload_a,
+                payload_b,
+                ..
+            } => {
+                let pa = self.attached_payload(payload_a);
+                let pb = self.attached_payload(payload_b);
+                let explicit = pa.zip(pb).and_then(|(a, b)| {
+                    if self.payload_pair_rules.is_empty() {
+                        None
+                    } else {
+                        self.payload_pair_rules
+                            .get(&canonical_payload_pair(&a.id, &b.id))
+                            .and_then(|r| r.margin)
+                    }
+                });
+                explicit.or_else(|| {
+                    combine_optional_max(
+                        pa.and_then(|p| p.safety_margin),
+                        pb.and_then(|p| p.safety_margin),
+                    )
+                })
+            }
+            CollidingPair::PayloadToObstacle {
+                payload, obstacle, ..
+            } => {
+                let p = self.attached_payload(payload);
+                let explicit = p.and_then(|pl| {
+                    if self.payload_obstacle_rules.is_empty() {
+                        None
+                    } else {
+                        self.payload_obstacle_rules
+                            .iter()
+                            .find(|((pid, obs), _)| *obs == obstacle && pid == &pl.id)
+                            .and_then(|(_, r)| r.margin)
+                    }
+                });
+                explicit
+                    .or_else(|| p.and_then(|pl| pl.safety_margin))
+                    .or_else(|| {
+                        self.obstacle_margins
+                            .get(obstacle.0 as usize)
+                            .copied()
+                            .flatten()
+                    })
+            }
+            CollidingPair::PayloadToLink { payload, link, .. } => {
+                let p = self.attached_payload(payload);
+                let explicit = p.and_then(|pl| {
+                    if self.payload_link_rules.is_empty() {
+                        None
+                    } else {
+                        self.payload_link_rules
+                            .iter()
+                            .find(|((pid, l), _)| *l == link && pid == &pl.id)
+                            .and_then(|(_, r)| r.margin)
+                    }
+                });
+                explicit.or_else(|| p.and_then(|pl| pl.safety_margin))
+            }
+        }
+    }
+
+    /// Returns the effective safety margin (meters) for `pair`, falling back to `default_margin`.
+    #[inline]
+    pub fn effective_pair_margin(&self, pair: &CollidingPair, default_margin: f64) -> f64 {
+        self.custom_pair_margin(pair).unwrap_or(default_margin)
+    }
+
+    /// Returns the custom per-pair activation distance (meters) configured for `pair`, if any.
+    pub fn custom_pair_activation(&self, pair: &CollidingPair) -> Option<f64> {
+        match *pair {
+            CollidingPair::LinkToLink { link_a, link_b } => {
+                self.link_pair_activations
+                    .get(&canonical_link_pair(link_a, link_b))
+                    .copied()
+            }
+            CollidingPair::LinkToObstacle { link, obstacle } => self
+                .link_obstacle_rules
+                .get(&(link, obstacle))
+                .and_then(|r| r.activation_distance)
+                .or_else(|| {
+                    self.obstacle_activations
+                        .get(obstacle.0 as usize)
+                        .copied()
+                        .flatten()
+                }),
+            CollidingPair::PayloadToPayload {
+                payload_a,
+                payload_b,
+                ..
+            } => {
+                let pa = self.attached_payload(payload_a);
+                let pb = self.attached_payload(payload_b);
+                let explicit = pa.zip(pb).and_then(|(a, b)| {
+                    if self.payload_pair_rules.is_empty() {
+                        None
+                    } else {
+                        self.payload_pair_rules
+                            .get(&canonical_payload_pair(&a.id, &b.id))
+                            .and_then(|r| r.activation_distance)
+                    }
+                });
+                explicit.or_else(|| {
+                    combine_optional_max(
+                        pa.and_then(|p| p.activation_distance),
+                        pb.and_then(|p| p.activation_distance),
+                    )
+                })
+            }
+            CollidingPair::PayloadToObstacle {
+                payload, obstacle, ..
+            } => {
+                let p = self.attached_payload(payload);
+                let explicit = p.and_then(|pl| {
+                    if self.payload_obstacle_rules.is_empty() {
+                        None
+                    } else {
+                        self.payload_obstacle_rules
+                            .iter()
+                            .find(|((pid, obs), _)| *obs == obstacle && pid == &pl.id)
+                            .and_then(|(_, r)| r.activation_distance)
+                    }
+                });
+                explicit
+                    .or_else(|| p.and_then(|pl| pl.activation_distance))
+                    .or_else(|| {
+                        self.obstacle_activations
+                            .get(obstacle.0 as usize)
+                            .copied()
+                            .flatten()
+                    })
+            }
+            CollidingPair::PayloadToLink { payload, link, .. } => {
+                let p = self.attached_payload(payload);
+                let explicit = p.and_then(|pl| {
+                    if self.payload_link_rules.is_empty() {
+                        None
+                    } else {
+                        self.payload_link_rules
+                            .iter()
+                            .find(|((pid, l), _)| *l == link && pid == &pl.id)
+                            .and_then(|(_, r)| r.activation_distance)
+                    }
+                });
+                explicit.or_else(|| p.and_then(|pl| pl.activation_distance))
+            }
+        }
+    }
+
+    /// Returns the effective CBF/MPPI activation distance (meters) for `pair`, falling back to `default_activation`.
+    #[inline]
+    pub fn effective_pair_activation(&self, pair: &CollidingPair, default_activation: f64) -> f64 {
+        self.custom_pair_activation(pair).unwrap_or(default_activation)
+    }
+
+    /// Returns the maximum configured activation distance across `default_activation` and all custom overrides.
+    pub fn max_activation_distance(&self, default_activation: f64) -> f64 {
+        let mut max_act = default_activation;
+        for &a in self.link_pair_activations.values() {
+            max_act = max_act.max(a);
+        }
+        for &a in self.obstacle_activations.iter().flatten() {
+            max_act = max_act.max(a);
+        }
+        for r in self.link_obstacle_rules.values() {
+            if let Some(a) = r.activation_distance {
+                max_act = max_act.max(a);
+            }
+        }
+        for r in self.payload_pair_rules.values() {
+            if let Some(a) = r.activation_distance {
+                max_act = max_act.max(a);
+            }
+        }
+        for r in self.payload_obstacle_rules.values() {
+            if let Some(a) = r.activation_distance {
+                max_act = max_act.max(a);
+            }
+        }
+        for r in self.payload_link_rules.values() {
+            if let Some(a) = r.activation_distance {
+                max_act = max_act.max(a);
+            }
+        }
+        for p in &self.attached_payloads {
+            if let Some(a) = p.activation_distance {
+                max_act = max_act.max(a);
+            }
+        }
+        max_act
+    }
+
     /// Allocates a [`CollisionWorkspace`] sized for `model` and this environment.
     pub fn create_workspace(&self, model: &MultiRobotModel) -> CollisionWorkspace {
         CollisionWorkspace::new(model, self)
     }
 
-    /// Updates `workspace` with Forward Kinematics, world-space link AABBs, and SoA spheres for `q`.
+    /// Updates `workspace` with Forward Kinematics, world-space link & payload AABBs, and SoA spheres for `q`.
     fn update_workspace(
         &self,
         model: &MultiRobotModel,
@@ -729,8 +1715,12 @@ impl CollisionEnvironment {
         model.forward_kinematics(q, &mut workspace.transforms)?;
 
         let num_links = model.num_links();
+        let num_payloads = self.attached_payloads.len();
         workspace.link_aabbs.resize(num_links, Aabb::new_invalid());
+        workspace.payload_poses.resize(num_payloads, Isometry3::identity());
+        workspace.payload_aabbs.resize(num_payloads, Aabb::new_invalid());
         workspace.world_spheres.link_ranges.resize(num_links, 0..0);
+        workspace.world_spheres.payload_ranges.resize(num_payloads, 0..0);
 
         if tier == GeometryTier::AnalyticSsv {
             workspace.world_spheres.cx.clear();
@@ -762,11 +1752,115 @@ impl CollisionEnvironment {
             }
         }
 
+        for (p_idx, payload) in self.attached_payloads.iter().enumerate() {
+            if payload.parent_link.index() >= num_links {
+                workspace.payload_aabbs[p_idx] = Aabb::new_invalid();
+                workspace.world_spheres.payload_ranges[p_idx] = 0..0;
+                continue;
+            }
+            let world_pose = *workspace.transforms.link_pose(payload.parent_link) * payload.local_pose;
+            workspace.payload_poses[p_idx] = world_pose;
+            workspace.payload_aabbs[p_idx] = payload.geometry.world_aabb(&world_pose);
+            if tier == GeometryTier::AnalyticSsv {
+                let start = workspace.world_spheres.cx.len();
+                for s in &payload.geometry.local_spheres {
+                    let p_w = world_pose.transform_point(&s.center);
+                    workspace.world_spheres.cx.push(p_w.x);
+                    workspace.world_spheres.cy.push(p_w.y);
+                    workspace.world_spheres.cz.push(p_w.z);
+                    workspace.world_spheres.radius.push(s.radius);
+                }
+                let end = workspace.world_spheres.cx.len();
+                workspace.world_spheres.payload_ranges[p_idx] = start..end;
+            }
+        }
+
         Ok(())
     }
 
+    fn spheres_collide_with_obstacle(
+        world_spheres: &WorldSphereSoA,
+        range: &Range<usize>,
+        obs: &Obstacle,
+        margin: f64,
+    ) -> bool {
+        let obs_pose = isometry_to_parry(&obs.pose);
+        for idx in range.clone() {
+            let ball_pose = ParryPose::from_parts(
+                ParryVector::new(
+                    world_spheres.cx[idx],
+                    world_spheres.cy[idx],
+                    world_spheres.cz[idx],
+                ),
+                ParryRotation::IDENTITY,
+            );
+            let r = world_spheres.radius[idx];
+            if margin == 0.0 {
+                let ball = parry3d::shape::Ball::new(r);
+                if parry3d::query::intersection_test(&ball_pose, &ball, &obs_pose, obs.shape.as_ref())
+                    .unwrap_or(false)
+                {
+                    return true;
+                }
+            } else if margin > 0.0 {
+                let ball = parry3d::shape::Ball::new(r + margin);
+                if parry3d::query::intersection_test(&ball_pose, &ball, &obs_pose, obs.shape.as_ref())
+                    .unwrap_or(false)
+                {
+                    return true;
+                }
+            } else {
+                let ball = parry3d::shape::Ball::new(r);
+                if let Ok(d) = parry3d::query::distance(&ball_pose, &ball, &obs_pose, obs.shape.as_ref())
+                {
+                    if d <= margin {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn closest_spheres_to_obstacle_witness(
+        world_spheres: &WorldSphereSoA,
+        range: &Range<usize>,
+        obs: &Obstacle,
+        cutoff: f64,
+    ) -> Option<ShapeWitness> {
+        let obs_pose = isometry_to_parry(&obs.pose);
+        let mut best: Option<ShapeWitness> = None;
+        for idx in range.clone() {
+            let ball_pose = ParryPose::from_parts(
+                ParryVector::new(
+                    world_spheres.cx[idx],
+                    world_spheres.cy[idx],
+                    world_spheres.cz[idx],
+                ),
+                ParryRotation::IDENTITY,
+            );
+            let ball = parry3d::shape::Ball::new(world_spheres.radius[idx]);
+            if let Ok(Some(contact)) = parry3d::query::contact(
+                &ball_pose,
+                &ball,
+                &obs_pose,
+                obs.shape.as_ref(),
+                cutoff.max(0.0),
+            ) {
+                let dist = contact.dist;
+                if dist <= cutoff && best.as_ref().is_none_or(|b| dist < b.0) {
+                    let p_a = parry_to_point(contact.point1);
+                    let p_b = parry_to_point(contact.point2);
+                    let n1 = parry_to_vector(contact.normal1);
+                    best = Some((dist, p_a, p_b, -n1));
+                }
+            }
+        }
+        best
+    }
+
     /// Evaluates whether configuration `q` is free of self-collision, inter-arm collision,
-    /// and environment obstacle collisions using a pre-allocated [`CollisionWorkspace`].
+    /// attached payload/tool collisions, and environment obstacle collisions using a pre-allocated [`CollisionWorkspace`].
     pub fn is_state_collision_free(
         &self,
         model: &MultiRobotModel,
@@ -838,33 +1932,136 @@ impl CollisionEnvironment {
                 };
                 let link_aabb = &workspace.link_aabbs[link_idx];
                 let link_pose = workspace.transforms.link_pose(link_id);
+                let max_obs_margin = self
+                    .obstacle_margins
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .fold(0.0_f64, f64::max);
+                let query_aabb = if max_obs_margin > 0.0 || !self.link_obstacle_rules.is_empty() {
+                    let rule_max = self
+                        .link_obstacle_rules
+                        .iter()
+                        .filter(|((l, _), _)| *l == link_id)
+                        .filter_map(|(_, r)| r.margin)
+                        .fold(max_obs_margin, f64::max);
+                    link_aabb.loosened(rule_max.max(0.0))
+                } else {
+                    *link_aabb
+                };
 
-                for obs_idx in bvh.intersect_aabb(link_aabb) {
+                for obs_idx in bvh.intersect_aabb(&query_aabb) {
+                    let obs_id = ObstacleId(obs_idx);
+                    if !self.is_link_obstacle_enabled(link_id, obs_id) {
+                        continue;
+                    }
+                    let margin = self
+                        .custom_pair_margin(&CollidingPair::LinkToObstacle {
+                            link: link_id,
+                            obstacle: obs_id,
+                        })
+                        .unwrap_or(0.0);
+                    if !link_aabb
+                        .loosened(margin.max(0.0))
+                        .intersects(&self.obstacles[obs_idx as usize].world_aabb())
+                    {
+                        continue;
+                    }
                     let obs = &self.obstacles[obs_idx as usize];
                     let collides = match tier {
                         GeometryTier::AnalyticSsv => {
-                            let obs_pose = isometry_to_parry(&obs.pose);
-                            geom.local_spheres.iter().any(|s| {
-                                let center_w = link_pose.transform_point(&s.center);
-                                let ball = parry3d::shape::Ball::new(s.radius);
-                                let ball_pose = ParryPose::from_parts(
-                                    ParryVector::new(center_w.x, center_w.y, center_w.z),
-                                    ParryRotation::IDENTITY,
-                                );
-                                parry3d::query::intersection_test(
-                                    &ball_pose,
-                                    &ball,
-                                    &obs_pose,
-                                    obs.shape.as_ref(),
-                                )
-                                .unwrap_or(false)
-                            })
+                            let range = &workspace.world_spheres.link_ranges[link_idx];
+                            Self::spheres_collide_with_obstacle(
+                                &workspace.world_spheres,
+                                range,
+                                obs,
+                                margin,
+                            )
                         }
                         GeometryTier::Convex => Self::link_collides_with_obstacle(
                             link_pose,
                             &geom.convex_shapes,
                             obs,
-                            0.0,
+                            margin,
+                        ),
+                    };
+                    if collides {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+
+        // 3. Attached Payloads / Tools (evaluated even when there are no static obstacles)
+        let num_payloads = self.attached_payloads.len();
+        for p_idx in 0..num_payloads {
+            let payload = &self.attached_payloads[p_idx];
+            if payload.parent_link.index() >= model.num_links() {
+                continue;
+            }
+            let payload_id = PayloadId(p_idx as u16);
+            let payload_pose = &workspace.payload_poses[p_idx];
+            let payload_aabb = &workspace.payload_aabbs[p_idx];
+
+            // 3a. Payload vs Static Environment Obstacles
+            if let Some(bvh) = &self.obstacle_bvh {
+                let base_margin = payload.safety_margin.unwrap_or(0.0);
+                let max_obs_margin = self
+                    .obstacle_margins
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .fold(base_margin, f64::max);
+                let rule_max = self
+                    .payload_obstacle_rules
+                    .iter()
+                    .filter(|((pid, _), _)| pid == &payload.id)
+                    .filter_map(|(_, r)| r.margin)
+                    .fold(max_obs_margin, f64::max);
+                let query_aabb = payload_aabb.loosened(rule_max.max(0.0));
+
+                for obs_idx in bvh.intersect_aabb(&query_aabb) {
+                    let obs_id = ObstacleId(obs_idx);
+                    if !self.is_payload_obstacle_enabled(&payload.id, obs_id) {
+                        continue;
+                    }
+                    let pair = CollidingPair::PayloadToObstacle {
+                        payload: payload_id,
+                        parent_link: payload.parent_link,
+                        obstacle: obs_id,
+                    };
+                    let margin = self.custom_pair_margin(&pair).unwrap_or(0.0);
+                    let obs = &self.obstacles[obs_idx as usize];
+                    if !payload_aabb
+                        .loosened(margin.max(0.0))
+                        .intersects(&obs.world_aabb())
+                    {
+                        continue;
+                    }
+                    let collides = match tier {
+                        GeometryTier::AnalyticSsv => {
+                            let range = &workspace.world_spheres.payload_ranges[p_idx];
+                            if !range.is_empty() {
+                                Self::spheres_collide_with_obstacle(
+                                    &workspace.world_spheres,
+                                    range,
+                                    obs,
+                                    margin,
+                                )
+                            } else {
+                                Self::link_collides_with_obstacle(
+                                    payload_pose,
+                                    &payload.geometry.convex_shapes,
+                                    obs,
+                                    margin,
+                                )
+                            }
+                        }
+                        GeometryTier::Convex => Self::link_collides_with_obstacle(
+                            payload_pose,
+                            &payload.geometry.convex_shapes,
+                            obs,
+                            margin,
                         ),
                     };
                     if collides {
@@ -873,56 +2070,118 @@ impl CollisionEnvironment {
                 }
             }
 
-            // 3. Attached Payloads vs Environment Obstacles & Non-Touch Links
-            for payload in &self.attached_payloads {
-                if payload.parent_link.index() >= model.num_links() {
+            // 3b. Payload vs Non-Touch Robot Links
+            for link_idx in 0..model.num_links() {
+                let link_id = LinkId(link_idx as u16);
+                if link_id == payload.parent_link || payload.touch_links.contains(&link_id) {
                     continue;
                 }
-                let payload_world_pose =
-                    workspace.transforms.link_pose(payload.parent_link) * payload.local_pose;
-                let payload_parry_pose = isometry_to_parry(&payload_world_pose);
-                let payload_aabb = payload.shape.compute_aabb(&payload_parry_pose);
-
-                for obs_idx in bvh.intersect_aabb(&payload_aabb) {
-                    let obs = &self.obstacles[obs_idx as usize];
-                    let obs_pose = isometry_to_parry(&obs.pose);
-                    if parry3d::query::intersection_test(
-                        &payload_parry_pose,
-                        payload.shape.as_ref(),
-                        &obs_pose,
-                        obs.shape.as_ref(),
-                    )
-                    .unwrap_or(false)
-                    {
-                        return Ok(false);
-                    }
+                if !self.is_payload_link_enabled(&payload.id, link_id) {
+                    continue;
                 }
-
-                for link_idx in 0..model.num_links() {
-                    let link_id = LinkId(link_idx as u16);
-                    if link_id == payload.parent_link || payload.touch_links.contains(&link_id) {
-                        continue;
-                    }
-                    let Some(geom) = self.link_geometry(link_id) else {
-                        continue;
-                    };
-                    if !payload_aabb.intersects(&workspace.link_aabbs[link_idx]) {
-                        continue;
-                    }
-                    let link_pose = workspace.transforms.link_pose(link_id);
-                    for (local_offset, shape) in &geom.convex_shapes {
-                        let shape_pose = isometry_to_parry(&(link_pose * local_offset));
-                        if parry3d::query::intersection_test(
-                            &payload_parry_pose,
-                            payload.shape.as_ref(),
-                            &shape_pose,
-                            shape.as_ref(),
-                        )
-                        .unwrap_or(false)
-                        {
-                            return Ok(false);
+                let Some(geom) = self.link_geometry(link_id) else {
+                    continue;
+                };
+                let pair = CollidingPair::PayloadToLink {
+                    payload: payload_id,
+                    parent_link: payload.parent_link,
+                    link: link_id,
+                };
+                let margin = self.custom_pair_margin(&pair).unwrap_or(0.0);
+                if !payload_aabb
+                    .loosened(margin.max(0.0))
+                    .intersects(&workspace.link_aabbs[link_idx])
+                {
+                    continue;
+                }
+                let collides = match tier {
+                    GeometryTier::AnalyticSsv => {
+                        let range_p = &workspace.world_spheres.payload_ranges[p_idx];
+                        let range_l = &workspace.world_spheres.link_ranges[link_idx];
+                        if !range_p.is_empty() && !range_l.is_empty() {
+                            workspace
+                                .world_spheres
+                                .ranges_intersect_simd(range_p, range_l, margin)
+                        } else {
+                            let link_pose = workspace.transforms.link_pose(link_id);
+                            Self::shapes_collide(
+                                payload_pose,
+                                &payload.geometry.convex_shapes,
+                                link_pose,
+                                &geom.convex_shapes,
+                                margin,
+                            )
                         }
                     }
+                    GeometryTier::Convex => {
+                        let link_pose = workspace.transforms.link_pose(link_id);
+                        Self::shapes_collide(
+                            payload_pose,
+                            &payload.geometry.convex_shapes,
+                            link_pose,
+                            &geom.convex_shapes,
+                            margin,
+                        )
+                    }
+                };
+                if collides {
+                    return Ok(false);
+                }
+            }
+
+            // 3c. Payload vs Other Attached Payloads (Tool-to-Tool)
+            for p_b_idx in (p_idx + 1)..num_payloads {
+                let payload_b = &self.attached_payloads[p_b_idx];
+                if payload_b.parent_link.index() >= model.num_links()
+                    || payload.parent_link == payload_b.parent_link
+                {
+                    continue;
+                }
+                if !self.is_payload_pair_enabled(&payload.id, &payload_b.id) {
+                    continue;
+                }
+                let payload_b_id = PayloadId(p_b_idx as u16);
+                let pair = CollidingPair::PayloadToPayload {
+                    payload_a: payload_id,
+                    parent_link_a: payload.parent_link,
+                    payload_b: payload_b_id,
+                    parent_link_b: payload_b.parent_link,
+                };
+                let margin = self.custom_pair_margin(&pair).unwrap_or(0.0);
+                if !payload_aabb
+                    .loosened(margin.max(0.0))
+                    .intersects(&workspace.payload_aabbs[p_b_idx])
+                {
+                    continue;
+                }
+                let collides = match tier {
+                    GeometryTier::AnalyticSsv => {
+                        let range_a = &workspace.world_spheres.payload_ranges[p_idx];
+                        let range_b = &workspace.world_spheres.payload_ranges[p_b_idx];
+                        if !range_a.is_empty() && !range_b.is_empty() {
+                            workspace
+                                .world_spheres
+                                .ranges_intersect_simd(range_a, range_b, margin)
+                        } else {
+                            Self::shapes_collide(
+                                payload_pose,
+                                &payload.geometry.convex_shapes,
+                                &workspace.payload_poses[p_b_idx],
+                                &payload_b.geometry.convex_shapes,
+                                margin,
+                            )
+                        }
+                    }
+                    GeometryTier::Convex => Self::shapes_collide(
+                        payload_pose,
+                        &payload.geometry.convex_shapes,
+                        &workspace.payload_poses[p_b_idx],
+                        &payload_b.geometry.convex_shapes,
+                        margin,
+                    ),
+                };
+                if collides {
+                    return Ok(false);
                 }
             }
         }
@@ -932,8 +2191,8 @@ impl CollisionEnvironment {
 
     /// Continuous collision checking along the geodesic C-space segment `[q0, q1]`.
     ///
-    /// Uses C-space Lipschitz lever-arm bounds to determine a conservative subdivision count
-    /// paired with binary bisection ordering (checking midpoints first for fast collision rejection).
+    /// Uses C-space Lipschitz lever-arm bounds (including attached tool extents) to determine
+    /// a conservative subdivision count.
     pub fn is_segment_collision_free(
         &self,
         model: &MultiRobotModel,
@@ -949,10 +2208,31 @@ impl CollisionEnvironment {
             return Ok(false);
         }
 
-        // Compute upper bound on workspace displacement across all links using Lipschitz lever arms
+        // Compute upper bound on workspace displacement across all links & attached tools using Lipschitz lever arms
         let mut max_disp = 0.0_f64;
         for link_idx in 0..model.num_links() {
             let disp = model.max_link_displacement(LinkId(link_idx as u16), q0, q1);
+            if disp > max_disp {
+                max_disp = disp;
+            }
+        }
+        for payload in &self.attached_payloads {
+            if payload.parent_link.index() >= model.num_links() {
+                continue;
+            }
+            let tool_reach = payload.local_pose.translation.vector.norm()
+                + payload.geometry.max_extent_from_origin();
+            let mut disp = model.max_link_displacement(payload.parent_link, q0, q1);
+            if tool_reach > 0.0 {
+                for q_idx in 0..model.dof() {
+                    if model.is_dof_ancestor_of_link(payload.parent_link, q_idx) {
+                        let joint = model.joint(model.actuated_joint(q_idx));
+                        if !matches!(joint.joint_type, JointType::Prismatic { .. }) {
+                            disp += tool_reach * model.dof_distance(q_idx, q0[q_idx], q1[q_idx]);
+                        }
+                    }
+                }
+            }
             if disp > max_disp {
                 max_disp = disp;
             }
@@ -967,8 +2247,7 @@ impl CollisionEnvironment {
             return Ok(true);
         }
 
-        // Check internal points in van der Corput / binary bisection order (1/2, 1/4, 3/4, ...)
-        // so collisions near the middle of a segment are detected in O(1) evaluations.
+        // Check internal points along the segment
         let mut scratch_q = std::mem::take(&mut workspace.scratch_q);
         scratch_q.resize(model.dof(), 0.0);
 
@@ -990,7 +2269,8 @@ impl CollisionEnvironment {
         }
     }
 
-    /// Queries all link-obstacle and active link-link signed distance witnesses within `cutoff_distance`.
+    /// Queries all link-obstacle, active link-link, and attached payload signed distance witnesses
+    /// within `cutoff_distance`.
     ///
     /// Populates `out_witnesses` with signed distances, world-space witness points, and unit normals
     /// suitable for [`SignedDistanceWitness::compute_distance_jacobian`].
@@ -1074,6 +2354,10 @@ impl CollisionEnvironment {
                 let link_pose = workspace.transforms.link_pose(link_id);
 
                 for obs_idx in bvh.intersect_aabb(&query_aabb) {
+                    let obs_id = ObstacleId(obs_idx);
+                    if !self.is_link_obstacle_enabled(link_id, obs_id) {
+                        continue;
+                    }
                     let obs = &self.obstacles[obs_idx as usize];
                     let obs_slice = [(Isometry3::identity(), obs.shape.clone())];
                     if let Some((dist, p_a, p_b, normal)) = Self::closest_shapes_witness(
@@ -1086,7 +2370,7 @@ impl CollisionEnvironment {
                         out_witnesses.push(SignedDistanceWitness {
                             pair: CollidingPair::LinkToObstacle {
                                 link: link_id,
-                                obstacle: ObstacleId(obs_idx),
+                                obstacle: obs_id,
                             },
                             signed_distance: dist,
                             witness_a_world: p_a,
@@ -1094,6 +2378,159 @@ impl CollisionEnvironment {
                             normal_world: normal,
                         });
                     }
+                }
+            }
+        }
+
+        // 3-5. Attached Payloads vs Obstacles, Non-Touch Links, and Other Payloads
+        let num_payloads = self.attached_payloads.len();
+        for p_idx in 0..num_payloads {
+            let payload = &self.attached_payloads[p_idx];
+            if payload.parent_link.index() >= model.num_links() {
+                continue;
+            }
+            let payload_id = PayloadId(p_idx as u16);
+            let payload_pose = &workspace.payload_poses[p_idx];
+            let payload_aabb = &workspace.payload_aabbs[p_idx];
+            let loosened_payload = payload_aabb.loosened(margin);
+
+            // 3. Payload-to-Obstacle
+            if let Some(bvh) = &self.obstacle_bvh {
+                for obs_idx in bvh.intersect_aabb(&loosened_payload) {
+                    let obs_id = ObstacleId(obs_idx);
+                    if !self.is_payload_obstacle_enabled(&payload.id, obs_id) {
+                        continue;
+                    }
+                    let obs = &self.obstacles[obs_idx as usize];
+                    let witness = if tier == GeometryTier::AnalyticSsv
+                        && !workspace.world_spheres.payload_ranges[p_idx].is_empty()
+                    {
+                        Self::closest_spheres_to_obstacle_witness(
+                            &workspace.world_spheres,
+                            &workspace.world_spheres.payload_ranges[p_idx],
+                            obs,
+                            cutoff_distance,
+                        )
+                    } else {
+                        let obs_slice = [(Isometry3::identity(), obs.shape.clone())];
+                        Self::closest_shapes_witness(
+                            payload_pose,
+                            &payload.geometry.convex_shapes,
+                            &obs.pose,
+                            &obs_slice,
+                            cutoff_distance,
+                        )
+                    };
+                    if let Some((dist, p_a, p_b, normal)) = witness {
+                        out_witnesses.push(SignedDistanceWitness {
+                            pair: CollidingPair::PayloadToObstacle {
+                                payload: payload_id,
+                                parent_link: payload.parent_link,
+                                obstacle: obs_id,
+                            },
+                            signed_distance: dist,
+                            witness_a_world: p_a,
+                            witness_b_world: p_b,
+                            normal_world: normal,
+                        });
+                    }
+                }
+            }
+
+            // 4. Payload-to-Link
+            for link_idx in 0..model.num_links() {
+                let link_id = LinkId(link_idx as u16);
+                if link_id == payload.parent_link || payload.touch_links.contains(&link_id) {
+                    continue;
+                }
+                if !self.is_payload_link_enabled(&payload.id, link_id) {
+                    continue;
+                }
+                let Some(geom) = self.link_geometry(link_id) else {
+                    continue;
+                };
+                if !loosened_payload.intersects(&workspace.link_aabbs[link_idx]) {
+                    continue;
+                }
+                let witness = if tier == GeometryTier::AnalyticSsv
+                    && !workspace.world_spheres.payload_ranges[p_idx].is_empty()
+                    && !workspace.world_spheres.link_ranges[link_idx].is_empty()
+                {
+                    workspace.world_spheres.closest_spheres_witness(
+                        &workspace.world_spheres.payload_ranges[p_idx],
+                        &workspace.world_spheres.link_ranges[link_idx],
+                        cutoff_distance,
+                    )
+                } else {
+                    let link_pose = workspace.transforms.link_pose(link_id);
+                    Self::closest_shapes_witness(
+                        payload_pose,
+                        &payload.geometry.convex_shapes,
+                        link_pose,
+                        &geom.convex_shapes,
+                        cutoff_distance,
+                    )
+                };
+                if let Some((dist, p_a, p_b, normal)) = witness {
+                    out_witnesses.push(SignedDistanceWitness {
+                        pair: CollidingPair::PayloadToLink {
+                            payload: payload_id,
+                            parent_link: payload.parent_link,
+                            link: link_id,
+                        },
+                        signed_distance: dist,
+                        witness_a_world: p_a,
+                        witness_b_world: p_b,
+                        normal_world: normal,
+                    });
+                }
+            }
+
+            // 5. Payload-to-Payload
+            for p_b_idx in (p_idx + 1)..num_payloads {
+                let payload_b = &self.attached_payloads[p_b_idx];
+                if payload_b.parent_link.index() >= model.num_links()
+                    || payload.parent_link == payload_b.parent_link
+                {
+                    continue;
+                }
+                if !self.is_payload_pair_enabled(&payload.id, &payload_b.id) {
+                    continue;
+                }
+                if !loosened_payload.intersects(&workspace.payload_aabbs[p_b_idx]) {
+                    continue;
+                }
+                let witness = if tier == GeometryTier::AnalyticSsv
+                    && !workspace.world_spheres.payload_ranges[p_idx].is_empty()
+                    && !workspace.world_spheres.payload_ranges[p_b_idx].is_empty()
+                {
+                    workspace.world_spheres.closest_spheres_witness(
+                        &workspace.world_spheres.payload_ranges[p_idx],
+                        &workspace.world_spheres.payload_ranges[p_b_idx],
+                        cutoff_distance,
+                    )
+                } else {
+                    Self::closest_shapes_witness(
+                        payload_pose,
+                        &payload.geometry.convex_shapes,
+                        &workspace.payload_poses[p_b_idx],
+                        &payload_b.geometry.convex_shapes,
+                        cutoff_distance,
+                    )
+                };
+                if let Some((dist, p_a, p_b, normal)) = witness {
+                    out_witnesses.push(SignedDistanceWitness {
+                        pair: CollidingPair::PayloadToPayload {
+                            payload_a: payload_id,
+                            parent_link_a: payload.parent_link,
+                            payload_b: PayloadId(p_b_idx as u16),
+                            parent_link_b: payload_b.parent_link,
+                        },
+                        signed_distance: dist,
+                        witness_a_world: p_a,
+                        witness_b_world: p_b,
+                        normal_world: normal,
+                    });
                 }
             }
         }

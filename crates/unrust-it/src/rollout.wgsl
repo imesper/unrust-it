@@ -32,16 +32,16 @@ struct FlatLinkSphere {
     local_center: vec3<f32>,
     radius: f32,
     link_index: u32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
+    esdf_margin: f32,
+    esdf_activation: f32,
+    flags: u32,
 };
 
 struct FlatSpherePair {
     sphere_a: u32,
     sphere_b: u32,
     combined_radius: f32,
-    pad: u32,
+    activation_distance: f32,
 };
 
 struct FlatEndEffector {
@@ -212,15 +212,18 @@ fn collision_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let sa = out_world_spheres[sphere_base + pair.sphere_a];
         let sb = out_world_spheres[sphere_base + pair.sphere_b];
         let d = distance(sa.xyz, sb.xyz) - pair.combined_radius;
-        total_cost = total_cost + smooth_hinge_cost(d, act);
+        let pair_act = select(act, max(pair.activation_distance, 1e-4), pair.activation_distance > 0.0);
+        total_cost = total_cost + smooth_hinge_cost(d, pair_act);
     }
 
     if (params.has_esdf != 0u) {
         for (var s_idx: u32 = 0u; s_idx < params.num_spheres; s_idx = s_idx + 1u) {
+            let s_meta = spheres[s_idx];
             let s = out_world_spheres[sphere_base + s_idx];
             let voxel_d = sample_esdf_distance(s.xyz);
-            let d = voxel_d - s.w;
-            total_cost = total_cost + smooth_hinge_cost(d, act);
+            let d = voxel_d - (s.w + s_meta.esdf_margin);
+            let sphere_act = select(act, max(s_meta.esdf_activation, 1e-4), s_meta.esdf_activation > 0.0);
+            total_cost = total_cost + smooth_hinge_cost(d, sphere_act);
         }
     }
 

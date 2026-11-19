@@ -18,23 +18,27 @@ pub mod trajectory;
 pub use batch::{
     BatchIkSolver, BatchMppiOptimizer, BatchRolloutBackend, CpuSimdBatchBackend, EsdfGridF32,
     FlatEndEffectorF32, FlatJointF32, FlatLinkSphereF32, FlatRobotModelF32, FlatSpherePairF32,
-    MppiConfig, RolloutUniformsF32,
+    MppiConfig, RolloutUniformsF32, SPHERE_FLAG_PAYLOAD,
 };
 #[cfg(feature = "gpu")]
 pub use batch::{GpuRobotContext, WgpuBatchBackend};
 pub use collision::{
-    AllowedCollisionMatrix, BoundingSphere, CollidingPair, CollisionChecker, CollisionEnvironment,
-    CollisionError, CollisionRule, CollisionWorkspace, GeometryTier, LinkCapsule, LinkGeometry,
-    Obstacle, SignedDistanceWitness, WorldSphereSoA,
+    decompose_shape_to_spheres, parry_to_isometry, AllowedCollisionMatrix, BoundingSphere,
+    CollidingPair, CollisionChecker, CollisionEnvironment, CollisionError, CollisionRule,
+    CollisionWorkspace, GeometryTier, LinkCapsule, LinkGeometry, Obstacle, PayloadPairRule,
+    SignedDistanceWitness, WorldSphereSoA,
 };
 pub use control::{ControlError, ReactiveServoConfig, ReactiveServoController, ServoTarget};
 pub use kinematics::{ForwardKinematics, InverseKinematics, KinematicsError, TransformBuffer};
 pub use manifold::{ClosedChainGraspConstraint, ConstraintManifold};
-pub use planner::{PathPlanner, PlannerError, RrtPlanner, Target};
+pub use planner::{
+    ApproachTarget, CoarsePlannerMode, PathPlanner, PlannerError, RrtPlanner, Target,
+    TwoStageApproachPlanner, TwoStagePlanConfig, TwoStagePlanResult,
+};
 pub use robot::{
     AttachedPayload, Configuration, FrameAttachment, FrameGraph, FrameId, FrameNode, JointId,
     JointLimit, JointSpec, JointState, JointType, KinodynamicLimits, LinkId, LinkSpec,
-    MultiRobotModel, ObstacleId, PlanningGroup, Robot, RobotError, RobotId, TaskPose,
+    MultiRobotModel, ObstacleId, PayloadId, PlanningGroup, Robot, RobotError, RobotId, TaskPose,
     TaskSpacePoint,
 };
 pub use trajectory::{
@@ -703,6 +707,785 @@ mod tests {
         assert!(
             opt_total_coll < init_total_coll * 0.25,
             "MPPI should substantially reduce collision cost (init={init_total_coll}, opt={opt_total_coll})"
+        );
+    }
+
+    #[test]
+    fn attached_payload_collision_witnesses_and_jacobians_match_fd() {
+        let (model, left_arm, right_arm, _) = build_dual_arm_model();
+        let mut env = CollisionEnvironment::new();
+        env.set_acm(AllowedCollisionMatrix::from_model(&model));
+        for link in model.links() {
+            env.set_link_geometry(
+                link.id,
+                LinkGeometry::from_capsule(
+                    Point3::origin(),
+                    Point3::new(0.0, 0.0, 0.3),
+                    link.bounding_radius,
+                ),
+            );
+        }
+
+        // Attach a multi-part compound tool to left wrist (LinkId(2)) with ZERO obstacles first.
+        let left_wrist = *left_arm.active_links.last().unwrap();
+        let left_forearm = left_arm.active_links[1];
+        let right_wrist = *right_arm.active_links.last().unwrap();
+        let left_tool = AttachedPayload::from_compound(
+            "left_tool",
+            left_wrist,
+            Isometry3::translation(0.0, 0.0, 0.3),
+            vec![
+                (
+                    Isometry3::translation(0.0, 0.0, 0.05),
+                    SharedShape::new(parry3d::shape::Cuboid::new(parry3d::math::Vector::new(
+                        0.03, 0.03, 0.05,
+                    ))),
+                ),
+                (
+                    Isometry3::translation(0.0, 0.0, 0.16),
+                    SharedShape::new(parry3d::shape::Capsule::new_z(0.05, 0.015)),
+                ),
+            ],
+        )
+        .with_touch_links(vec![left_forearm, left_wrist]);
+        let left_pid = env.attach_payload(left_tool);
+
+        let mut ws = env.create_workspace(&model);
+
+        // 1. Verify Payload <-> Link collision detection works even with ZERO environment obstacles
+        // Bend both arms directly toward each other along Y so left_tool penetrates right_wrist.
+        let q_collide = [
+            -std::f64::consts::FRAC_PI_2,
+            0.7,
+            0.55,
+            std::f64::consts::FRAC_PI_2,
+            0.7,
+            0.55,
+        ];
+        assert!(
+            !env.is_state_collision_free(&model, &q_collide, GeometryTier::Convex, &mut ws)
+                .unwrap(),
+            "tool colliding with other arm must be caught even with zero static obstacles"
+        );
+        assert!(
+            !env.is_state_collision_free(&model, &q_collide, GeometryTier::AnalyticSsv, &mut ws)
+                .unwrap(),
+            "AnalyticSsv tool-vs-link check must also detect collision"
+        );
+
+        // 2. Verify touch_links exemption: fold left arm tightly without hitting right arm
+        let q_touch_safe = [-0.2, 0.2, 2.2, 0.0, -0.8, 0.0];
+        assert!(
+            env.is_state_collision_free(&model, &q_touch_safe, GeometryTier::Convex, &mut ws)
+                .unwrap(),
+            "touch_links should exempt parent & adjacent forearm links from payload collision"
+        );
+
+        // 3. Attach second tool to right wrist and add an obstacle near left tool
+        let right_tool = AttachedPayload::from_shape(
+            "right_tool",
+            right_wrist,
+            Isometry3::translation(0.0, 0.0, 0.3),
+            SharedShape::new(parry3d::shape::Capsule::new_z(0.08, 0.015)),
+        )
+        .with_touch_links(vec![right_arm.active_links[1], right_wrist]);
+        let right_pid = env.attach_payload(right_tool);
+
+        let q_near = [
+            -std::f64::consts::FRAC_PI_2,
+            0.22,
+            0.18,
+            std::f64::consts::FRAC_PI_2,
+            0.22,
+            0.18,
+        ];
+        let mut buf = model.create_transform_buffer();
+        model.forward_kinematics(&q_near, &mut buf).unwrap();
+        let left_wrist_pose = *buf.link_pose(left_wrist);
+        let obs_center = left_wrist_pose.transform_point(&Point3::new(0.15, 0.0, 0.45));
+        let obs_id = env.add_obstacle(
+            SharedShape::new(Ball::new(0.05)),
+            Isometry3::from(Translation3::from(obs_center.coords)),
+        );
+
+        assert!(env
+            .is_state_collision_free(&model, &q_near, GeometryTier::Convex, &mut ws)
+            .unwrap());
+
+        let mut witnesses = Vec::new();
+        env.query_signed_distances(
+            &model,
+            &q_near,
+            1.5,
+            GeometryTier::Convex,
+            &mut ws,
+            &mut witnesses,
+        )
+        .unwrap();
+
+        let w_obs = witnesses
+            .iter()
+            .find(|w| {
+                matches!(
+                    w.pair,
+                    CollidingPair::PayloadToObstacle {
+                        payload,
+                        obstacle,
+                        ..
+                    } if payload == left_pid && obstacle == obs_id
+                )
+            })
+            .expect("expected PayloadToObstacle witness")
+            .clone();
+        let w_link = witnesses
+            .iter()
+            .find(|w| {
+                matches!(
+                    w.pair,
+                    CollidingPair::PayloadToLink {
+                        payload,
+                        link,
+                        ..
+                    } if payload == left_pid && link == right_wrist
+                )
+            })
+            .expect("expected PayloadToLink witness")
+            .clone();
+        let w_pay = witnesses
+            .iter()
+            .find(|w| {
+                matches!(
+                    w.pair,
+                    CollidingPair::PayloadToPayload {
+                        payload_a,
+                        payload_b,
+                        ..
+                    } if payload_a == left_pid && payload_b == right_pid
+                )
+            })
+            .expect("expected PayloadToPayload witness")
+            .clone();
+
+        // Verify analytical distance Jacobians for all 3 payload witness types against FD
+        let eps = 1e-6;
+        let mut j_dist = vec![0.0; model.dof()];
+        for witness in [&w_obs, &w_link, &w_pay] {
+            witness.compute_distance_jacobian(&model, &ws.transforms, &mut j_dist);
+            for k in 0..model.dof() {
+                let mut q_plus = q_near;
+                let mut q_minus = q_near;
+                q_plus[k] += eps;
+                q_minus[k] -= eps;
+                let mut w_p = Vec::new();
+                let mut w_m = Vec::new();
+                env.query_signed_distances(
+                    &model,
+                    &q_plus,
+                    1.5,
+                    GeometryTier::Convex,
+                    &mut ws,
+                    &mut w_p,
+                )
+                .unwrap();
+                env.query_signed_distances(
+                    &model,
+                    &q_minus,
+                    1.5,
+                    GeometryTier::Convex,
+                    &mut ws,
+                    &mut w_m,
+                )
+                .unwrap();
+                let d_p = w_p
+                    .iter()
+                    .find(|w| w.pair == witness.pair)
+                    .unwrap()
+                    .signed_distance;
+                let d_m = w_m
+                    .iter()
+                    .find(|w| w.pair == witness.pair)
+                    .unwrap()
+                    .signed_distance;
+                let fd = (d_p - d_m) / (2.0 * eps);
+                assert_relative_eq!(j_dist[k], fd, epsilon = 1e-4);
+            }
+        }
+
+        // 4. Verify is_segment_collision_free catches an attached tool sweeping through an obstacle
+        let q_sweep_a = [0.0, 0.3, 0.2, 0.0, -0.8, 0.0];
+        let mut q_sweep_mid = q_sweep_a;
+        q_sweep_mid[0] = -0.60;
+        let mut q_sweep_end = q_sweep_a;
+        q_sweep_end[0] = -1.20;
+        model.forward_kinematics(&q_sweep_mid, &mut buf).unwrap();
+        let sweep_tip = buf
+            .link_pose(left_wrist)
+            .transform_point(&Point3::new(0.0, 0.0, 0.45));
+        let mut env_sweep = CollisionEnvironment::new();
+        env_sweep.set_acm(AllowedCollisionMatrix::from_model(&model));
+        for link in model.links() {
+            env_sweep.set_link_geometry(
+                link.id,
+                LinkGeometry::from_capsule(
+                    Point3::origin(),
+                    Point3::new(0.0, 0.0, 0.3),
+                    link.bounding_radius,
+                ),
+            );
+        }
+        env_sweep.attach_payload(
+            AttachedPayload::from_shape(
+                "long_probe",
+                left_wrist,
+                Isometry3::translation(0.0, 0.0, 0.45),
+                SharedShape::new(Ball::new(0.04)),
+            )
+            .with_touch_links(vec![left_forearm, left_wrist]),
+        );
+        env_sweep.add_obstacle(
+            SharedShape::new(Ball::new(0.05)),
+            Isometry3::from(Translation3::from(sweep_tip.coords)),
+        );
+        let mut ws_sweep = env_sweep.create_workspace(&model);
+        assert!(env_sweep
+            .is_state_collision_free(&model, &q_sweep_a, GeometryTier::Convex, &mut ws_sweep)
+            .unwrap());
+        assert!(env_sweep
+            .is_state_collision_free(&model, &q_sweep_end, GeometryTier::Convex, &mut ws_sweep)
+            .unwrap());
+        assert!(
+            !env_sweep
+                .is_segment_collision_free(
+                    &model,
+                    &q_sweep_a,
+                    &q_sweep_end,
+                    0.03,
+                    GeometryTier::Convex,
+                    &mut ws_sweep
+                )
+                .unwrap(),
+            "Lipschitz CCD must catch a long attached tool sweeping through an obstacle"
+        );
+    }
+
+    #[test]
+    fn batch_f32_includes_attached_payloads_and_pair_margins_cpu_and_gpu() {
+        let (model, left_arm, right_arm, _) = build_dual_arm_model();
+        let mut env = CollisionEnvironment::new();
+        let mut acm = AllowedCollisionMatrix::from_model(&model);
+        acm.set_inter_arm_margin(&model, 0.06);
+        env.set_acm(acm);
+        for link in model.links() {
+            env.set_link_geometry(
+                link.id,
+                LinkGeometry::from_capsule(
+                    Point3::origin(),
+                    Point3::new(0.0, 0.0, 0.3),
+                    link.bounding_radius,
+                ),
+            );
+        }
+
+        let left_wrist = *left_arm.active_links.last().unwrap();
+        let right_wrist = *right_arm.active_links.last().unwrap();
+        env.attach_payload(
+            AttachedPayload::from_shape(
+                "tool_l",
+                left_wrist,
+                Isometry3::translation(0.0, 0.0, 0.35),
+                SharedShape::new(Ball::new(0.02)),
+            )
+            .with_touch_links(vec![left_arm.active_links[1], left_wrist])
+            .with_safety_margin(0.003)
+            .with_activation_distance(0.02),
+        );
+        env.attach_payload(
+            AttachedPayload::from_shape(
+                "tool_r",
+                right_wrist,
+                Isometry3::translation(0.0, 0.0, 0.35),
+                SharedShape::new(Ball::new(0.02)),
+            )
+            .with_touch_links(vec![right_arm.active_links[1], right_wrist])
+            .with_safety_margin(0.003)
+            .with_activation_distance(0.02),
+        );
+        env.set_payload_pair_margin("tool_l", "tool_r", 0.004);
+        env.set_payload_pair_activation("tool_l", "tool_r", 0.02);
+
+        let flat = FlatRobotModelF32::compile_with_default_margin(&model, &env, 0.04);
+        assert!(flat.spheres.iter().any(|s| s.flags == SPHERE_FLAG_PAYLOAD));
+        assert!(flat
+            .active_self_pairs
+            .iter()
+            .any(|p| (p.activation_distance - 0.02).abs() < 1e-5));
+
+        let mut esdf = EsdfGridF32::new([-1.2, -1.2, -0.4], 0.04, [60, 60, 45], 1.0);
+        esdf.add_sphere_obstacle([0.45, 0.0, 0.65], 0.12);
+
+        // Verify pair-specific activation override: construct a batch of varied configs
+        let batch_size = 64;
+        let dof = flat.dof;
+        let mut q_batch = vec![0.0_f32; batch_size * dof];
+        for b in 0..batch_size {
+            let phase = b as f32 * 0.08;
+            q_batch[b * dof] = -1.57 + 0.3 * phase.sin();
+            q_batch[b * dof + 1] = 0.5 + 0.3 * phase.cos();
+            q_batch[b * dof + 2] = 0.4 + 0.2 * phase.sin();
+            q_batch[b * dof + 3] = 1.57 - 0.3 * phase.sin();
+            q_batch[b * dof + 4] = 0.5 + 0.3 * phase.cos();
+            q_batch[b * dof + 5] = 0.4 + 0.2 * phase.cos();
+        }
+
+        let cpu = CpuSimdBatchBackend;
+        let mut cpu_costs = vec![0.0_f32; batch_size];
+        cpu.collision_cost_batch_f32(&flat, Some(&esdf), &q_batch, 0.12, &mut cpu_costs);
+        assert!(cpu_costs.iter().any(|&c| c > 0.0));
+
+        // Specifically verify that tool-to-tool separation of ~35mm (> 4mm margin + 20mm pair activation)
+        // yields ZERO cost even when global activation_distance is large (0.15m), proving custom activation works!
+        let flat_tool_only = {
+            let mut m_only = FlatRobotModelF32::compile(&model, &env);
+            m_only.active_self_pairs.retain(|p| {
+                flat.spheres[p.sphere_a as usize].flags == SPHERE_FLAG_PAYLOAD
+                    && flat.spheres[p.sphere_b as usize].flags == SPHERE_FLAG_PAYLOAD
+            });
+            m_only
+        };
+        // Find distance when tool tips are separated (> 4mm margin + 20mm pair activation)
+        let q_gap = [
+            -std::f64::consts::FRAC_PI_2,
+            0.20,
+            0.12,
+            std::f64::consts::FRAC_PI_2,
+            0.20,
+            0.12,
+        ];
+        let mut buf = model.create_transform_buffer();
+        model.forward_kinematics(&q_gap, &mut buf).unwrap();
+        let p_tl = buf
+            .link_pose(left_wrist)
+            .transform_point(&Point3::new(0.0, 0.0, 0.35));
+        let p_tr = buf
+            .link_pose(right_wrist)
+            .transform_point(&Point3::new(0.0, 0.0, 0.35));
+        let gap = (p_tl - p_tr).norm() - 0.04;
+        assert!(gap > 0.024, "expected tool gap > 0.024, got {gap}");
+        let q_gap_f32 = batch::config_to_f32(&q_gap);
+        let mut gap_cost = [0.0_f32; 1];
+        cpu.collision_cost_batch_f32(&flat_tool_only, None, &q_gap_f32, 0.50, &mut gap_cost);
+        assert_relative_eq!(gap_cost[0], 0.0, epsilon = 1e-6);
+
+        #[cfg(feature = "gpu")]
+        {
+            let gpu = WgpuBatchBackend::new().expect("wgpu backend should initialize");
+            let mut gpu_costs = vec![0.0_f32; batch_size];
+            gpu.collision_cost_batch_f32(&flat, Some(&esdf), &q_batch, 0.12, &mut gpu_costs);
+            for (&c, &g) in cpu_costs.iter().zip(gpu_costs.iter()) {
+                assert_relative_eq!(c, g, epsilon = 1e-4);
+            }
+
+            let gpu_ctx = GpuRobotContext::new(&gpu, flat.clone(), Some(esdf.clone()), batch_size);
+            let mut res_costs = vec![0.0_f32; batch_size];
+            gpu_ctx.collision_cost_resident(&gpu, &q_batch, 0.12, &mut res_costs);
+            for (&c, &r) in cpu_costs.iter().zip(res_costs.iter()) {
+                assert_relative_eq!(c, r, epsilon = 1e-4);
+            }
+        }
+    }
+
+    #[test]
+    fn priority_weighted_qp_cbf_and_curl_break_symmetric_deadlock() {
+        let (model, left_arm, right_arm, _) = build_dual_arm_model();
+        let mut env = CollisionEnvironment::new();
+        env.set_acm(AllowedCollisionMatrix::from_model(&model));
+        for link in model.links() {
+            let cap_len = if link.id == LinkId(2) || link.id == LinkId(5) {
+                0.65
+            } else {
+                0.30
+            };
+            env.set_link_geometry(
+                link.id,
+                LinkGeometry::from_capsule(
+                    Point3::origin(),
+                    Point3::new(0.0, 0.0, cap_len),
+                    link.bounding_radius,
+                ),
+            );
+        }
+
+        // 1. Priority weighting test: place left & right arms facing each other symmetrically along Y.
+        let q_sym = [
+            -std::f64::consts::FRAC_PI_2,
+            -0.50,
+            1.30,
+            std::f64::consts::FRAC_PI_2,
+            -0.50,
+            1.30,
+        ];
+        let mut ws = env.create_workspace(&model);
+        assert!(env
+            .is_state_collision_free(&model, &q_sym, GeometryTier::Convex, &mut ws)
+            .unwrap());
+
+        let left_tcp = left_arm.end_effectors[0];
+        let right_tcp = right_arm.end_effectors[0];
+
+        let cfg_prio = ReactiveServoConfig {
+            dt: 0.1,
+            safety_margin: 0.06,
+            cbf_activation_distance: 0.35,
+            cbf_gamma: 8.0,
+            damping: 0.02,
+            posture_gain: 0.0,
+            tangential_curl_gain: 0.0,
+            ..ReactiveServoConfig::default()
+        }
+        .with_arm_priority(RobotId(0), 10.0)
+        .with_arm_priority(RobotId(1), 1.0);
+
+        let mut servo_prio = ReactiveServoController::new(&model, &env, cfg_prio);
+        let mut dq_cmd = [0.0; 6];
+        let targets_approach = [
+            ServoTarget::twist(left_tcp, SVector::<f64, 6>::new(0.0, -0.35, 0.0, 0.0, 0.0, 0.0)),
+            ServoTarget::twist(right_tcp, SVector::<f64, 6>::new(0.0, 0.35, 0.0, 0.0, 0.0, 0.0)),
+        ];
+        servo_prio
+            .step(
+                &model,
+                &env,
+                &q_sym,
+                &[0.0; 6],
+                &targets_approach,
+                None,
+                &mut dq_cmd,
+            )
+            .unwrap();
+
+        let mut buf = model.create_transform_buffer();
+        model.forward_kinematics(&q_sym, &mut buf).unwrap();
+        let mut j_l = DMatrix::<f64>::zeros(6, 6);
+        let mut j_r = DMatrix::<f64>::zeros(6, 6);
+        model.geometric_jacobian(&buf, left_tcp, j_l.as_view_mut()).unwrap();
+        model.geometric_jacobian(&buf, right_tcp, j_r.as_view_mut()).unwrap();
+        let dq_vec = nalgebra::DVector::from_column_slice(&dq_cmd);
+        let v_l = (&j_l * &dq_vec)[1]; // Y velocity of left TCP (desires -0.35)
+        let v_r = (&j_r * &dq_vec)[1]; // Y velocity of right TCP (desires +0.35)
+        assert!(
+            v_l < -0.20 && v_r < -0.10,
+            "higher-priority left arm should keep advancing -Y while lower-priority right arm backs away (-Y) (v_l={v_l:.4}, v_r={v_r:.4})"
+        );
+
+        // 2. Deadlock breaking via tangential curl:
+        // 2a. Exact radial obstacle deadlock: without curl, motion stays trapped on y = +0.35 plane;
+        // with curl, arm swings around the obstacle and converges cleanly.
+        let mut env_obs_deadlock = CollisionEnvironment::new();
+        env_obs_deadlock.set_acm(AllowedCollisionMatrix::from_model(&model));
+        for link in model.links() {
+            env_obs_deadlock.set_link_geometry(
+                link.id,
+                LinkGeometry::from_capsule(
+                    Point3::origin(),
+                    Point3::new(0.0, 0.0, 0.30),
+                    link.bounding_radius,
+                ),
+            );
+        }
+        let left_wrist = *left_arm.active_links.last().unwrap();
+        let right_wrist = *right_arm.active_links.last().unwrap();
+        env_obs_deadlock.attach_payload(
+            AttachedPayload::from_shape(
+                "probe_l",
+                left_wrist,
+                Isometry3::translation(0.0, 0.0, 0.30),
+                SharedShape::new(Ball::new(0.035)),
+            )
+            .with_touch_links(vec![left_arm.active_links[1], left_wrist]),
+        );
+
+        let q_rad_start = [0.0, -0.35, 1.45, 0.0, -0.8, 0.0];
+        let q_rad_goal = [0.0, 0.55, 0.70, 0.0, -0.8, 0.0];
+        model.forward_kinematics(&q_rad_start, &mut buf).unwrap();
+        let p_rad_start = buf.frame_pose(left_tcp).translation.vector;
+        model.forward_kinematics(&q_rad_goal, &mut buf).unwrap();
+        let p_rad_goal = buf.frame_pose(left_tcp).translation.vector;
+        let obs_mid = Vector3::new(0.31, p_rad_start.y, 0.5 * (p_rad_start.z + p_rad_goal.z));
+        // Vertical cylinder along Z at y = +0.35 blocks straight radial X-motion while keeping exact symmetry.
+        let vertical_rot = nalgebra::UnitQuaternion::from_axis_angle(
+            &Vector3::x_axis(),
+            std::f64::consts::FRAC_PI_2,
+        );
+        env_obs_deadlock.add_obstacle(
+            SharedShape::new(parry3d::shape::Cylinder::new(0.40, 0.04)),
+            Isometry3::from_parts(Translation3::from(obs_mid), vertical_rot),
+        );
+        assert!(
+            env_obs_deadlock
+                .is_state_collision_free(&model, &q_rad_start, GeometryTier::Convex, &mut ws)
+                .unwrap(),
+            "start state for radial deadlock test must be collision-free"
+        );
+
+        let rad_target = [ServoTarget::position(
+            left_tcp,
+            Point3::from(p_rad_goal),
+            1.8,
+        )];
+        let mut q_nocurl = q_rad_start;
+        let mut qd_nocurl = [0.0; 6];
+        let mut servo_nocurl = ReactiveServoController::new(
+            &model,
+            &env_obs_deadlock,
+            ReactiveServoConfig {
+                dt: 0.02,
+                safety_margin: 0.03,
+                cbf_activation_distance: 0.25,
+                cbf_gamma: 5.0,
+                damping: 0.02,
+                posture_gain: 0.0,
+                tangential_curl_gain: 0.0,
+                ..ReactiveServoConfig::default()
+            },
+        );
+        for _ in 0..150 {
+            servo_nocurl
+                .step(
+                    &model,
+                    &env_obs_deadlock,
+                    &q_nocurl,
+                    &qd_nocurl,
+                    &rad_target,
+                    None,
+                    &mut dq_cmd,
+                )
+                .unwrap();
+            for k in 0..6 {
+                q_nocurl[k] = model.dof_limits()[k]
+                    .position
+                    .clamp(q_nocurl[k] + dq_cmd[k] * 0.02);
+                qd_nocurl[k] = dq_cmd[k];
+            }
+            assert!(
+                env_obs_deadlock
+                    .is_state_collision_free(&model, &q_nocurl, GeometryTier::Convex, &mut ws)
+                    .unwrap(),
+                "no-curl trajectory must still remain collision-free while stalled"
+            );
+        }
+        model.forward_kinematics(&q_nocurl, &mut buf).unwrap();
+        let stalled_err = (buf.frame_pose(left_tcp).translation.vector - p_rad_goal).norm();
+        assert!(
+            stalled_err > 0.12 && q_nocurl[0].abs() < 1e-3,
+            "without tangential curl, collinear obstacle must stall arm in symmetry plane (stalled_err={stalled_err:.4}, q0={:.4})",
+            q_nocurl[0]
+        );
+
+        // Verify on a single tick that curl immediately breaks the y = +0.35 symmetry when blocked
+        let mut servo_curl_impulse = ReactiveServoController::new(
+            &model,
+            &env_obs_deadlock,
+            ReactiveServoConfig {
+                dt: 0.02,
+                safety_margin: 0.03,
+                cbf_activation_distance: 0.25,
+                cbf_gamma: 5.0,
+                damping: 0.02,
+                posture_gain: 0.0,
+                tangential_curl_gain: 0.9,
+                ..ReactiveServoConfig::default()
+            },
+        );
+        servo_curl_impulse
+            .step(
+                &model,
+                &env_obs_deadlock,
+                &q_nocurl,
+                &qd_nocurl,
+                &rad_target,
+                None,
+                &mut dq_cmd,
+            )
+            .unwrap();
+        assert!(
+            dq_cmd[0].abs() > 0.05,
+            "tangential curl should immediately inject lateral yaw escape velocity (dq0={:.4})",
+            dq_cmd[0]
+        );
+
+        // With a bypassable sphere obstacle along the straight path, tangential curl routes around it and converges
+        let mut env_obs_bypass = CollisionEnvironment::new();
+        env_obs_bypass.set_acm(AllowedCollisionMatrix::from_model(&model));
+        for link in model.links() {
+            env_obs_bypass.set_link_geometry(
+                link.id,
+                LinkGeometry::from_capsule(
+                    Point3::origin(),
+                    Point3::new(0.0, 0.0, 0.30),
+                    link.bounding_radius,
+                ),
+            );
+        }
+        env_obs_bypass.attach_payload(
+            AttachedPayload::from_shape(
+                "probe_l",
+                left_wrist,
+                Isometry3::translation(0.0, 0.0, 0.30),
+                SharedShape::new(Ball::new(0.035)),
+            )
+            .with_touch_links(vec![left_arm.active_links[1], left_wrist]),
+        );
+        env_obs_bypass.add_obstacle(
+            SharedShape::new(Ball::new(0.045)),
+            Isometry3::from(Translation3::from(Vector3::new(0.31, p_rad_start.y, 0.85))),
+        );
+
+        let mut q_rad_curl = q_rad_start;
+        let mut qd_rad_curl = [0.0; 6];
+        let mut servo_rad_curl = ReactiveServoController::new(
+            &model,
+            &env_obs_bypass,
+            ReactiveServoConfig {
+                dt: 0.02,
+                safety_margin: 0.02,
+                cbf_activation_distance: 0.25,
+                cbf_gamma: 5.0,
+                damping: 0.02,
+                posture_gain: 0.0,
+                tangential_curl_gain: 0.9,
+                ..ReactiveServoConfig::default()
+            },
+        );
+        for _ in 0..240 {
+            servo_rad_curl
+                .step(
+                    &model,
+                    &env_obs_bypass,
+                    &q_rad_curl,
+                    &qd_rad_curl,
+                    &rad_target,
+                    None,
+                    &mut dq_cmd,
+                )
+                .unwrap();
+            for k in 0..6 {
+                q_rad_curl[k] = model.dof_limits()[k]
+                    .position
+                    .clamp(q_rad_curl[k] + dq_cmd[k] * 0.02);
+                qd_rad_curl[k] = dq_cmd[k];
+            }
+            assert!(
+                env_obs_bypass
+                    .is_state_collision_free(&model, &q_rad_curl, GeometryTier::Convex, &mut ws)
+                    .unwrap(),
+                "radial curl trajectory must stay strictly collision-free"
+            );
+        }
+        model.forward_kinematics(&q_rad_curl, &mut buf).unwrap();
+        let unblocked_err = (buf.frame_pose(left_tcp).translation.vector - p_rad_goal).norm();
+        assert!(
+            unblocked_err < 0.02,
+            "tangential curl should route around collinear obstacle (unblocked_err={unblocked_err:.4})"
+        );
+
+        // 2b. Dual-arm head-on crossing with tool payloads converges cleanly and collision-free
+        let mut env_cross = CollisionEnvironment::new();
+        env_cross.set_acm(AllowedCollisionMatrix::from_model(&model));
+        for link in model.links() {
+            env_cross.set_link_geometry(
+                link.id,
+                LinkGeometry::from_capsule(
+                    Point3::origin(),
+                    Point3::new(0.0, 0.0, 0.30),
+                    link.bounding_radius,
+                ),
+            );
+        }
+        env_cross.attach_payload(
+            AttachedPayload::from_shape(
+                "cross_tool_l",
+                left_wrist,
+                Isometry3::translation(0.0, 0.0, 0.30),
+                SharedShape::new(Ball::new(0.045)),
+            )
+            .with_touch_links(vec![left_arm.active_links[1], left_wrist]),
+        );
+        env_cross.attach_payload(
+            AttachedPayload::from_shape(
+                "cross_tool_r",
+                right_wrist,
+                Isometry3::translation(0.0, 0.0, 0.30),
+                SharedShape::new(Ball::new(0.045)),
+            )
+            .with_touch_links(vec![right_arm.active_links[1], right_wrist]),
+        );
+
+        model
+            .forward_kinematics(&[0.0, 0.35, 0.70, 0.0, 0.35, 0.70], &mut buf)
+            .unwrap();
+        let r_actual = buf.frame_pose(left_tcp).translation.x;
+        let x_off = (r_actual * r_actual - 0.35 * 0.35).sqrt();
+        let q0_left = (-0.35_f64).atan2(-x_off);
+        let q0_right = (0.35_f64).atan2(x_off);
+        let mut q_curr = [q0_left, 0.35, 0.70, q0_right, 0.35, 0.70];
+        let mut qd_curr = [0.0; 6];
+        model.forward_kinematics(&q_curr, &mut buf).unwrap();
+        let p_left_start = buf.frame_pose(left_tcp).translation.vector;
+        let p_right_start = buf.frame_pose(right_tcp).translation.vector;
+        let left_goal = Point3::from(p_right_start);
+        let right_goal = Point3::from(p_left_start);
+
+        let swap_targets = [
+            ServoTarget::position(left_tcp, left_goal, 4.0),
+            ServoTarget::position(right_tcp, right_goal, 4.0),
+        ];
+
+        let cfg_curl = ReactiveServoConfig {
+            dt: 0.02,
+            safety_margin: 0.025,
+            cbf_activation_distance: 0.25,
+            cbf_gamma: 8.0,
+            damping: 0.02,
+            posture_gain: 0.0,
+            tangential_curl_gain: 0.8,
+            ..ReactiveServoConfig::default()
+        };
+        let mut servo_curl = ReactiveServoController::new(&model, &env_cross, cfg_curl);
+
+        for _ in 0..220 {
+            servo_curl
+                .step(
+                    &model,
+                    &env_cross,
+                    &q_curr,
+                    &qd_curr,
+                    &swap_targets,
+                    None,
+                    &mut dq_cmd,
+                )
+                .unwrap();
+            for k in 0..6 {
+                q_curr[k] = model.dof_limits()[k]
+                    .position
+                    .clamp(q_curr[k] + dq_cmd[k] * 0.02);
+                qd_curr[k] = dq_cmd[k];
+            }
+            assert!(
+                env_cross
+                    .is_state_collision_free(&model, &q_curr, GeometryTier::Convex, &mut ws)
+                    .unwrap(),
+                "reactive curl trajectory must remain strictly collision-free"
+            );
+        }
+
+        model.forward_kinematics(&q_curr, &mut buf).unwrap();
+        let p_l_end = buf.frame_pose(left_tcp).translation.vector;
+        let p_r_end = buf.frame_pose(right_tcp).translation.vector;
+        let err_l = (p_l_end - left_goal.coords).norm();
+        let err_r = (p_r_end - right_goal.coords).norm();
+        assert!(
+            err_l < 0.02 && err_r < 0.02,
+            "tangential curl should resolve symmetric head-on crossing without deadlock (err_l={err_l:.4}, err_r={err_r:.4}, p_l={p_l_end:?}, p_r={p_r_end:?}, q={q_curr:?})"
         );
     }
 }
