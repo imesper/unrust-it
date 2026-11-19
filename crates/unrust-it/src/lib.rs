@@ -18,7 +18,7 @@ pub mod trajectory;
 pub use batch::{
     BatchIkSolver, BatchMppiOptimizer, BatchRolloutBackend, CpuSimdBatchBackend, EsdfGridF32,
     FlatEndEffectorF32, FlatJointF32, FlatLinkSphereF32, FlatRobotModelF32, FlatSpherePairF32,
-    MppiConfig, RolloutUniformsF32, SPHERE_FLAG_PAYLOAD,
+    MppiConfig, MppiOptimizationTrace, RolloutUniformsF32, SPHERE_FLAG_PAYLOAD,
 };
 #[cfg(feature = "gpu")]
 pub use batch::{GpuRobotContext, WgpuBatchBackend};
@@ -1487,5 +1487,86 @@ mod tests {
             err_l < 0.02 && err_r < 0.02,
             "tangential curl should resolve symmetric head-on crossing without deadlock (err_l={err_l:.4}, err_r={err_r:.4}, p_l={p_l_end:?}, p_r={p_r_end:?}, q={q_curr:?})"
         );
+    }
+
+    #[test]
+    fn esdf_carve_collision_environment_produces_signed_distances() {
+        use parry3d::math::Vector as ParryVector;
+        use parry3d::shape::{Cuboid, Cylinder};
+
+        let mut env = CollisionEnvironment::new();
+        let box_id = env.add_obstacle(
+            SharedShape::new(Cuboid::new(ParryVector::new(0.08, 0.06, 0.05))),
+            Isometry3::from_parts(
+                Translation3::new(0.0, 0.0, 0.20),
+                nalgebra::UnitQuaternion::from_axis_angle(&Vector3::z_axis(), 0.45),
+            ),
+        );
+        let cyl_rot =
+            nalgebra::UnitQuaternion::from_axis_angle(&Vector3::x_axis(), std::f64::consts::FRAC_PI_2);
+        env.add_obstacle(
+            SharedShape::new(Cylinder::new(0.10, 0.04)),
+            Isometry3::from_parts(Translation3::new(0.25, 0.0, 0.20), cyl_rot),
+        );
+
+        let mut esdf = EsdfGridF32::new([-0.3, -0.3, 0.0], 0.02, [40, 30, 20], 1.0);
+        esdf.carve_collision_environment(&env);
+
+        // Interior of box and cylinder must be negative
+        let (d_box, _) = esdf.sample_distance_and_gradient([0.0, 0.0, 0.20]).unwrap();
+        let (d_cyl, _) = esdf.sample_distance_and_gradient([0.25, 0.0, 0.20]).unwrap();
+        assert!(d_box < -0.02, "expected negative distance inside box, got {d_box}");
+        assert!(d_cyl < -0.01, "expected negative distance inside cylinder, got {d_cyl}");
+
+        // Move box via set_obstacle_pose and re-carve
+        assert!(env.set_obstacle_pose(box_id, Isometry3::translation(-0.15, 0.0, 0.20)));
+        esdf.clear(1.0);
+        assert!(esdf.distances.iter().all(|&d| (d - 1.0).abs() < 1e-6));
+        esdf.carve_collision_environment(&env);
+        let (d_old, _) = esdf.sample_distance_and_gradient([0.0, 0.0, 0.20]).unwrap();
+        let (d_new, _) = esdf.sample_distance_and_gradient([-0.15, 0.0, 0.20]).unwrap();
+        assert!(d_old > 0.04, "old box location should be free, got {d_old}");
+        assert!(d_new < -0.02, "moved box location should be interior, got {d_new}");
+    }
+
+    #[test]
+    fn batch_mppi_optimize_with_trace_matches_optimize_and_exposes_rollouts() {
+        let (model, left_arm, right_arm, _) = build_dual_arm_model();
+        let mut env = CollisionEnvironment::new();
+        env.set_acm(AllowedCollisionMatrix::from_model(&model));
+        for link in model.links() {
+            env.set_link_geometry(
+                link.id,
+                LinkGeometry::from_capsule(
+                    Point3::origin(),
+                    Point3::new(0.0, 0.0, 0.30),
+                    link.bounding_radius,
+                ),
+            );
+        }
+        let mut esdf = EsdfGridF32::new([-1.0, -1.0, -0.2], 0.05, [40, 40, 28], 1.0);
+        esdf.add_sphere_obstacle([0.3, 0.0, 0.65], 0.12);
+        let flat = FlatRobotModelF32::compile(&model, &env);
+
+        let _ = (left_arm, right_arm);
+        let start = [-0.4, 0.3, 0.4, 0.4, 0.3, 0.4];
+        let goal = [0.4, 0.6, 0.6, -0.4, 0.6, 0.6];
+
+        let opt = BatchMppiOptimizer::new(MppiConfig {
+            num_rollouts: 16,
+            horizon: 10,
+            num_iterations: 8,
+            ..MppiConfig::default()
+        });
+        let trace = opt.optimize_with_trace(&CpuSimdBatchBackend, &model, &flat, Some(&esdf), &start, &goal);
+        let nominal = opt.optimize(&CpuSimdBatchBackend, &model, &flat, Some(&esdf), &start, &goal);
+
+        assert_eq!(trace.nominal, nominal);
+        assert_eq!(trace.final_rollouts.len(), 16);
+        assert_eq!(trace.rollout_costs.len(), 16);
+        assert_eq!(trace.rollout_weights.len(), 16);
+        assert_eq!(trace.iteration_min_costs.len(), 8);
+        let weight_sum: f64 = trace.rollout_weights.iter().sum();
+        assert_relative_eq!(weight_sum, 1.0, epsilon = 1e-6);
     }
 }

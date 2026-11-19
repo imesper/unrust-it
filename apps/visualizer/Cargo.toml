@@ -6,8 +6,15 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+gpu-compute = ["unrust-it/gpu"]
+
 [dependencies]
+log.workspace = true
 nalgebra.workspace = true
 parry3d.workspace = true
+rayon.workspace = true
+thiserror.workspace = true
 unrust-it.workspace = true
 unrust-it-urdf = { path = "../../crates/unrust-it-urdf" }

@@ -1,4 +1,6 @@
-//! Multi-arm simulation scenario generator and JSON/HTML exporter for `unrust-it`.
+//! Multi-arm simulation scenario generator, declarative scene engine, and JSON/HTML exporter for `unrust-it`.
+
+pub mod scene;
 
 use nalgebra::{Isometry3, SVector, Translation3};
 use parry3d::shape::{Ball, SharedShape};
@@ -9,91 +11,8 @@ use unrust_it::{
     FlatRobotModelF32, GeometryTier, MppiConfig, MultiRobotModel, PathPlanner,
     ReactiveServoConfig, ReactiveServoController, RrtPlanner, ServoTarget, Target, ToppraTrajectory,
 };
+use unrust_it_urdf::presets::{ARM_4DOF_SRDF as WORKCELL_ARM_SRDF, ARM_4DOF_URDF as WORKCELL_ARM_URDF};
 use unrust_it_urdf::{add_urdf_to_scene, apply_srdf_str};
-
-const WORKCELL_ARM_URDF: &str = r#"
-<robot name="unrust_arm_4dof">
-  <link name="base_link">
-    <collision>
-      <origin xyz="0 0 0.05" rpy="0 0 0"/>
-      <geometry>
-        <cylinder radius="0.065" length="0.10"/>
-      </geometry>
-    </collision>
-  </link>
-  <link name="shoulder_link">
-    <collision>
-      <origin xyz="0 0 0.09" rpy="0 0 0"/>
-      <geometry>
-        <capsule radius="0.055" length="0.18"/>
-      </geometry>
-    </collision>
-  </link>
-  <link name="upper_arm_link">
-    <collision>
-      <origin xyz="0 0 0.16" rpy="0 0 0"/>
-      <geometry>
-        <capsule radius="0.048" length="0.32"/>
-      </geometry>
-    </collision>
-  </link>
-  <link name="forearm_link">
-    <collision>
-      <origin xyz="0 0 0.14" rpy="0 0 0"/>
-      <geometry>
-        <capsule radius="0.042" length="0.28"/>
-      </geometry>
-    </collision>
-  </link>
-  <link name="wrist_link">
-    <collision>
-      <origin xyz="0 0 0.08" rpy="0 0 0"/>
-      <geometry>
-        <capsule radius="0.035" length="0.16"/>
-      </geometry>
-    </collision>
-  </link>
-
-  <joint name="j1_waist" type="revolute">
-    <parent link="base_link"/>
-    <child link="shoulder_link"/>
-    <origin xyz="0 0 0.10" rpy="0 0 0"/>
-    <axis xyz="0 0 1"/>
-    <limit lower="-2.8" upper="2.8" effort="90" velocity="2.2"/>
-  </joint>
-  <joint name="j2_shoulder" type="revolute">
-    <parent link="shoulder_link"/>
-    <child link="upper_arm_link"/>
-    <origin xyz="0 0 0.18" rpy="0 0 0"/>
-    <axis xyz="0 1 0"/>
-    <limit lower="-1.9" upper="1.9" effort="90" velocity="2.2"/>
-  </joint>
-  <joint name="j3_elbow" type="revolute">
-    <parent link="upper_arm_link"/>
-    <child link="forearm_link"/>
-    <origin xyz="0 0 0.32" rpy="0 0 0"/>
-    <axis xyz="0 1 0"/>
-    <limit lower="-2.4" upper="2.4" effort="70" velocity="2.5"/>
-  </joint>
-  <joint name="j4_wrist" type="revolute">
-    <parent link="forearm_link"/>
-    <child link="wrist_link"/>
-    <origin xyz="0 0 0.28" rpy="0 0 0"/>
-    <axis xyz="0 1 0"/>
-    <limit lower="-2.4" upper="2.4" effort="50" velocity="3.0"/>
-  </joint>
-</robot>
-"#;
-
-const WORKCELL_ARM_SRDF: &str = r#"
-<robot name="unrust_arm_4dof">
-  <group name="arm">
-    <chain base_link="base_link" tip_link="wrist_link"/>
-  </group>
-  <disable_collisions link1="base_link" link2="upper_arm_link" reason="Never"/>
-  <disable_collisions link1="shoulder_link" link2="forearm_link" reason="Never"/>
-</robot>
-"#;
 
 /// A single evaluated frame in a visualizer scenario.
 #[derive(Debug, Clone)]
@@ -658,5 +577,67 @@ mod tests {
         assert!(html.contains("rrt_toppra"));
         assert!(html.contains("batch_mppi"));
         assert!(html.contains("bimanual_cbf"));
+    }
+
+    #[test]
+    fn compiles_all_five_preset_workcells() {
+        for &id in scene::all_preset_ids() {
+            let spec = scene::preset_workcell(id);
+            let wc = spec.compile(1).expect("preset workcell should compile");
+            match id {
+                scene::PresetId::ThreeArmCloseProximity | scene::PresetId::ThreeArmCrossing => {
+                    assert_eq!(wc.arms.len(), 3);
+                    assert_eq!(wc.model.dof(), 18);
+                    assert_eq!(wc.env.attached_payloads().len(), 3);
+                }
+                scene::PresetId::DualArmMppiEsdf
+                | scene::PresetId::DualArmRrtToppra
+                | scene::PresetId::DualArmClosedChainCbf => {
+                    assert_eq!(wc.arms.len(), 2);
+                    assert_eq!(wc.model.dof(), 8);
+                }
+            }
+            if id == scene::PresetId::ThreeArmCloseProximity {
+                let (d_wp, _) = wc
+                    .esdf
+                    .sample_distance_and_gradient([0.0, 0.0, 0.42])
+                    .expect("workpiece center must be inside ESDF");
+                assert!(
+                    d_wp < -0.01,
+                    "ESDF should encode negative distance inside workpiece cuboid, got {d_wp}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn runs_dual_arm_mppi_with_real_rollout_ribbons() {
+        let spec = scene::preset_workcell(scene::PresetId::DualArmMppiEsdf);
+        let wc = spec.compile(1).unwrap();
+        let traj = scene::run_planner_sync(&wc, &spec).expect("DualArmMppiEsdf should plan");
+        assert!(!traj.frames.is_empty());
+        assert!(!traj.rollout_ribbons.is_empty());
+        assert!(traj.rollout_ribbons.iter().all(|r| r.total_cost.is_finite()));
+        assert!(traj.metrics.min_clearance_mm > 0.0);
+    }
+
+    #[test]
+    fn runs_three_arm_close_proximity_preset() {
+        let spec = scene::preset_workcell(scene::PresetId::ThreeArmCloseProximity);
+        let wc = spec.compile(1).unwrap();
+        let traj = scene::run_planner_sync(&wc, &spec)
+            .expect("ThreeArmCloseProximity should converge");
+        assert!(traj.metrics.convex_verified);
+        assert!(traj.metrics.max_pos_error_mm < 5.0);
+        assert!(
+            traj.frames
+                .iter()
+                .any(|f| f.stage == scene::TrajectoryStage::Stage1Coarse)
+                && traj
+                    .frames
+                    .iter()
+                    .any(|f| f.stage == scene::TrajectoryStage::Stage2Refinement),
+            "expected both Stage 1 and Stage 2 frames in TwoStageProximity trajectory"
+        );
     }
 }

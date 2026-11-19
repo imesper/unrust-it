@@ -18,6 +18,8 @@ use unrust_it::{
 /// Errors that can occur when parsing URDF or SRDF XML descriptions.
 #[derive(Debug, Error)]
 pub enum UrdfError {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
     #[error("XML parse error: {0}")]
     Xml(#[from] roxmltree::Error),
     #[error("missing required XML element `<{0}>`")]
@@ -122,6 +124,39 @@ pub fn load_urdf_str(
         Isometry3::identity(),
     )?;
     Ok((model, env, handle))
+}
+
+/// Loads a single-robot URDF file from `path` into a fresh [`MultiRobotModel`] and [`CollisionEnvironment`].
+pub fn load_urdf_file(
+    path: impl AsRef<std::path::Path>,
+) -> Result<(MultiRobotModel, CollisionEnvironment, UrdfRobotHandle), UrdfError> {
+    let urdf_xml = std::fs::read_to_string(path)?;
+    load_urdf_str(&urdf_xml)
+}
+
+/// Reads a URDF XML file from `path` and mounts the robot into an existing [`MultiRobotModel`] and
+/// [`CollisionEnvironment`] with a name `prefix` and world `base_pose`.
+pub fn add_urdf_file_to_scene(
+    model: &mut MultiRobotModel,
+    env: &mut CollisionEnvironment,
+    path: impl AsRef<std::path::Path>,
+    robot_id: RobotId,
+    prefix: &str,
+    base_pose: Isometry3<f64>,
+) -> Result<UrdfRobotHandle, UrdfError> {
+    let urdf_xml = std::fs::read_to_string(path)?;
+    add_urdf_to_scene(model, env, &urdf_xml, robot_id, prefix, base_pose)
+}
+
+/// Reads a MoveIt SRDF XML file from `path` and applies it to `model` and `env`.
+pub fn apply_srdf_file(
+    model: &mut MultiRobotModel,
+    env: &mut CollisionEnvironment,
+    path: impl AsRef<std::path::Path>,
+    prefix: &str,
+) -> Result<SrdfData, UrdfError> {
+    let srdf_xml = std::fs::read_to_string(path)?;
+    apply_srdf_str(model, env, &srdf_xml, prefix)
 }
 
 /// Parses a URDF XML string and mounts the robot into an existing [`MultiRobotModel`] and
@@ -605,6 +640,214 @@ pub fn apply_srdf_str(
         group_states,
         disabled_collisions,
     })
+}
+
+/// Built-in canonical URDF and MoveIt SRDF presets shared across tests, benchmarks, and visualizers.
+pub mod presets {
+    /// 4-DOF articulated workcell arm URDF (`base_link` through `wrist_link`, cylinder + capsules).
+    pub const ARM_4DOF_URDF: &str = r#"
+<robot name="unrust_arm_4dof">
+  <link name="base_link">
+    <collision>
+      <origin xyz="0 0 0.05" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.065" length="0.10"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="shoulder_link">
+    <collision>
+      <origin xyz="0 0 0.09" rpy="0 0 0"/>
+      <geometry>
+        <capsule radius="0.055" length="0.18"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="upper_arm_link">
+    <collision>
+      <origin xyz="0 0 0.16" rpy="0 0 0"/>
+      <geometry>
+        <capsule radius="0.048" length="0.32"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="forearm_link">
+    <collision>
+      <origin xyz="0 0 0.14" rpy="0 0 0"/>
+      <geometry>
+        <capsule radius="0.042" length="0.28"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="wrist_link">
+    <collision>
+      <origin xyz="0 0 0.08" rpy="0 0 0"/>
+      <geometry>
+        <capsule radius="0.035" length="0.16"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="j1_waist" type="revolute">
+    <parent link="base_link"/>
+    <child link="shoulder_link"/>
+    <origin xyz="0 0 0.10" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-2.8" upper="2.8" effort="90" velocity="2.2"/>
+  </joint>
+  <joint name="j2_shoulder" type="revolute">
+    <parent link="shoulder_link"/>
+    <child link="upper_arm_link"/>
+    <origin xyz="0 0 0.18" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.9" upper="1.9" effort="90" velocity="2.2"/>
+  </joint>
+  <joint name="j3_elbow" type="revolute">
+    <parent link="upper_arm_link"/>
+    <child link="forearm_link"/>
+    <origin xyz="0 0 0.32" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-2.4" upper="2.4" effort="70" velocity="2.5"/>
+  </joint>
+  <joint name="j4_wrist" type="revolute">
+    <parent link="forearm_link"/>
+    <child link="wrist_link"/>
+    <origin xyz="0 0 0.28" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-2.4" upper="2.4" effort="50" velocity="3.0"/>
+  </joint>
+</robot>
+"#;
+
+    /// MoveIt SRDF configuration corresponding to [`ARM_4DOF_URDF`].
+    pub const ARM_4DOF_SRDF: &str = r#"
+<robot name="unrust_arm_4dof">
+  <group name="arm">
+    <chain base_link="base_link" tip_link="wrist_link"/>
+  </group>
+  <disable_collisions link1="base_link" link2="upper_arm_link" reason="Never"/>
+  <disable_collisions link1="shoulder_link" link2="forearm_link" reason="Never"/>
+</robot>
+"#;
+
+    /// 6-DOF precision industrial manipulator URDF (`base_link` through `flange_link`).
+    pub const ARM_6DOF_URDF: &str = r#"
+<robot name="unrust_arm_6dof">
+  <link name="base_link">
+    <collision>
+      <origin xyz="0 0 0.05" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.060" length="0.10"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="shoulder_link">
+    <collision>
+      <origin xyz="0 0 0.08" rpy="0 0 0"/>
+      <geometry>
+        <capsule radius="0.048" length="0.16"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="upper_arm_link">
+    <collision>
+      <origin xyz="0 0 0.17" rpy="0 0 0"/>
+      <geometry>
+        <capsule radius="0.040" length="0.34"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="forearm_link">
+    <collision>
+      <origin xyz="0 0 0.15" rpy="0 0 0"/>
+      <geometry>
+        <capsule radius="0.034" length="0.30"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="wrist1_link">
+    <collision>
+      <origin xyz="0 0 0.035" rpy="0 0 0"/>
+      <geometry>
+        <capsule radius="0.026" length="0.07"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="wrist2_link">
+    <collision>
+      <origin xyz="0 0 0.025" rpy="0 0 0"/>
+      <geometry>
+        <capsule radius="0.022" length="0.05"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="flange_link">
+    <collision>
+      <origin xyz="0 0 0.015" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.024" length="0.03"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="j1_waist" type="revolute">
+    <parent link="base_link"/>
+    <child link="shoulder_link"/>
+    <origin xyz="0 0 0.10" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3.0" upper="3.0" effort="120" velocity="3.0"/>
+  </joint>
+  <joint name="j2_shoulder" type="revolute">
+    <parent link="shoulder_link"/>
+    <child link="upper_arm_link"/>
+    <origin xyz="0 0 0.16" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-2.1" upper="2.1" effort="120" velocity="3.0"/>
+  </joint>
+  <joint name="j3_elbow" type="revolute">
+    <parent link="upper_arm_link"/>
+    <child link="forearm_link"/>
+    <origin xyz="0 0 0.34" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-2.6" upper="2.6" effort="90" velocity="3.5"/>
+  </joint>
+  <joint name="j4_wrist_roll" type="revolute">
+    <parent link="forearm_link"/>
+    <child link="wrist1_link"/>
+    <origin xyz="0 0 0.30" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3.0" upper="3.0" effort="50" velocity="4.0"/>
+  </joint>
+  <joint name="j5_wrist_pitch" type="revolute">
+    <parent link="wrist1_link"/>
+    <child link="wrist2_link"/>
+    <origin xyz="0 0 0.07" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-2.4" upper="2.4" effort="40" velocity="4.0"/>
+  </joint>
+  <joint name="j6_flange_roll" type="revolute">
+    <parent link="wrist2_link"/>
+    <child link="flange_link"/>
+    <origin xyz="0 0 0.05" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3.14" upper="3.14" effort="30" velocity="5.0"/>
+  </joint>
+</robot>
+"#;
+
+    /// MoveIt SRDF configuration corresponding to [`ARM_6DOF_URDF`].
+    pub const ARM_6DOF_SRDF: &str = r#"
+<robot name="unrust_arm_6dof">
+  <group name="arm">
+    <chain base_link="base_link" tip_link="flange_link"/>
+  </group>
+  <disable_collisions link1="base_link" link2="upper_arm_link" reason="Never"/>
+  <disable_collisions link1="shoulder_link" link2="forearm_link" reason="Never"/>
+  <disable_collisions link1="upper_arm_link" link2="wrist1_link" reason="Never"/>
+  <disable_collisions link1="forearm_link" link2="wrist2_link" reason="Never"/>
+  <disable_collisions link1="wrist1_link" link2="flange_link" reason="Never"/>
+</robot>
+"#;
 }
 
 fn resolve_link(
@@ -1191,5 +1434,43 @@ mod tests {
             &mut out_ees,
         );
         assert!(out_ees[0][2] > 0.3);
+    }
+
+    #[test]
+    fn loads_urdf_and_srdf_from_files_and_builtin_presets() {
+        let dir = std::env::temp_dir().join(format!(
+            "unrust_it_urdf_test_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let urdf_path = dir.join("arm6.urdf");
+        let srdf_path = dir.join("arm6.srdf");
+        std::fs::write(&urdf_path, presets::ARM_6DOF_URDF).unwrap();
+        std::fs::write(&srdf_path, presets::ARM_6DOF_SRDF).unwrap();
+
+        let (model_single, _, handle_single) = load_urdf_file(&urdf_path).unwrap();
+        assert_eq!(model_single.dof(), 6);
+        assert_eq!(handle_single.actuated_joints.len(), 6);
+
+        let mut model = MultiRobotModel::new();
+        let mut env = CollisionEnvironment::new();
+        let h = add_urdf_file_to_scene(
+            &mut model,
+            &mut env,
+            &urdf_path,
+            RobotId(0),
+            "r0_",
+            Isometry3::translation(0.5, 0.0, 0.0),
+        )
+        .unwrap();
+        assert_eq!(h.actuated_joints.len(), 6);
+        let srdf = apply_srdf_file(&mut model, &mut env, &srdf_path, "r0_").unwrap();
+        assert_eq!(srdf.groups.len(), 1);
+        assert_eq!(srdf.disabled_collisions.len(), 5);
+
+        let missing = load_urdf_file(dir.join("missing.urdf"));
+        assert!(matches!(missing, Err(UrdfError::Io(_))));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

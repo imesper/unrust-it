@@ -1256,8 +1256,11 @@ dependencies = [
 name = "unrust-it-visualizer"
 version = "0.1.0"
 dependencies = [
+ "log",
  "nalgebra",
  "parry3d-f64",
+ "rayon",
+ "thiserror",
  "unrust-it",
  "unrust-it-urdf",
 ]

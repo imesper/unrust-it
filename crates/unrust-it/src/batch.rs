@@ -9,10 +9,15 @@
 //! 3. **Branchless geometric primitives** (link sphere trees + 3D ESDF voxel grids)
 //!    with zero GJK/EPA while-loop warp divergence.
 
-use crate::collision::{AllowedCollisionMatrix, CollidingPair, CollisionEnvironment};
+use crate::collision::{
+    isometry_to_parry, parry_to_isometry, AllowedCollisionMatrix, CollidingPair,
+    CollisionEnvironment,
+};
 use crate::robot::{FrameAttachment, FrameId, JointType, LinkId, MultiRobotModel, PayloadId};
 use bytemuck::{Pod, Zeroable};
 use nalgebra::{Isometry3, Point3, Vector3};
+use parry3d::math::Vector as ParryVector;
+use parry3d::shape::{SharedShape, TypedShape};
 use rayon::prelude::*;
 use wide::f32x8;
 
@@ -414,6 +419,71 @@ impl EsdfGridF32 {
             inv_voxel_size: 1.0 / voxel_size,
             dims,
             distances: vec![default_distance; total],
+        }
+    }
+
+    /// Resets every voxel in the ESDF grid to `default_distance`.
+    pub fn clear(&mut self, default_distance: f32) {
+        self.distances.fill(default_distance);
+    }
+
+    /// Carves an arbitrary `parry3d` `SharedShape` posed at `pose` into the ESDF grid
+    /// using parallel `rayon` Z-slice evaluation and exact signed distances (negative inside).
+    pub fn carve_shape(&mut self, shape: &SharedShape, pose: &Isometry3<f64>) {
+        match shape.as_typed_shape() {
+            TypedShape::Ball(ball) => {
+                let c = pose.translation.vector;
+                self.add_sphere_obstacle([c.x as f32, c.y as f32, c.z as f32], ball.radius as f32);
+                return;
+            }
+            TypedShape::Compound(compound) => {
+                for (sub_pose, sub_shape) in compound.shapes() {
+                    let world_sub = *pose * parry_to_isometry(sub_pose);
+                    self.carve_shape(sub_shape, &world_sub);
+                }
+                return;
+            }
+            _ => {}
+        }
+
+        let [nx, ny, _nz] = self.dims;
+        let stride_y = nx;
+        let stride_z = nx * ny;
+        if stride_z == 0 {
+            return;
+        }
+        let origin = self.origin;
+        let voxel_size = self.voxel_size;
+        let parry_pose = isometry_to_parry(pose);
+        let shape_ref = shape.as_ref();
+
+        self.distances
+            .par_chunks_mut(stride_z)
+            .enumerate()
+            .for_each(|(iz, slice)| {
+                let pz = (origin[2] + (iz as f32 + 0.5) * voxel_size) as f64;
+                for iy in 0..ny {
+                    let py = (origin[1] + (iy as f32 + 0.5) * voxel_size) as f64;
+                    let row_off = iy * stride_y;
+                    for ix in 0..nx {
+                        let px = (origin[0] + (ix as f32 + 0.5) * voxel_size) as f64;
+                        let pt = ParryVector::new(px, py, pz);
+                        let proj = shape_ref.project_point(&parry_pose, pt, false);
+                        let dist = (proj.point - pt).length();
+                        let signed_d = if proj.is_inside { -dist } else { dist } as f32;
+                        let slot = &mut slice[row_off + ix];
+                        if signed_d < *slot {
+                            *slot = signed_d;
+                        }
+                    }
+                }
+            });
+    }
+
+    /// Carves all obstacles currently registered in `env` into this ESDF grid.
+    pub fn carve_collision_environment(&mut self, env: &CollisionEnvironment) {
+        for obs in &env.obstacles {
+            self.carve_shape(&obs.shape, &obs.pose);
         }
     }
 
@@ -2252,6 +2322,21 @@ impl Default for MppiConfig {
     }
 }
 
+/// Full trace returned by [`BatchMppiOptimizer::optimize_with_trace`].
+#[derive(Debug, Clone)]
+pub struct MppiOptimizationTrace {
+    /// Optimized nominal trajectory waypoints (`len == horizon`).
+    pub nominal: Vec<crate::robot::Configuration>,
+    /// Candidate rollout trajectories from the final iteration (`len == num_rollouts`, each of length `horizon`).
+    pub final_rollouts: Vec<Vec<crate::robot::Configuration>>,
+    /// Total cost of each final-iteration rollout (`len == num_rollouts`).
+    pub rollout_costs: Vec<f64>,
+    /// Softmax importance weights of each final-iteration rollout (`len == num_rollouts`).
+    pub rollout_weights: Vec<f64>,
+    /// Minimum rollout cost recorded at each MPPI iteration (`len == num_iterations`).
+    pub iteration_min_costs: Vec<f64>,
+}
+
 /// Batched Model Predictive Path Integral (MPPI) trajectory optimizer.
 ///
 /// Evaluates $B \times H$ states per iteration in a single [`BatchRolloutBackend::collision_cost_batch_f32`]
@@ -2277,6 +2362,21 @@ impl BatchMppiOptimizer {
         start: &[f64],
         goal: &[f64],
     ) -> Vec<crate::robot::Configuration> {
+        self.optimize_with_trace(backend, model, flat_model, esdf, start, goal)
+            .nominal
+    }
+
+    /// Optimizes a collision-avoiding trajectory and returns final candidate rollouts, costs,
+    /// importance weights, and per-iteration minimum costs for visualization and diagnostics.
+    pub fn optimize_with_trace<B: BatchRolloutBackend>(
+        &self,
+        backend: &B,
+        model: &MultiRobotModel,
+        flat_model: &FlatRobotModelF32,
+        esdf: Option<&EsdfGridF32>,
+        start: &[f64],
+        goal: &[f64],
+    ) -> MppiOptimizationTrace {
         let dof = model.dof();
         assert_eq!(start.len(), dof, "start configuration must match model DOF");
         assert_eq!(goal.len(), dof, "goal configuration must match model DOF");
@@ -2300,6 +2400,7 @@ impl BatchMppiOptimizer {
         let mut state_costs = vec![0.0_f32; total_states];
         let mut rollout_costs = vec![0.0_f64; b_count];
         let mut weights = vec![0.0_f64; b_count];
+        let mut iteration_min_costs = Vec::with_capacity(self.config.num_iterations);
 
         let mut rng_state: u64 = 0x9E37_79B9_7F4A_7C15;
         let mut next_gaussian = || -> f64 {
@@ -2404,6 +2505,7 @@ impl BatchMppiOptimizer {
                     min_cost = total;
                 }
             }
+            iteration_min_costs.push(min_cost);
 
             // Softmax importance weights
             let temp = self.config.temperature.max(1e-6);
@@ -2435,9 +2537,29 @@ impl BatchMppiOptimizer {
             }
         }
 
-        (0..h)
+        let nominal_configs = (0..h)
             .map(|t| crate::robot::Configuration::from_slice(&nominal[t * dof..(t + 1) * dof]))
-            .collect()
+            .collect();
+        let final_rollouts = (0..b_count)
+            .map(|b| {
+                let q_offset = b * h * dof;
+                (0..h)
+                    .map(|t| {
+                        crate::robot::Configuration::from_slice(
+                            &rollout_q[q_offset + t * dof..q_offset + (t + 1) * dof],
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+
+        MppiOptimizationTrace {
+            nominal: nominal_configs,
+            final_rollouts,
+            rollout_costs,
+            rollout_weights: weights,
+            iteration_min_costs,
+        }
     }
 }
 

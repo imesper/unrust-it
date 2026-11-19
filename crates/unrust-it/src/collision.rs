@@ -1216,6 +1216,19 @@ impl CollisionEnvironment {
         id
     }
 
+    /// Updates the world pose of an existing obstacle and rebuilds the obstacle BVH
+    /// without disturbing per-obstacle margin/activation or rule tables.
+    ///
+    /// Returns `false` if `id` is out of bounds.
+    pub fn set_obstacle_pose(&mut self, id: ObstacleId, pose: Isometry3<f64>) -> bool {
+        let Some(obs) = self.obstacles.get_mut(id.0 as usize) else {
+            return false;
+        };
+        obs.pose = pose;
+        self.rebuild_bvh();
+        true
+    }
+
     /// Rebuilds the static obstacle `Bvh` broad-phase acceleration structure.
     pub fn rebuild_bvh(&mut self) {
         if self.obstacles.is_empty() {
