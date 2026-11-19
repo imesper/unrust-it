@@ -7,14 +7,18 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = []
+default = ["render"]
+render = ["dep:wgpu", "dep:bytemuck", "dep:pollster"]
 gpu-compute = ["unrust-it/gpu"]
 
 [dependencies]
+bytemuck = { workspace = true, optional = true }
 log.workspace = true
 nalgebra.workspace = true
 parry3d.workspace = true
+pollster = { workspace = true, optional = true }
 rayon.workspace = true
 thiserror.workspace = true
 unrust-it.workspace = true
 unrust-it-urdf = { path = "../../crates/unrust-it-urdf" }
+wgpu = { workspace = true, optional = true }

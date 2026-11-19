@@ -1256,13 +1256,16 @@ dependencies = [
 name = "unrust-it-visualizer"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "log",
  "nalgebra",
  "parry3d-f64",
+ "pollster",
  "rayon",
  "thiserror",
  "unrust-it",
  "unrust-it-urdf",
+ "wgpu",
 ]
 
 [[package]]

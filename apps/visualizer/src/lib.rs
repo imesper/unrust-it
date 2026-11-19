@@ -1,5 +1,7 @@
 //! Multi-arm simulation scenario generator, declarative scene engine, and JSON/HTML exporter for `unrust-it`.
 
+#[cfg(feature = "render")]
+pub mod render;
 pub mod scene;
 
 use nalgebra::{Isometry3, SVector, Translation3};
