@@ -45,6 +45,7 @@ export component PlannerPanel inherits Rectangle {
             vertical-stretch: 1;
             VerticalLayout {
                 spacing: 8px;
+                alignment: start;
 
                 SectionCard {
                     title: "ARM PRIORITY WEIGHTS (QP-CBF)";
@@ -189,6 +190,7 @@ export component PlannerPanel inherits Rectangle {
             vertical-stretch: 1;
             VerticalLayout {
                 spacing: 8px;
+                alignment: start;
 
                 SectionCard {
                     title: "ARM TCP TARGETS (" + PlannerState.arm-targets.length + ")";
@@ -333,6 +335,7 @@ export component PlannerPanel inherits Rectangle {
                 vertical-stretch: 1;
                 VerticalLayout {
                     spacing: 4px;
+                    alignment: start;
                     for j in PlannerState.joints: ParamSlider {
                         label: j.name;
                         unit: "rad";

@@ -48,7 +48,7 @@ export component TopToolbar inherits Rectangle {
         }
 
         ComboBox {
-            width: 265px;
+            width: 225px;
             height: 28px;
             model: PlannerState.scenario-presets;
             current-index: PlannerState.active-preset-index;
@@ -101,9 +101,12 @@ export component TopToolbar inherits Rectangle {
             clicked => { SceneState.export-legacy-html(); }
         }
 
-        StatusBadge {
-            text: PlannerState.gpu-adapter-label;
-            level: 3;
+        VerticalLayout {
+            alignment: center;
+            StatusBadge {
+                text: PlannerState.gpu-adapter-label;
+                level: 3;
+            }
         }
 
         Button {

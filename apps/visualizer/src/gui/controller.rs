@@ -378,19 +378,19 @@ impl AppController {
         };
         let gfx = if cfg!(feature = "gui") {
             if cfg!(target_os = "macos") {
-                "wgpu 30 Metal"
+                "Metal"
             } else if cfg!(target_os = "windows") {
-                "wgpu 30 DX12/Vk"
+                "DX12"
             } else {
-                "wgpu 30 Vulkan"
+                "Vulkan"
             }
         } else {
-            "Offscreen Readback"
+            "Readback"
         };
         let compute = if cfg!(feature = "gpu-compute") {
-            "GPU + SIMD f32x8"
+            "GPU"
         } else {
-            "CPU SIMD f32x8"
+            "SIMD"
         };
         ui.global::<PlannerState>()
             .set_gpu_adapter_label(SharedString::from(format!("{gfx} · {compute}")));
@@ -1336,11 +1336,21 @@ fn bind_callbacks(window: &MainWindow, ctrl: &Rc<RefCell<AppController>>) {
         let c = Rc::clone(ctrl);
         vp.on_resize_viewport(move |w, h| {
             let b = c.borrow();
-            let mut st = b.viewport_state.borrow_mut();
-            let new_size = (w.max(1) as u32, h.max(1) as u32);
-            if st.logical_size != new_size {
-                st.logical_size = new_size;
-                st.dirty = true;
+            let resized = {
+                let mut st = b.viewport_state.borrow_mut();
+                let new_size = (w.max(1) as u32, h.max(1) as u32);
+                if st.logical_size != new_size {
+                    st.logical_size = new_size;
+                    st.dirty = true;
+                    true
+                } else {
+                    false
+                }
+            };
+            if resized {
+                if let Some(ui) = b.ui_weak.upgrade() {
+                    ui.window().request_redraw();
+                }
             }
         });
 
