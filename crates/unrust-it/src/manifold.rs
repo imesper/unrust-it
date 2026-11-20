@@ -201,33 +201,28 @@ impl ConstraintManifold for ClosedChainGraspConstraint {
             return Err(KinematicsError::InvalidFrameOrLink);
         };
 
+        let p_b = Point3::from(buf.frame_pose(self.frame_b).translation.vector);
         let t_w_a = buf.frame_pose(self.frame_a);
         let t_w_b_desired = t_w_a * self.desired_relative_pose;
         let p_b_des = Point3::from(t_w_b_desired.translation.vector);
 
-        let mut j_b = DMatrix::<f64>::zeros(6, dof);
-        model.geometric_jacobian(buf, self.frame_b, j_b.as_view_mut())?;
+        out_jacobian.fill(0.0);
+        for q_idx in 0..dof {
+            let col_b = match node_b.associated_link {
+                Some(link_b) => model.point_screw_column(buf, link_b, &p_b, q_idx),
+                None => [0.0; 6],
+            };
+            let col_a = match node_a.associated_link {
+                Some(link_a) => model.point_screw_column(buf, link_a, &p_b_des, q_idx),
+                None => [0.0; 6],
+            };
 
-        // Jacobian of the target point `p_b_des` rigidly attached to frame A:
-        let mut j_a_at_b = DMatrix::<f64>::zeros(6, dof);
-        if let Some(link_a) = node_a.associated_link {
-            model.compute_point_and_angular_jacobian_on_link(
-                buf,
-                link_a,
-                &p_b_des,
-                &mut j_a_at_b.as_view_mut(),
-            );
-        }
-        let _ = node_b;
-
-        let j_diff = j_b - j_a_at_b;
-        let mut row = 0;
-        for (dim, &active) in self.active_dims.iter().enumerate() {
-            if active {
-                for col in 0..dof {
-                    out_jacobian[(row, col)] = j_diff[(dim, col)];
+            let mut row = 0;
+            for (dim, &active) in self.active_dims.iter().enumerate() {
+                if active {
+                    out_jacobian[(row, q_idx)] = col_b[dim] - col_a[dim];
+                    row += 1;
                 }
-                row += 1;
             }
         }
         Ok(())

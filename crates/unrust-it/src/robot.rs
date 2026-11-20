@@ -929,6 +929,23 @@ impl MultiRobotModel {
         }
     }
 
+    /// Signed shortest displacement `(to - from)` for a single actuated DOF `q_idx`
+    /// (wrapped to $[-\pi, \pi]$ for `Continuous` joints).
+    #[inline]
+    pub fn dof_signed_diff(&self, q_idx: usize, from: f64, to: f64) -> f64 {
+        let joint = &self.joints[self.actuated_joints[q_idx].index()];
+        match joint.joint_type {
+            JointType::Continuous { .. } => {
+                let mut diff = (to - from).rem_euclid(TAU);
+                if diff > PI {
+                    diff -= TAU;
+                }
+                diff
+            }
+            _ => to - from,
+        }
+    }
+
     /// Manifold-aware L2 distance in C-space between `q0` and `q1`.
     pub fn distance(&self, q0: &[f64], q1: &[f64]) -> f64 {
         debug_assert_eq!(q0.len(), self.dof());

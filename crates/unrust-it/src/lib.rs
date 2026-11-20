@@ -96,7 +96,7 @@ pub use batch::{
     MppiConfig, MppiOptimizationTrace, RolloutUniformsF32, SPHERE_FLAG_PAYLOAD,
 };
 #[cfg(feature = "gpu")]
-pub use batch::{GpuRobotContext, WgpuBatchBackend};
+pub use batch::{GpuRobotContext, ResidentGpuBatchBackend, WgpuBatchBackend};
 pub use collision::{
     decompose_shape_to_spheres, parry_to_isometry, AllowedCollisionMatrix, BoundingSphere,
     CollidingPair, CollisionChecker, CollisionEnvironment, CollisionError, CollisionRule,
@@ -1643,5 +1643,314 @@ mod tests {
         assert_eq!(trace.iteration_min_costs.len(), 8);
         let weight_sum: f64 = trace.rollout_weights.iter().sum();
         assert_relative_eq!(weight_sum, 1.0, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn joint_reference_cbf_filters_colliding_toppra_trajectory_safely() {
+        let (model, left_arm, _right_arm, _dual_arms) = build_dual_arm_model();
+        let mut env = CollisionEnvironment::new();
+        env.set_acm(AllowedCollisionMatrix::from_model(&model));
+        for link in model.links() {
+            env.set_link_geometry(
+                link.id,
+                LinkGeometry::from_capsule(
+                    Point3::origin(),
+                    Point3::new(0.0, 0.0, 0.28),
+                    link.bounding_radius,
+                ),
+            );
+        }
+
+        let start = [0.0, -0.35, -0.35, 0.0, -0.35, -0.35];
+        let mid = [0.0, 0.0, 0.0, 0.0, -0.35, -0.35];
+        let goal = [0.0, 0.55, 0.45, 0.0, -0.35, -0.35];
+        let spline = CubicSplinePath::from_waypoints(&[
+            Configuration::from_slice(&start),
+            Configuration::from_slice(&mid),
+            Configuration::from_slice(&goal),
+        ])
+        .unwrap();
+        let traj = ToppraTrajectory::parameterize(spline, model.dof_limits(), 25).unwrap();
+
+        // 1. Track unobstructed TOPP-RA trajectory using ServoTarget::JointReference
+        let mut q = start;
+        let mut dq = [0.0_f64; 6];
+        let mut dq_cmd = [0.0_f64; 6];
+        let mut q_ref = vec![0.0_f64; 6];
+        let mut dq_ref = vec![0.0_f64; 6];
+        let mut ddq_ref = vec![0.0_f64; 6];
+
+        let cfg = ReactiveServoConfig {
+            dt: 0.005,
+            safety_margin: 0.04,
+            cbf_activation_distance: 0.25,
+            cbf_gamma: 6.0,
+            ..ReactiveServoConfig::default()
+        };
+        let mut servo = ReactiveServoController::new(&model, &env, cfg.clone());
+        let steps = ((traj.duration() / cfg.dt).ceil() as usize) + 80;
+        for step in 0..steps {
+            let t = (step as f64) * cfg.dt;
+            traj.sample_into(t, &mut q_ref, &mut dq_ref, &mut ddq_ref);
+            servo
+                .step(
+                    &model,
+                    &env,
+                    &q,
+                    &dq,
+                    &[ServoTarget::joint_reference(
+                        q_ref.clone(),
+                        dq_ref.clone(),
+                        10.0,
+                    )],
+                    None,
+                    &mut dq_cmd,
+                )
+                .unwrap();
+            dq.copy_from_slice(&dq_cmd);
+            for (q_k, &dq_k) in q.iter_mut().zip(dq_cmd.iter()) {
+                *q_k += dq_k * cfg.dt;
+            }
+        }
+        for k in 0..6 {
+            assert!(
+                (q[k] - goal[k]).abs() < 0.03,
+                "unobstructed JointReference should converge closely on dof {k}: q={}, goal={}",
+                q[k],
+                goal[k]
+            );
+        }
+
+        // 2. Place an obstacle directly across the swept path and re-run through CBF safety filter
+        let mut buf = model.create_transform_buffer();
+        let mid_pose = {
+            model.forward_kinematics(&mid, &mut buf).unwrap();
+            *buf.frame_pose(left_arm.end_effectors[0])
+        };
+        env.add_obstacle(
+            SharedShape::new(Ball::new(0.12)),
+            Isometry3::from(Translation3::from(mid_pose.translation.vector)),
+        );
+
+        let mut servo_obs = ReactiveServoController::new(&model, &env, cfg);
+        let mut ws = env.create_workspace(&model);
+        let mut witnesses = Vec::with_capacity(32);
+        q = start;
+        dq = [0.0; 6];
+        let mut min_dist = f64::INFINITY;
+        for step in 0..steps {
+            let t = (step as f64) * 0.005;
+            traj.sample_into(t, &mut q_ref, &mut dq_ref, &mut ddq_ref);
+            servo_obs
+                .step_joint_reference(&model, &env, &q, &dq, &q_ref, &dq_ref, 8.0, None, &mut dq_cmd)
+                .unwrap();
+            dq.copy_from_slice(&dq_cmd);
+            for (q_k, &dq_k) in q.iter_mut().zip(dq_cmd.iter()) {
+                *q_k += dq_k * 0.005;
+            }
+            env.query_signed_distances(
+                &model,
+                &q,
+                0.5,
+                GeometryTier::Convex,
+                &mut ws,
+                &mut witnesses,
+            )
+            .unwrap();
+            for w in &witnesses {
+                min_dist = min_dist.min(w.signed_distance);
+            }
+        }
+        assert!(
+            min_dist >= 0.035,
+            "JointReference CBF filter must keep clearance near margin 0.04 m, got {min_dist:.4}"
+        );
+    }
+
+    #[test]
+    fn subgroup_planning_freezes_stationary_arms_in_rrt_and_two_stage() {
+        let (model, left_arm, _right_arm, _dual_arms) = build_dual_arm_model();
+        let mut env = CollisionEnvironment::new();
+        env.set_acm(AllowedCollisionMatrix::from_model(&model));
+        for link in model.links() {
+            env.set_link_geometry(
+                link.id,
+                LinkGeometry::from_capsule(
+                    Point3::origin(),
+                    Point3::new(0.0, 0.0, 0.25),
+                    link.bounding_radius,
+                ),
+            );
+        }
+        env.add_obstacle(
+            SharedShape::new(Ball::new(0.10)),
+            Isometry3::translation(0.28, 0.35, 0.52),
+        );
+
+        let start_vec = vec![0.1, -0.3, -0.3, -0.45, 0.6, 0.35];
+        let start = Configuration::new(start_vec.clone());
+
+        // Compute reachable target for left arm only
+        let mut goal_ref = start_vec.clone();
+        goal_ref[0] = -0.35;
+        goal_ref[1] = 0.55;
+        goal_ref[2] = 0.35;
+        let mut buf = model.create_transform_buffer();
+        model.forward_kinematics(&goal_ref, &mut buf).unwrap();
+        let left_pose = *buf.frame_pose(left_arm.end_effectors[0]);
+
+        // 1. Subgroup RRT-Connect planning for left_arm only
+        let robot = Robot::from_model(Arc::new(model.clone()));
+        let rrt = RrtPlanner::new(env.clone());
+        let rrt_path = rrt
+            .plan_path_for_group(
+                &robot,
+                &left_arm,
+                start.clone(),
+                Target::MultiPose(vec![TaskPose::new(left_arm.end_effectors[0], left_pose)]),
+            )
+            .unwrap();
+        assert!(rrt_path.len() >= 2);
+        for wp in &rrt_path {
+            for k in 3..6 {
+                assert_relative_eq!(wp.0[k], start_vec[k], epsilon = 1e-12);
+            }
+        }
+
+        // 2. Subgroup Two-Stage close-proximity planning for left_arm only
+        let pre_ref = [-0.30, 0.42, 0.28, -0.45, 0.6, 0.35];
+        model.forward_kinematics(&pre_ref, &mut buf).unwrap();
+        let pre_pose = *buf.frame_pose(left_arm.end_effectors[0]);
+
+        let two_stage_cfg = TwoStagePlanConfig {
+            coarse_mode: CoarsePlannerMode::RrtConnect,
+            servo_config: ReactiveServoConfig {
+                safety_margin: 0.025,
+                ..TwoStagePlanConfig::default().servo_config
+            },
+            ..TwoStagePlanConfig::default()
+        };
+        let planner = TwoStageApproachPlanner::new(two_stage_cfg);
+        let res = planner
+            .plan_for_group(
+                &CpuSimdBatchBackend,
+                &model,
+                &env,
+                None,
+                &left_arm,
+                start,
+                &[ApproachTarget::with_pre_approach(
+                    TaskPose::new(left_arm.end_effectors[0], left_pose),
+                    pre_pose,
+                )],
+            )
+            .unwrap();
+        assert!(res.max_position_error < 0.01);
+        for wp in &res.full_path {
+            for k in 3..6 {
+                assert_relative_eq!(wp.0[k], start_vec[k], epsilon = 1e-12);
+            }
+        }
+
+        // 3. Subgroup masked MPPI freezes stationary right_arm DOFs
+        let flat = FlatRobotModelF32::compile(&model, &env);
+        let mppi = BatchMppiOptimizer::new(MppiConfig {
+            num_rollouts: 16,
+            horizon: 8,
+            num_iterations: 4,
+            ..MppiConfig::default()
+        });
+        let left_mask = [true, true, true, false, false, false];
+        let mppi_traj = mppi.optimize_masked(
+            &CpuSimdBatchBackend,
+            &model,
+            &flat,
+            None,
+            &start_vec,
+            &goal_ref,
+            Some(&left_mask),
+        );
+        assert_eq!(mppi_traj.len(), 8);
+        for wp in &mppi_traj {
+            for k in 3..6 {
+                assert_relative_eq!(wp.0[k], start_vec[k], epsilon = 1e-12);
+            }
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn resident_gpu_batch_backend_matches_simd_and_runs_ik_mppi() {
+        let Ok(wgpu_backend) = WgpuBatchBackend::new() else {
+            return;
+        };
+        let (model, left_arm, right_arm, _dual_arms) = build_dual_arm_model();
+        let mut env = CollisionEnvironment::new();
+        env.set_acm(AllowedCollisionMatrix::from_model(&model));
+        for link in model.links() {
+            env.set_link_geometry(
+                link.id,
+                LinkGeometry::from_capsule(
+                    Point3::origin(),
+                    Point3::new(0.0, 0.0, 0.28),
+                    link.bounding_radius,
+                ),
+            );
+        }
+        let flat = FlatRobotModelF32::compile(&model, &env);
+        let mut esdf = EsdfGridF32::new([-0.8, -0.8, 0.0], 0.05, [32, 32, 24], 1.0);
+        esdf.add_sphere_obstacle([0.35, 0.0, 0.6], 0.10);
+
+        let wgpu_arc = Arc::new(wgpu_backend);
+        // Intentionally small max_batch_size (16) to exercise multi-chunk dispatch in MPPI
+        let resident = ResidentGpuBatchBackend::new(wgpu_arc, flat.clone(), Some(esdf.clone()), 16);
+
+        let q_batch: Vec<f32> = (0..24)
+            .flat_map(|b| {
+                let a = (b as f32) * 0.05 - 0.5;
+                [a, 0.3, -0.2, -a, 0.3, -0.2]
+            })
+            .collect();
+        let mut sph_cpu = vec![[0.0_f32; 4]; 24 * flat.spheres.len()];
+        let mut ee_cpu = vec![[0.0_f32; 7]; 24 * flat.end_effectors.len()];
+        let mut sph_res = vec![[0.0_f32; 4]; 24 * flat.spheres.len()];
+        let mut ee_res = vec![[0.0_f32; 7]; 24 * flat.end_effectors.len()];
+
+        CpuSimdBatchBackend.forward_kinematics_batch_f32(&flat, &q_batch, &mut sph_cpu, &mut ee_cpu);
+        resident.forward_kinematics_batch_f32(&flat, &q_batch, &mut sph_res, &mut ee_res);
+        for (a, b) in ee_cpu.iter().zip(ee_res.iter()) {
+            for k in 0..7 {
+                assert_relative_eq!(a[k], b[k], epsilon = 1e-4);
+            }
+        }
+
+        let mut costs_cpu = vec![0.0_f32; 24];
+        let mut costs_res = vec![0.0_f32; 24];
+        CpuSimdBatchBackend.collision_cost_batch_f32(&flat, Some(&esdf), &q_batch, 0.08, &mut costs_cpu);
+        resident.collision_cost_batch_f32(&flat, Some(&esdf), &q_batch, 0.08, &mut costs_res);
+        for (c0, c1) in costs_cpu.iter().zip(costs_res.iter()) {
+            assert_relative_eq!(*c0, *c1, epsilon = 1e-4);
+        }
+
+        let mut buf = model.create_transform_buffer();
+        let goal_q = [0.25, 0.5, -0.2, -0.25, 0.5, -0.2];
+        model.forward_kinematics(&goal_q, &mut buf).unwrap();
+        let targets = [
+            TaskPose::new(left_arm.end_effectors[0], *buf.frame_pose(left_arm.end_effectors[0])),
+            TaskPose::new(right_arm.end_effectors[0], *buf.frame_pose(right_arm.end_effectors[0])),
+        ];
+        let seed = [0.0, 0.1, 0.1, 0.0, 0.1, 0.1];
+        let q_ik = BatchIkSolver::new(20)
+            .solve_collision_free(&resident, &model, &flat, &env, Some(&esdf), &seed, &targets)
+            .unwrap();
+
+        let mppi = BatchMppiOptimizer::new(MppiConfig {
+            num_rollouts: 8,
+            horizon: 8,
+            num_iterations: 4,
+            ..MppiConfig::default()
+        });
+        let traj = mppi.optimize(&resident, &model, &flat, Some(&esdf), &seed, q_ik.as_slice());
+        assert_eq!(traj.len(), 8);
     }
 }

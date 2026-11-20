@@ -11,7 +11,8 @@ use crate::collision::{
 use crate::control::{ControlError, ReactiveServoConfig, ReactiveServoController, ServoTarget};
 use crate::kinematics::{KinematicsError, TransformBuffer};
 use crate::robot::{
-    Configuration, JointType, MultiRobotModel, Robot, RobotError, TaskPose, TaskSpacePoint,
+    Configuration, JointType, MultiRobotModel, PlanningGroup, Robot, RobotError, TaskPose,
+    TaskSpacePoint,
 };
 use nalgebra::{DMatrix, DVector, Isometry3, Translation3, Vector3};
 use std::sync::Arc;
@@ -152,26 +153,72 @@ impl RrtPlanner {
         }
     }
 
-    fn resolve_goal(&self, robot: &Robot, start: &Configuration, target: Target) -> Result<Configuration, PlannerError> {
+    /// Plans a collision-free path restricting motion to `group`'s DOFs while holding
+    /// all other arms/joints in `robot` fixed at `start` (and avoiding collisions with them).
+    pub fn plan_path_for_group(
+        &self,
+        robot: &Robot,
+        group: &PlanningGroup,
+        start: Configuration,
+        target: Target,
+    ) -> Result<Vec<Configuration>, PlannerError> {
+        self.plan_path_internal(robot, Some(group), start, target)
+    }
+
+    fn resolve_goal(
+        &self,
+        robot: &Robot,
+        start: &Configuration,
+        target: Target,
+        group: Option<&PlanningGroup>,
+        active_mask: Option<&[bool]>,
+    ) -> Result<Configuration, PlannerError> {
         match target {
-            Target::Joint(goal) => Ok(goal),
+            Target::Joint(goal) => {
+                if let (Some(grp), Some(mask)) = (group, active_mask) {
+                    if goal.dof() == grp.dof() {
+                        let mut full = start.clone();
+                        grp.inject_group_q(goal.as_slice(), &mut full.0);
+                        return Ok(full);
+                    }
+                    if goal.dof() == start.dof() {
+                        let mut full = goal;
+                        for (k, &act) in mask.iter().enumerate() {
+                            if !act {
+                                full.0[k] = start.0[k];
+                            }
+                        }
+                        return Ok(full);
+                    }
+                    return Err(PlannerError::InvalidConfiguration(RobotError::WrongDof {
+                        expected: grp.dof(),
+                        actual: goal.dof(),
+                    }));
+                }
+                Ok(goal)
+            }
             Target::Task(point) => {
                 let Some(model) = &robot.model else {
                     return Err(PlannerError::MissingInverseKinematics);
                 };
-                let ee_frame = model
-                    .groups()
-                    .first()
+                let ee_frame = group
                     .and_then(|g| g.end_effectors.first().copied())
+                    .or_else(|| {
+                        model
+                            .groups()
+                            .first()
+                            .and_then(|g| g.end_effectors.first().copied())
+                    })
                     .ok_or(PlannerError::MissingInverseKinematics)?;
                 let mut buf = model.create_transform_buffer();
                 model.forward_kinematics(start.as_slice(), &mut buf)?;
                 let current_rot = buf.frame_pose(ee_frame).rotation;
                 let pose = Isometry3::from_parts(point.position.into(), current_rot);
                 model
-                    .solve_ik_dls(
+                    .solve_ik_dls_masked(
                         &[TaskPose::new(ee_frame, pose)],
                         start.as_slice(),
+                        active_mask,
                         120,
                         1e-4,
                         1e-2,
@@ -185,22 +232,47 @@ impl RrtPlanner {
                 };
                 let mut buf = model.create_transform_buffer();
                 model
-                    .solve_ik_dls(&poses, start.as_slice(), 150, 1e-4, 1e-2, &mut buf)
+                    .solve_ik_dls_masked(
+                        &poses,
+                        start.as_slice(),
+                        active_mask,
+                        150,
+                        1e-4,
+                        1e-2,
+                        &mut buf,
+                    )
                     .map_err(|_| PlannerError::TargetUnreachable)
             }
         }
     }
-}
 
-impl PathPlanner for RrtPlanner {
-    fn plan_path(
+    fn plan_path_internal(
         &self,
         robot: &Robot,
+        group: Option<&PlanningGroup>,
         start: Configuration,
         target: Target,
     ) -> Result<Vec<Configuration>, PlannerError> {
         robot.validate_configuration(&start)?;
-        let goal = self.resolve_goal(robot, &start, target)?;
+        let dof = start.dof();
+        let active_mask = if let Some(grp) = group {
+            let mut mask = vec![false; dof];
+            for &idx in &grp.q_indices {
+                if idx >= dof {
+                    return Err(PlannerError::InvalidConfiguration(RobotError::WrongDof {
+                        expected: dof,
+                        actual: idx + 1,
+                    }));
+                }
+                mask[idx] = true;
+            }
+            Some(mask)
+        } else {
+            None
+        };
+        let active_mask_ref = active_mask.as_deref();
+
+        let goal = self.resolve_goal(robot, &start, target, group, active_mask_ref)?;
         robot.validate_configuration(&goal)?;
 
         if !self.environment.is_collision_free(robot, &start)?
@@ -229,7 +301,6 @@ impl PathPlanner for RrtPlanner {
         }
 
         // Bidirectional RRT-Connect search in flat arenas
-        let dof = model.dof();
         let mut tree_a = FlatTree::with_capacity(dof, 512, start.as_slice());
         let mut tree_b = FlatTree::with_capacity(dof, 512, goal.as_slice());
         let mut swapped = false;
@@ -244,11 +315,15 @@ impl PathPlanner for RrtPlanner {
             z ^ (z >> 31)
         };
 
-        let mut q_rand = vec![0.0; dof];
+        let mut q_rand = start.0.clone();
         let mut q_step = vec![0.0; dof];
 
         for _ in 0..self.max_iterations {
             for (k, lim) in model.dof_limits().iter().enumerate() {
+                if active_mask_ref.is_some_and(|m| !m[k]) {
+                    q_rand[k] = start.0[k];
+                    continue;
+                }
                 let u = (next_u64() >> 11) as f64 * (1.0 / ((1u64 << 53) as f64));
                 let (lo, hi) = if lim.position.min.is_finite() && lim.position.max.is_finite() {
                     (lim.position.min, lim.position.max)
@@ -332,6 +407,17 @@ impl PathPlanner for RrtPlanner {
         }
 
         Err(PlannerError::CollisionDetected)
+    }
+}
+
+impl PathPlanner for RrtPlanner {
+    fn plan_path(
+        &self,
+        robot: &Robot,
+        start: Configuration,
+        target: Target,
+    ) -> Result<Vec<Configuration>, PlannerError> {
+        self.plan_path_internal(robot, None, start, target)
     }
 }
 
@@ -570,6 +656,7 @@ impl TwoStageApproachPlanner {
         &self,
         model: &MultiRobotModel,
         env: &CollisionEnvironment,
+        group: Option<&PlanningGroup>,
         start: &Configuration,
         goal: &Configuration,
     ) -> Result<Vec<Configuration>, PlannerError> {
@@ -578,7 +665,10 @@ impl TwoStageApproachPlanner {
         rrt.step_size = self.config.rrt_step_size;
         rrt.max_workspace_step = self.config.rrt_max_workspace_step;
         rrt.max_iterations = self.config.rrt_max_iterations;
-        rrt.plan_path(&robot, start.clone(), Target::Joint(goal.clone()))
+        match group {
+            Some(grp) => rrt.plan_path_for_group(&robot, grp, start.clone(), Target::Joint(goal.clone())),
+            None => rrt.plan_path(&robot, start.clone(), Target::Joint(goal.clone())),
+        }
     }
 
     fn update_min_clearance(
@@ -610,7 +700,56 @@ impl TwoStageApproachPlanner {
         start: Configuration,
         targets: &[ApproachTarget],
     ) -> Result<TwoStagePlanResult, PlannerError> {
+        self.plan_internal(backend, model, env, esdf, None, start, targets)
+    }
+
+    /// Plans a collision-free two-stage trajectory restricting motion to `group`'s DOFs
+    /// while holding all other arms/joints fixed at `start` (and avoiding collisions with them).
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_for_group<B: BatchRolloutBackend>(
+        &self,
+        backend: &B,
+        model: &MultiRobotModel,
+        env: &CollisionEnvironment,
+        esdf: Option<&EsdfGridF32>,
+        group: &PlanningGroup,
+        start: Configuration,
+        targets: &[ApproachTarget],
+    ) -> Result<TwoStagePlanResult, PlannerError> {
+        self.plan_internal(backend, model, env, esdf, Some(group), start, targets)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn plan_internal<B: BatchRolloutBackend>(
+        &self,
+        backend: &B,
+        model: &MultiRobotModel,
+        env: &CollisionEnvironment,
+        esdf: Option<&EsdfGridF32>,
+        group: Option<&PlanningGroup>,
+        start: Configuration,
+        targets: &[ApproachTarget],
+    ) -> Result<TwoStagePlanResult, PlannerError> {
         model.validate_configuration(start.as_slice())?;
+        let dof = model.dof();
+        let active_mask = if let Some(grp) = group {
+            let mut mask = vec![false; dof];
+            for &idx in &grp.q_indices {
+                if idx >= dof {
+                    return Err(PlannerError::InvalidConfiguration(RobotError::WrongDof {
+                        expected: dof,
+                        actual: idx + 1,
+                    }));
+                }
+                mask[idx] = true;
+            }
+            Some(mask)
+        } else {
+            None
+        };
+        let active_mask_ref = active_mask.as_deref();
+        let is_active = |k: usize| active_mask_ref.is_none_or(|m| m[k]);
+
         let mut ws = env.create_workspace(model);
         if !env.is_state_collision_free(model, start.as_slice(), GeometryTier::Convex, &mut ws)? {
             return Err(PlannerError::CollisionDetected);
@@ -636,13 +775,14 @@ impl TwoStageApproachPlanner {
         let q_pre = self
             .config
             .ik_solver
-            .solve_collision_free(
+            .solve_collision_free_masked(
                 backend,
                 model,
                 &flat_model,
                 env,
                 esdf,
                 start.as_slice(),
+                active_mask_ref,
                 &pre_targets,
             )
             .map_err(|_| PlannerError::TargetUnreachable)?;
@@ -650,17 +790,18 @@ impl TwoStageApproachPlanner {
         // 2. Stage 1: Coarse Global Plan (start -> q_pre) validated in GeometryTier::Convex
         let stage1_path = match &self.config.coarse_mode {
             CoarsePlannerMode::RrtConnect => {
-                self.plan_stage1_rrt(model, env, &start, &q_pre)?
+                self.plan_stage1_rrt(model, env, group, &start, &q_pre)?
             }
             CoarsePlannerMode::Mppi(mppi_cfg) => {
                 let mppi = BatchMppiOptimizer::new(mppi_cfg.clone());
-                let traj = mppi.optimize(
+                let traj = mppi.optimize_masked(
                     backend,
                     model,
                     &flat_model,
                     esdf,
                     start.as_slice(),
                     q_pre.as_slice(),
+                    active_mask_ref,
                 );
                 if Self::validate_path_convex(
                     model,
@@ -676,13 +817,14 @@ impl TwoStageApproachPlanner {
             }
             CoarsePlannerMode::MppiWithRrtFallback(mppi_cfg) => {
                 let mppi = BatchMppiOptimizer::new(mppi_cfg.clone());
-                let traj = mppi.optimize(
+                let traj = mppi.optimize_masked(
                     backend,
                     model,
                     &flat_model,
                     esdf,
                     start.as_slice(),
                     q_pre.as_slice(),
+                    active_mask_ref,
                 );
                 if Self::validate_path_convex(
                     model,
@@ -693,19 +835,22 @@ impl TwoStageApproachPlanner {
                 )? {
                     traj
                 } else {
-                    self.plan_stage1_rrt(model, env, &start, &q_pre)?
+                    self.plan_stage1_rrt(model, env, group, &start, &q_pre)?
                 }
             }
         };
 
         // 3. Stage 2: Tight-margin GeometryTier::Convex CBF Refinement (q_pre -> final_pose)
-        let dof = model.dof();
         let mut q_curr = q_pre.0.clone();
         let mut dq_curr = vec![0.0_f64; dof];
         let mut dq_cmd = vec![0.0_f64; dof];
         let mut q_cand = vec![0.0_f64; dof];
 
-        let mut servo = ReactiveServoController::new(model, env, self.config.servo_config.clone());
+        let mut servo_cfg = self.config.servo_config.clone();
+        if let Some(mask) = active_mask.clone() {
+            servo_cfg = servo_cfg.with_active_dof_mask(mask);
+        }
+        let mut servo = ReactiveServoController::new(model, env, servo_cfg);
         let servo_targets: Vec<ServoTarget> = targets
             .iter()
             .map(|t| ServoTarget::pose(t.final_pose.frame, t.final_pose.pose, self.config.approach_pose_gain))
@@ -758,6 +903,10 @@ impl TwoStageApproachPlanner {
             let mut accepted = false;
             for scale in [1.0, 0.5, 0.25, 0.125] {
                 for (k, lim) in model.dof_limits().iter().enumerate() {
+                    if !is_active(k) {
+                        q_cand[k] = start.0[k];
+                        continue;
+                    }
                     let next_val = q_curr[k] + dq_cmd[k] * dt * scale;
                     let joint = model.joint(model.actuated_joint(k));
                     q_cand[k] = if matches!(joint.joint_type, JointType::Continuous { .. }) {
@@ -831,11 +980,15 @@ impl TwoStageApproachPlanner {
                     err_vec[off + 3] = r_e.x;
                     err_vec[off + 4] = r_e.y;
                     err_vec[off + 5] = r_e.z;
-                    model.geometric_jacobian(
-                        &buf,
-                        t.final_pose.frame,
-                        j_mat.view_mut((off, 0), (6, dof)),
-                    )?;
+                    let mut sub_j = j_mat.view_mut((off, 0), (6, dof));
+                    model.geometric_jacobian(&buf, t.final_pose.frame, sub_j.as_view_mut())?;
+                    for col in 0..dof {
+                        if !is_active(col) {
+                            for r in 0..6 {
+                                sub_j[(r, col)] = 0.0;
+                            }
+                        }
+                    }
                 }
 
                 let mut gram = &j_mat * j_mat.transpose();
@@ -854,6 +1007,10 @@ impl TwoStageApproachPlanner {
                 }
 
                 for (k, lim) in model.dof_limits().iter().enumerate() {
+                    if !is_active(k) {
+                        q_cand[k] = start.0[k];
+                        continue;
+                    }
                     let next_val = q_curr[k] + dq[k];
                     let joint = model.joint(model.actuated_joint(k));
                     q_cand[k] = if matches!(joint.joint_type, JointType::Continuous { .. }) {

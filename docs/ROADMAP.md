@@ -13,7 +13,7 @@ This document tracks all completed engineering phases and commits on `main`, alo
 | **2A/2B** | CuRobo-style `f32` SIMD/WGSL batching, `EsdfGridF32`, `GpuRobotContext`, Batch IK & MPPI, URDF/SRDF | **Complete** | `31eae0d`, `fc4197c`, `d728dfd`, `335efd1` |
 | **2C** | Compound tool payloads, per-pair safety margins, priority QP-CBF + curl, Two-Stage planner | **Complete** | `3f475f6` |
 | **2D** | Declarative scene engine, pure-`wgpu 30` 3D renderer, Slint 1.19 Studio UI, interactive inspectors | **Complete** | `556a732`, `9f8067a`, `1eff888`, `dbcf530` |
-| **3** | Core 1 kHz zero-alloc polish, `WorldScene`, `unrust-it-io` (TOML/JSON), Dual-Rate Pipeline | **Planned** | — |
+| **3** | Core 1 kHz zero-alloc polish, `WorldScene`, `unrust-it-io` (TOML/JSON), Dual-Rate Pipeline | **In Progress (3A Complete)** | — |
 | **4** | `unrust-it-perception`: Calibration ingestion, RGB-D/LiDAR/Radar self-filtering, dynamic ESDF + CV-EKF | **Planned** | — |
 | **5** | Mobile manipulators (`nq`/`nv`), CAD mesh ingestion (VHACD), ROS 2 / Zenoh / Python / C ABI | **Planned** | — |
 
@@ -54,7 +54,7 @@ This document tracks all completed engineering phases and commits on `main`, alo
 
 ### Phase 3 — Core 1 kHz RT Ergonomics, World Schema & Dual-Rate Pipeline
 
-#### Milestone 3A — Core Hot-Path Polish & Subgroup Planning
+#### Milestone 3A — Core Hot-Path Polish & Subgroup Planning ✅ Complete
 - **Deliverables**:
   - Eliminate remaining per-tick heap allocations inside `ReactiveServoController::step()`, `ToppraTrajectory::sample_into()`, and payload pair lookups (integer-indexed lookup instead of `String` formatting).
   - Add `ServoTarget::JointReference { q_ref, dq_ref, kp }` so `ReactiveServoController` operates directly as a 1 kHz CBF safety filter over any trajectory.

@@ -1153,6 +1153,11 @@ fn canonical_link_pair(a: LinkId, b: LinkId) -> (LinkId, LinkId) {
 }
 
 #[inline]
+fn canonical_payload_id_pair(a: PayloadId, b: PayloadId) -> (PayloadId, PayloadId) {
+    if a <= b { (a, b) } else { (b, a) }
+}
+
+#[inline]
 fn canonical_payload_pair(a: &str, b: &str) -> (String, String) {
     if a <= b {
         (a.to_string(), b.to_string())
@@ -1198,6 +1203,12 @@ pub struct CollisionEnvironment {
     payload_obstacle_rules: HashMap<(String, ObstacleId), PayloadPairRule>,
     /// Per-pair overrides for `(payload_id, link)`.
     payload_link_rules: HashMap<(String, LinkId), PayloadPairRule>,
+    /// Zero-alloc integer-keyed cache for `payload_pair_rules`.
+    compiled_payload_pair_rules: HashMap<(PayloadId, PayloadId), PayloadPairRule>,
+    /// Zero-alloc integer-keyed cache for `payload_obstacle_rules`.
+    compiled_payload_obstacle_rules: HashMap<(PayloadId, ObstacleId), PayloadPairRule>,
+    /// Zero-alloc integer-keyed cache for `payload_link_rules`.
+    compiled_payload_link_rules: HashMap<(PayloadId, LinkId), PayloadPairRule>,
 }
 
 impl CollisionEnvironment {
@@ -1275,22 +1286,58 @@ impl CollisionEnvironment {
         self.acm.as_mut()
     }
 
+    fn payload_id_by_name(&self, id: &str) -> Option<PayloadId> {
+        self.attached_payloads
+            .iter()
+            .position(|p| p.id == id)
+            .map(|idx| PayloadId(idx as u16))
+    }
+
+    fn rebuild_payload_rule_caches(&mut self) {
+        self.compiled_payload_pair_rules.clear();
+        for ((a, b), &rule) in &self.payload_pair_rules {
+            if let (Some(pa), Some(pb)) = (self.payload_id_by_name(a), self.payload_id_by_name(b)) {
+                self.compiled_payload_pair_rules
+                    .insert(canonical_payload_id_pair(pa, pb), rule);
+            }
+        }
+
+        self.compiled_payload_obstacle_rules.clear();
+        for ((pid_str, obs), &rule) in &self.payload_obstacle_rules {
+            if let Some(pid) = self.payload_id_by_name(pid_str) {
+                self.compiled_payload_obstacle_rules
+                    .insert((pid, *obs), rule);
+            }
+        }
+
+        self.compiled_payload_link_rules.clear();
+        for ((pid_str, link), &rule) in &self.payload_link_rules {
+            if let Some(pid) = self.payload_id_by_name(pid_str) {
+                self.compiled_payload_link_rules.insert((pid, *link), rule);
+            }
+        }
+    }
+
     /// Attaches a grasped payload or tool to a robot link (replacing any existing payload with the same `id`).
     pub fn attach_payload(&mut self, payload: AttachedPayload) -> PayloadId {
-        if let Some(pos) = self.attached_payloads.iter().position(|p| p.id == payload.id) {
+        let id = if let Some(pos) = self.attached_payloads.iter().position(|p| p.id == payload.id) {
             self.attached_payloads[pos] = payload;
             PayloadId(pos as u16)
         } else {
             let id = PayloadId(self.attached_payloads.len() as u16);
             self.attached_payloads.push(payload);
             id
-        }
+        };
+        self.rebuild_payload_rule_caches();
+        id
     }
 
     /// Detaches a grasped payload by its ID.
     pub fn detach_payload(&mut self, id: &str) -> Option<AttachedPayload> {
         let pos = self.attached_payloads.iter().position(|p| p.id == id)?;
-        Some(self.attached_payloads.swap_remove(pos))
+        let removed = self.attached_payloads.swap_remove(pos);
+        self.rebuild_payload_rule_caches();
+        Some(removed)
     }
 
     /// Returns all currently attached payloads and tools.
@@ -1373,6 +1420,7 @@ impl CollisionEnvironment {
             .entry(canonical_payload_pair(id_a, id_b))
             .or_default()
             .margin = Some(margin);
+        self.rebuild_payload_rule_caches();
     }
 
     /// Configures a custom CBF/MPPI activation distance between two attached payloads/tools `(id_a, id_b)`.
@@ -1381,6 +1429,7 @@ impl CollisionEnvironment {
             .entry(canonical_payload_pair(id_a, id_b))
             .or_default()
             .activation_distance = Some(activation);
+        self.rebuild_payload_rule_caches();
     }
 
     /// Enables or disables collision checking between two attached payloads `(id_a, id_b)`.
@@ -1389,6 +1438,7 @@ impl CollisionEnvironment {
             .entry(canonical_payload_pair(id_a, id_b))
             .or_default()
             .enabled = enabled;
+        self.rebuild_payload_rule_caches();
     }
 
     /// Configures a custom safety margin between payload `payload_id` and `obstacle`.
@@ -1402,6 +1452,7 @@ impl CollisionEnvironment {
             .entry((payload_id.to_string(), obstacle))
             .or_default()
             .margin = Some(margin);
+        self.rebuild_payload_rule_caches();
     }
 
     /// Configures a custom CBF activation distance between payload `payload_id` and `obstacle`.
@@ -1415,6 +1466,7 @@ impl CollisionEnvironment {
             .entry((payload_id.to_string(), obstacle))
             .or_default()
             .activation_distance = Some(activation);
+        self.rebuild_payload_rule_caches();
     }
 
     /// Enables or disables collision checking between payload `payload_id` and `obstacle`.
@@ -1428,6 +1480,7 @@ impl CollisionEnvironment {
             .entry((payload_id.to_string(), obstacle))
             .or_default()
             .enabled = enabled;
+        self.rebuild_payload_rule_caches();
     }
 
     /// Configures a custom safety margin between payload `payload_id` and `link`.
@@ -1436,6 +1489,7 @@ impl CollisionEnvironment {
             .entry((payload_id.to_string(), link))
             .or_default()
             .margin = Some(margin);
+        self.rebuild_payload_rule_caches();
     }
 
     /// Configures a custom CBF/MPPI activation distance between payload `payload_id` and `link`.
@@ -1449,6 +1503,7 @@ impl CollisionEnvironment {
             .entry((payload_id.to_string(), link))
             .or_default()
             .activation_distance = Some(activation);
+        self.rebuild_payload_rule_caches();
     }
 
     /// Enables or disables collision checking between payload `payload_id` and `link`.
@@ -1457,17 +1512,57 @@ impl CollisionEnvironment {
             .entry((payload_id.to_string(), link))
             .or_default()
             .enabled = enabled;
+        self.rebuild_payload_rule_caches();
     }
 
-    /// Returns whether collision checking between two payloads is enabled.
+    /// Zero-allocation ID-based check for whether payload pair `(a, b)` is enabled.
+    #[inline]
+    pub fn is_payload_pair_id_enabled(&self, a: PayloadId, b: PayloadId) -> bool {
+        if self.compiled_payload_pair_rules.is_empty() {
+            return true;
+        }
+        self.compiled_payload_pair_rules
+            .get(&canonical_payload_id_pair(a, b))
+            .is_none_or(|r| r.enabled)
+    }
+
+    /// Zero-allocation ID-based check for whether `(payload, obstacle)` is enabled.
+    #[inline]
+    pub fn is_payload_obstacle_id_enabled(&self, payload: PayloadId, obstacle: ObstacleId) -> bool {
+        if self.compiled_payload_obstacle_rules.is_empty() {
+            return true;
+        }
+        self.compiled_payload_obstacle_rules
+            .get(&(payload, obstacle))
+            .is_none_or(|r| r.enabled)
+    }
+
+    /// Zero-allocation ID-based check for whether `(payload, link)` is enabled.
+    #[inline]
+    pub fn is_payload_link_id_enabled(&self, payload: PayloadId, link: LinkId) -> bool {
+        if self.compiled_payload_link_rules.is_empty() {
+            return true;
+        }
+        self.compiled_payload_link_rules
+            .get(&(payload, link))
+            .is_none_or(|r| r.enabled)
+    }
+
+    /// Returns whether collision checking between two payloads is enabled (allocation-free).
     #[inline]
     pub fn is_payload_pair_enabled(&self, id_a: &str, id_b: &str) -> bool {
         if self.payload_pair_rules.is_empty() {
             return true;
         }
+        let (lo, hi) = if id_a <= id_b {
+            (id_a, id_b)
+        } else {
+            (id_b, id_a)
+        };
         self.payload_pair_rules
-            .get(&canonical_payload_pair(id_a, id_b))
-            .is_none_or(|r| r.enabled)
+            .iter()
+            .find(|((a, b), _)| a == lo && b == hi)
+            .is_none_or(|(_, r)| r.enabled)
     }
 
     /// Returns whether collision checking between `payload_id` and `obstacle` is enabled.
@@ -1525,15 +1620,13 @@ impl CollisionEnvironment {
             } => {
                 let pa = self.attached_payload(payload_a);
                 let pb = self.attached_payload(payload_b);
-                let explicit = pa.zip(pb).and_then(|(a, b)| {
-                    if self.payload_pair_rules.is_empty() {
-                        None
-                    } else {
-                        self.payload_pair_rules
-                            .get(&canonical_payload_pair(&a.id, &b.id))
-                            .and_then(|r| r.margin)
-                    }
-                });
+                let explicit = if self.compiled_payload_pair_rules.is_empty() {
+                    None
+                } else {
+                    self.compiled_payload_pair_rules
+                        .get(&canonical_payload_id_pair(payload_a, payload_b))
+                        .and_then(|r| r.margin)
+                };
                 explicit.or_else(|| {
                     combine_optional_max(
                         pa.and_then(|p| p.safety_margin),
@@ -1545,16 +1638,13 @@ impl CollisionEnvironment {
                 payload, obstacle, ..
             } => {
                 let p = self.attached_payload(payload);
-                let explicit = p.and_then(|pl| {
-                    if self.payload_obstacle_rules.is_empty() {
-                        None
-                    } else {
-                        self.payload_obstacle_rules
-                            .iter()
-                            .find(|((pid, obs), _)| *obs == obstacle && pid == &pl.id)
-                            .and_then(|(_, r)| r.margin)
-                    }
-                });
+                let explicit = if self.compiled_payload_obstacle_rules.is_empty() {
+                    None
+                } else {
+                    self.compiled_payload_obstacle_rules
+                        .get(&(payload, obstacle))
+                        .and_then(|r| r.margin)
+                };
                 explicit
                     .or_else(|| p.and_then(|pl| pl.safety_margin))
                     .or_else(|| {
@@ -1566,16 +1656,13 @@ impl CollisionEnvironment {
             }
             CollidingPair::PayloadToLink { payload, link, .. } => {
                 let p = self.attached_payload(payload);
-                let explicit = p.and_then(|pl| {
-                    if self.payload_link_rules.is_empty() {
-                        None
-                    } else {
-                        self.payload_link_rules
-                            .iter()
-                            .find(|((pid, l), _)| *l == link && pid == &pl.id)
-                            .and_then(|(_, r)| r.margin)
-                    }
-                });
+                let explicit = if self.compiled_payload_link_rules.is_empty() {
+                    None
+                } else {
+                    self.compiled_payload_link_rules
+                        .get(&(payload, link))
+                        .and_then(|r| r.margin)
+                };
                 explicit.or_else(|| p.and_then(|pl| pl.safety_margin))
             }
         }
@@ -1612,15 +1699,13 @@ impl CollisionEnvironment {
             } => {
                 let pa = self.attached_payload(payload_a);
                 let pb = self.attached_payload(payload_b);
-                let explicit = pa.zip(pb).and_then(|(a, b)| {
-                    if self.payload_pair_rules.is_empty() {
-                        None
-                    } else {
-                        self.payload_pair_rules
-                            .get(&canonical_payload_pair(&a.id, &b.id))
-                            .and_then(|r| r.activation_distance)
-                    }
-                });
+                let explicit = if self.compiled_payload_pair_rules.is_empty() {
+                    None
+                } else {
+                    self.compiled_payload_pair_rules
+                        .get(&canonical_payload_id_pair(payload_a, payload_b))
+                        .and_then(|r| r.activation_distance)
+                };
                 explicit.or_else(|| {
                     combine_optional_max(
                         pa.and_then(|p| p.activation_distance),
@@ -1632,16 +1717,13 @@ impl CollisionEnvironment {
                 payload, obstacle, ..
             } => {
                 let p = self.attached_payload(payload);
-                let explicit = p.and_then(|pl| {
-                    if self.payload_obstacle_rules.is_empty() {
-                        None
-                    } else {
-                        self.payload_obstacle_rules
-                            .iter()
-                            .find(|((pid, obs), _)| *obs == obstacle && pid == &pl.id)
-                            .and_then(|(_, r)| r.activation_distance)
-                    }
-                });
+                let explicit = if self.compiled_payload_obstacle_rules.is_empty() {
+                    None
+                } else {
+                    self.compiled_payload_obstacle_rules
+                        .get(&(payload, obstacle))
+                        .and_then(|r| r.activation_distance)
+                };
                 explicit
                     .or_else(|| p.and_then(|pl| pl.activation_distance))
                     .or_else(|| {
@@ -1653,16 +1735,13 @@ impl CollisionEnvironment {
             }
             CollidingPair::PayloadToLink { payload, link, .. } => {
                 let p = self.attached_payload(payload);
-                let explicit = p.and_then(|pl| {
-                    if self.payload_link_rules.is_empty() {
-                        None
-                    } else {
-                        self.payload_link_rules
-                            .iter()
-                            .find(|((pid, l), _)| *l == link && pid == &pl.id)
-                            .and_then(|(_, r)| r.activation_distance)
-                    }
-                });
+                let explicit = if self.compiled_payload_link_rules.is_empty() {
+                    None
+                } else {
+                    self.compiled_payload_link_rules
+                        .get(&(payload, link))
+                        .and_then(|r| r.activation_distance)
+                };
                 explicit.or_else(|| p.and_then(|pl| pl.activation_distance))
             }
         }
@@ -2035,7 +2114,7 @@ impl CollisionEnvironment {
 
                 for obs_idx in bvh.intersect_aabb(&query_aabb) {
                     let obs_id = ObstacleId(obs_idx);
-                    if !self.is_payload_obstacle_enabled(&payload.id, obs_id) {
+                    if !self.is_payload_obstacle_id_enabled(payload_id, obs_id) {
                         continue;
                     }
                     let pair = CollidingPair::PayloadToObstacle {
@@ -2089,7 +2168,7 @@ impl CollisionEnvironment {
                 if link_id == payload.parent_link || payload.touch_links.contains(&link_id) {
                     continue;
                 }
-                if !self.is_payload_link_enabled(&payload.id, link_id) {
+                if !self.is_payload_link_id_enabled(payload_id, link_id) {
                     continue;
                 }
                 let Some(geom) = self.link_geometry(link_id) else {
@@ -2150,10 +2229,10 @@ impl CollisionEnvironment {
                 {
                     continue;
                 }
-                if !self.is_payload_pair_enabled(&payload.id, &payload_b.id) {
+                let payload_b_id = PayloadId(p_b_idx as u16);
+                if !self.is_payload_pair_id_enabled(payload_id, payload_b_id) {
                     continue;
                 }
-                let payload_b_id = PayloadId(p_b_idx as u16);
                 let pair = CollidingPair::PayloadToPayload {
                     payload_a: payload_id,
                     parent_link_a: payload.parent_link,
@@ -2411,7 +2490,7 @@ impl CollisionEnvironment {
             if let Some(bvh) = &self.obstacle_bvh {
                 for obs_idx in bvh.intersect_aabb(&loosened_payload) {
                     let obs_id = ObstacleId(obs_idx);
-                    if !self.is_payload_obstacle_enabled(&payload.id, obs_id) {
+                    if !self.is_payload_obstacle_id_enabled(payload_id, obs_id) {
                         continue;
                     }
                     let obs = &self.obstacles[obs_idx as usize];
@@ -2456,7 +2535,7 @@ impl CollisionEnvironment {
                 if link_id == payload.parent_link || payload.touch_links.contains(&link_id) {
                     continue;
                 }
-                if !self.is_payload_link_enabled(&payload.id, link_id) {
+                if !self.is_payload_link_id_enabled(payload_id, link_id) {
                     continue;
                 }
                 let Some(geom) = self.link_geometry(link_id) else {
@@ -2507,7 +2586,8 @@ impl CollisionEnvironment {
                 {
                     continue;
                 }
-                if !self.is_payload_pair_enabled(&payload.id, &payload_b.id) {
+                let payload_b_id = PayloadId(p_b_idx as u16);
+                if !self.is_payload_pair_id_enabled(payload_id, payload_b_id) {
                     continue;
                 }
                 if !loosened_payload.intersects(&workspace.payload_aabbs[p_b_idx]) {

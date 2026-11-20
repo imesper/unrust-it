@@ -195,6 +195,34 @@ impl MultiRobotModel {
         Ok(())
     }
 
+    /// Computes the 6D world screw column `[vx, vy, vz, wx, wy, wz]` of joint `q_idx`
+    /// for `point_world` rigidly attached to `link`.
+    #[inline]
+    pub(crate) fn point_screw_column(
+        &self,
+        buf: &TransformBuffer,
+        link: LinkId,
+        point_world: &Point3<f64>,
+        q_idx: usize,
+    ) -> [f64; 6] {
+        if !self.is_dof_ancestor_of_link(link, q_idx) {
+            return [0.0; 6];
+        }
+        let joint_id = self.actuated_joint(q_idx);
+        let joint = self.joint(joint_id);
+        let axis_w = &buf.joint_axes_world[joint_id.index()];
+        match joint.joint_type {
+            JointType::Fixed => [0.0; 6],
+            JointType::Revolute { .. } | JointType::Continuous { .. } => {
+                let origin_w = &buf.joint_origins_world[joint_id.index()];
+                let r = point_world - origin_w;
+                let v = axis_w.cross(&r);
+                [v.x, v.y, v.z, axis_w.x, axis_w.y, axis_w.z]
+            }
+            JointType::Prismatic { .. } => [axis_w.x, axis_w.y, axis_w.z, 0.0, 0.0, 0.0],
+        }
+    }
+
     /// Populates the $6 \times N_{\text{dof}}$ world-aligned geometric Jacobian for an arbitrary
     /// world point `point_world` rigidly attached to `link`.
     pub fn compute_point_and_angular_jacobian_on_link(
@@ -206,31 +234,9 @@ impl MultiRobotModel {
     ) {
         let dof = self.dof();
         for q_idx in 0..dof {
-            if !self.is_dof_ancestor_of_link(link, q_idx) {
-                continue;
-            }
-            let joint_id = self.actuated_joint(q_idx);
-            let joint = self.joint(joint_id);
-            let axis_w = &buf.joint_axes_world[joint_id.index()];
-
-            match joint.joint_type {
-                JointType::Fixed => {}
-                JointType::Revolute { .. } | JointType::Continuous { .. } => {
-                    let origin_w = &buf.joint_origins_world[joint_id.index()];
-                    let r = point_world - origin_w;
-                    let v = axis_w.cross(&r);
-                    out_jacobian[(0, q_idx)] = v.x;
-                    out_jacobian[(1, q_idx)] = v.y;
-                    out_jacobian[(2, q_idx)] = v.z;
-                    out_jacobian[(3, q_idx)] = axis_w.x;
-                    out_jacobian[(4, q_idx)] = axis_w.y;
-                    out_jacobian[(5, q_idx)] = axis_w.z;
-                }
-                JointType::Prismatic { .. } => {
-                    out_jacobian[(0, q_idx)] = axis_w.x;
-                    out_jacobian[(1, q_idx)] = axis_w.y;
-                    out_jacobian[(2, q_idx)] = axis_w.z;
-                }
+            let col = self.point_screw_column(buf, link, point_world, q_idx);
+            for (r, &val) in col.iter().enumerate() {
+                out_jacobian[(r, q_idx)] = val;
             }
         }
     }
@@ -287,6 +293,30 @@ impl MultiRobotModel {
         damping: f64,
         buf: &mut TransformBuffer,
     ) -> Result<Configuration, KinematicsError> {
+        self.solve_ik_dls_masked(
+            targets,
+            q_seed,
+            None,
+            max_iterations,
+            tolerance,
+            damping,
+            buf,
+        )
+    }
+
+    /// Solves multi-target 6-DOF Inverse Kinematics over the subset of active joints specified
+    /// by `active_dofs` (`None` enables all DOFs), keeping inactive DOFs fixed at `q_seed`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn solve_ik_dls_masked(
+        &self,
+        targets: &[TaskPose],
+        q_seed: &[f64],
+        active_dofs: Option<&[bool]>,
+        max_iterations: usize,
+        tolerance: f64,
+        damping: f64,
+        buf: &mut TransformBuffer,
+    ) -> Result<Configuration, KinematicsError> {
         let dof = self.dof();
         if q_seed.len() != dof {
             return Err(KinematicsError::InvalidConfiguration(
@@ -296,15 +326,28 @@ impl MultiRobotModel {
                 },
             ));
         }
+        if let Some(mask) = active_dofs {
+            if mask.len() != dof {
+                return Err(KinematicsError::InvalidConfiguration(
+                    RobotError::WrongDof {
+                        expected: dof,
+                        actual: mask.len(),
+                    },
+                ));
+            }
+        }
         if targets.is_empty() {
             return Ok(Configuration::from_slice(q_seed));
         }
 
+        let is_active = |k: usize| active_dofs.is_none_or(|m| m[k]);
         let m = 6 * targets.len();
         let mut q = DVector::from_column_slice(q_seed);
-        // Clamp initial seed into bounds
+        // Clamp active initial seed DOFs into bounds (inactive DOFs remain exact `q_seed[k]`)
         for (k, lim) in self.dof_limits().iter().enumerate() {
-            q[k] = lim.position.clamp(q[k]);
+            if is_active(k) {
+                q[k] = lim.position.clamp(q[k]);
+            }
         }
 
         let mut err = DVector::<f64>::zeros(m);
@@ -329,8 +372,17 @@ impl MultiRobotModel {
                 err[row_offset + 4] = rot_err.y;
                 err[row_offset + 5] = rot_err.z;
 
-                let sub_j = j_stacked.view_mut((row_offset, 0), (6, dof));
-                self.geometric_jacobian(buf, target.frame, sub_j)?;
+                let mut sub_j = j_stacked.view_mut((row_offset, 0), (6, dof));
+                self.geometric_jacobian(buf, target.frame, sub_j.as_view_mut())?;
+                if let Some(mask) = active_dofs {
+                    for (col, &act) in mask.iter().enumerate() {
+                        if !act {
+                            for r in 0..6 {
+                                sub_j[(r, col)] = 0.0;
+                            }
+                        }
+                    }
+                }
             }
 
             if err.norm() <= tolerance {
@@ -356,8 +408,11 @@ impl MultiRobotModel {
                 dq *= max_step / dq_inf;
             }
 
-            q += dq;
             for (k, lim) in self.dof_limits().iter().enumerate() {
+                if !is_active(k) {
+                    continue;
+                }
+                q[k] += dq[k];
                 let joint = self.joint(self.actuated_joint(k));
                 if matches!(joint.joint_type, JointType::Continuous { .. }) {
                     q[k] = (q[k] + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU)

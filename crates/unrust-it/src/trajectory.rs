@@ -323,33 +323,44 @@ impl ToppraTrajectory {
         })
     }
 
+    /// Actuated degrees of freedom along this trajectory.
+    #[inline]
+    pub fn dof(&self) -> usize {
+        self.path.dof()
+    }
+
     /// Total trajectory duration $T$ in seconds.
     #[inline]
     pub fn duration(&self) -> f64 {
         *self.grid_t.last().unwrap_or(&0.0)
     }
 
-    /// Samples the time-parameterized trajectory $(q(t), \dot{q}(t), \ddot{q}(t))$ at time `t` in $O(\log N)$ time.
-    pub fn sample(&self, t: f64) -> TrajectorySample {
+    /// Zero-allocation evaluation of $(q(t), \dot{q}(t), \ddot{q}(t))$ into caller-provided slices.
+    ///
+    /// Returns the clamped sample timestamp `t_clamped` inside $[0, T]$.
+    pub fn sample_into(
+        &self,
+        t: f64,
+        out_position: &mut [f64],
+        out_velocity: &mut [f64],
+        out_acceleration: &mut [f64],
+    ) -> f64 {
         let dof = self.path.dof();
-        let mut position = vec![0.0; dof];
-        let mut velocity = vec![0.0; dof];
-        let mut acceleration = vec![0.0; dof];
-        let jerk = vec![0.0; dof];
+        debug_assert!(out_position.len() >= dof);
+        debug_assert!(out_velocity.len() >= dof);
+        debug_assert!(out_acceleration.len() >= dof);
 
         let total_t = self.duration();
         if total_t <= 1e-12 || self.grid_t.len() <= 1 {
-            let mut qs = vec![0.0; dof];
-            let mut qss = vec![0.0; dof];
-            self.path
-                .evaluate_derivatives(0.0, &mut position, &mut qs, &mut qss);
-            return TrajectorySample {
-                time: 0.0,
-                position,
-                velocity,
-                acceleration,
-                jerk,
-            };
+            self.path.evaluate_derivatives(
+                0.0,
+                &mut out_position[..dof],
+                &mut out_velocity[..dof],
+                &mut out_acceleration[..dof],
+            );
+            out_velocity[..dof].fill(0.0);
+            out_acceleration[..dof].fill(0.0);
+            return 0.0;
         }
 
         let t_clamped = t.clamp(0.0, total_t);
@@ -369,18 +380,34 @@ impl ToppraTrajectory {
             .clamp(0.0, self.path.total_length());
         let sd = (sd0 + sdd * dt).max(0.0);
 
-        let mut qs = vec![0.0; dof];
-        let mut qss = vec![0.0; dof];
-        self.path
-            .evaluate_derivatives(s, &mut position, &mut qs, &mut qss);
+        self.path.evaluate_derivatives(
+            s,
+            &mut out_position[..dof],
+            &mut out_velocity[..dof],
+            &mut out_acceleration[..dof],
+        );
 
         for k in 0..dof {
-            velocity[k] = qs[k] * sd;
-            acceleration[k] = qs[k] * sdd + qss[k] * sd * sd;
+            let qs = out_velocity[k];
+            let qss = out_acceleration[k];
+            out_velocity[k] = qs * sd;
+            out_acceleration[k] = qs * sdd + qss * sd * sd;
         }
 
+        t_clamped
+    }
+
+    /// Samples the time-parameterized trajectory $(q(t), \dot{q}(t), \ddot{q}(t))$ at time `t` in $O(\log N)$ time.
+    pub fn sample(&self, t: f64) -> TrajectorySample {
+        let dof = self.path.dof();
+        let mut position = vec![0.0; dof];
+        let mut velocity = vec![0.0; dof];
+        let mut acceleration = vec![0.0; dof];
+        let jerk = vec![0.0; dof];
+        let time = self.sample_into(t, &mut position, &mut velocity, &mut acceleration);
+
         TrajectorySample {
-            time: t_clamped,
+            time,
             position,
             velocity,
             acceleration,
@@ -494,36 +521,68 @@ impl JerkLimitedTrajectory {
         }
     }
 
+    /// Actuated degrees of freedom along this trajectory.
+    #[inline]
+    pub fn dof(&self) -> usize {
+        self.dof
+    }
+
     /// Synchronized duration $T$ of the trajectory in seconds.
     #[inline]
     pub fn duration(&self) -> f64 {
         self.duration
     }
 
-    /// Evaluates the trajectory state $(q(t), \dot{q}(t), \ddot{q}(t), \dddot{q}(t))$ at time `t` in $O(1)$ time.
-    pub fn sample(&self, t: f64) -> TrajectorySample {
+    /// Zero-allocation evaluation of $(q(t), \dot{q}(t), \ddot{q}(t), \dddot{q}(t))$ into caller-provided slices.
+    ///
+    /// Returns the clamped timestamp `tau` inside $[0, T]$.
+    pub fn sample_into(
+        &self,
+        t: f64,
+        out_position: &mut [f64],
+        out_velocity: &mut [f64],
+        out_acceleration: &mut [f64],
+        out_jerk: &mut [f64],
+    ) -> f64 {
+        debug_assert!(out_position.len() >= self.dof);
+        debug_assert!(out_velocity.len() >= self.dof);
+        debug_assert!(out_acceleration.len() >= self.dof);
+        debug_assert!(out_jerk.len() >= self.dof);
+
         let tau = t.clamp(0.0, self.duration);
         let tau2 = tau * tau;
         let tau3 = tau2 * tau;
         let tau4 = tau3 * tau;
         let tau5 = tau4 * tau;
 
+        for k in 0..self.dof {
+            let [c0, c1, c2, c3, c4, c5] = self.coeffs[k];
+            out_position[k] = c0 + c1 * tau + c2 * tau2 + c3 * tau3 + c4 * tau4 + c5 * tau5;
+            out_velocity[k] =
+                c1 + 2.0 * c2 * tau + 3.0 * c3 * tau2 + 4.0 * c4 * tau3 + 5.0 * c5 * tau4;
+            out_acceleration[k] = 2.0 * c2 + 6.0 * c3 * tau + 12.0 * c4 * tau2 + 20.0 * c5 * tau3;
+            out_jerk[k] = 6.0 * c3 + 24.0 * c4 * tau + 60.0 * c5 * tau2;
+        }
+
+        tau
+    }
+
+    /// Evaluates the trajectory state $(q(t), \dot{q}(t), \ddot{q}(t), \dddot{q}(t))$ at time `t` in $O(1)$ time.
+    pub fn sample(&self, t: f64) -> TrajectorySample {
         let mut position = vec![0.0; self.dof];
         let mut velocity = vec![0.0; self.dof];
         let mut acceleration = vec![0.0; self.dof];
         let mut jerk = vec![0.0; self.dof];
-
-        for k in 0..self.dof {
-            let [c0, c1, c2, c3, c4, c5] = self.coeffs[k];
-            position[k] = c0 + c1 * tau + c2 * tau2 + c3 * tau3 + c4 * tau4 + c5 * tau5;
-            velocity[k] =
-                c1 + 2.0 * c2 * tau + 3.0 * c3 * tau2 + 4.0 * c4 * tau3 + 5.0 * c5 * tau4;
-            acceleration[k] = 2.0 * c2 + 6.0 * c3 * tau + 12.0 * c4 * tau2 + 20.0 * c5 * tau3;
-            jerk[k] = 6.0 * c3 + 24.0 * c4 * tau + 60.0 * c5 * tau2;
-        }
+        let time = self.sample_into(
+            t,
+            &mut position,
+            &mut velocity,
+            &mut acceleration,
+            &mut jerk,
+        );
 
         TrajectorySample {
-            time: tau,
+            time,
             position,
             velocity,
             acceleration,

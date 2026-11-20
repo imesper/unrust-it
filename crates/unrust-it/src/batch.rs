@@ -2112,6 +2112,147 @@ impl GpuRobotContext {
     }
 }
 
+/// [`BatchRolloutBackend`] wrapper around a persistent [`GpuRobotContext`] so
+/// [`BatchIkSolver`] and [`BatchMppiOptimizer`] reuse GPU storage buffers across all iterations.
+///
+/// Rollout batches larger than [`GpuRobotContext::max_batch_size`] are automatically chunked.
+/// If a rollout is invoked with a differently sized [`FlatRobotModelF32`], evaluation falls back
+/// seamlessly to the underlying [`WgpuBatchBackend`].
+#[cfg(feature = "gpu")]
+pub struct ResidentGpuBatchBackend {
+    backend: std::sync::Arc<WgpuBatchBackend>,
+    context: std::sync::Mutex<GpuRobotContext>,
+}
+
+#[cfg(feature = "gpu")]
+impl ResidentGpuBatchBackend {
+    /// Allocates resident GPU buffers once for `model` and optional `esdf` up to `max_batch_size`.
+    pub fn new(
+        backend: std::sync::Arc<WgpuBatchBackend>,
+        model: FlatRobotModelF32,
+        esdf: Option<EsdfGridF32>,
+        max_batch_size: usize,
+    ) -> Self {
+        let context = GpuRobotContext::new(&backend, model, esdf, max_batch_size);
+        Self {
+            backend,
+            context: std::sync::Mutex::new(context),
+        }
+    }
+
+    /// Wraps an already-allocated [`GpuRobotContext`] into a reusable [`BatchRolloutBackend`].
+    pub fn from_context(
+        backend: std::sync::Arc<WgpuBatchBackend>,
+        context: GpuRobotContext,
+    ) -> Self {
+        Self {
+            backend,
+            context: std::sync::Mutex::new(context),
+        }
+    }
+
+    /// Replaces the resident ESDF voxel grid without re-uploading robot kinematics or spheres.
+    pub fn update_esdf(&self, esdf: EsdfGridF32) {
+        let mut ctx = self.context.lock().expect("resident GPU context mutex");
+        ctx.update_esdf(&self.backend, esdf);
+    }
+
+    /// Returns a reference to the shared [`WgpuBatchBackend`].
+    pub fn backend(&self) -> &WgpuBatchBackend {
+        &self.backend
+    }
+
+    /// Maximum batch size per GPU dispatch configured on the inner [`GpuRobotContext`].
+    pub fn max_batch_size(&self) -> usize {
+        self.context
+            .lock()
+            .expect("resident GPU context mutex")
+            .max_batch_size()
+    }
+
+    fn is_compatible(ctx: &GpuRobotContext, model: &FlatRobotModelF32) -> bool {
+        let m = ctx.model();
+        m.dof == model.dof
+            && m.num_links == model.num_links
+            && m.spheres.len() == model.spheres.len()
+            && m.end_effectors.len() == model.end_effectors.len()
+            && m.active_self_pairs.len() == model.active_self_pairs.len()
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl BatchRolloutBackend for ResidentGpuBatchBackend {
+    fn forward_kinematics_batch_f32(
+        &self,
+        model: &FlatRobotModelF32,
+        q_batch: &[f32],
+        out_world_spheres: &mut [[f32; 4]],
+        out_ee_poses: &mut [[f32; 7]],
+    ) {
+        let ctx = self.context.lock().expect("resident GPU context mutex");
+        if !Self::is_compatible(&ctx, model) || model.dof == 0 {
+            drop(ctx);
+            self.backend
+                .forward_kinematics_batch_f32(model, q_batch, out_world_spheres, out_ee_poses);
+            return;
+        }
+        let chunk_b = ctx.max_batch_size().max(1);
+        let n_batches = q_batch.len() / model.dof;
+        for b_start in (0..n_batches).step_by(chunk_b) {
+            let b_end = (b_start + chunk_b).min(n_batches);
+            let count = b_end - b_start;
+            let q_slice = &q_batch[b_start * model.dof..b_end * model.dof];
+            let sph_slice = if model.spheres.is_empty() {
+                &mut [][..]
+            } else {
+                &mut out_world_spheres[b_start * model.spheres.len()..b_start * model.spheres.len() + count * model.spheres.len()]
+            };
+            let ee_slice = if model.end_effectors.is_empty() {
+                &mut [][..]
+            } else {
+                &mut out_ee_poses[b_start * model.end_effectors.len()..b_start * model.end_effectors.len() + count * model.end_effectors.len()]
+            };
+            ctx.forward_kinematics_resident(&self.backend, q_slice, sph_slice, ee_slice);
+        }
+    }
+
+    fn collision_cost_batch_f32(
+        &self,
+        model: &FlatRobotModelF32,
+        esdf: Option<&EsdfGridF32>,
+        q_batch: &[f32],
+        activation_distance: f32,
+        out_costs: &mut [f32],
+    ) {
+        let ctx = self.context.lock().expect("resident GPU context mutex");
+        if !Self::is_compatible(&ctx, model)
+            || model.dof == 0
+            || esdf.is_some() != ctx.esdf().is_some()
+        {
+            drop(ctx);
+            self.backend.collision_cost_batch_f32(
+                model,
+                esdf,
+                q_batch,
+                activation_distance,
+                out_costs,
+            );
+            return;
+        }
+        let chunk_b = ctx.max_batch_size().max(1);
+        let n_batches = q_batch.len() / model.dof;
+        for b_start in (0..n_batches).step_by(chunk_b) {
+            let b_end = (b_start + chunk_b).min(n_batches);
+            ctx.collision_cost_resident(
+                &self.backend,
+                &q_batch[b_start * model.dof..b_end * model.dof],
+                activation_distance,
+                &mut out_costs[b_start..b_end],
+            );
+        }
+    }
+}
+
 /// Multi-seed collision-free inverse kinematics solver.
 ///
 /// Evaluates `num_seeds` initial joint seeds in parallel, scores all converged IK
@@ -2163,8 +2304,27 @@ impl BatchIkSolver {
         env: &CollisionEnvironment,
         esdf: Option<&EsdfGridF32>,
         q_seed: &[f64],
-        targets: &[ crate::robot::TaskPose ],
-    ) -> Result< crate::robot::Configuration, crate::kinematics::KinematicsError > {
+        targets: &[crate::robot::TaskPose],
+    ) -> Result<crate::robot::Configuration, crate::kinematics::KinematicsError> {
+        self.solve_collision_free_masked(
+            backend, model, flat_model, env, esdf, q_seed, None, targets,
+        )
+    }
+
+    /// Masked subgroup variant of [`Self::solve_collision_free`], keeping inactive DOFs
+    /// (`active_dofs == Some(mask)` with `!mask[d]`) pinned to `q_seed[d]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn solve_collision_free_masked<B: BatchRolloutBackend>(
+        &self,
+        backend: &B,
+        model: &MultiRobotModel,
+        flat_model: &FlatRobotModelF32,
+        env: &CollisionEnvironment,
+        esdf: Option<&EsdfGridF32>,
+        q_seed: &[f64],
+        active_dofs: Option<&[bool]>,
+        targets: &[crate::robot::TaskPose],
+    ) -> Result<crate::robot::Configuration, crate::kinematics::KinematicsError> {
         let dof = model.dof();
         if q_seed.len() != dof {
             return Err(crate::kinematics::KinematicsError::InvalidConfiguration(
@@ -2174,6 +2334,17 @@ impl BatchIkSolver {
                 },
             ));
         }
+        if let Some(mask) = active_dofs {
+            if mask.len() != dof {
+                return Err(crate::kinematics::KinematicsError::InvalidConfiguration(
+                    crate::robot::RobotError::WrongDof {
+                        expected: dof,
+                        actual: mask.len(),
+                    },
+                ));
+            }
+        }
+        let is_active = |d: usize| active_dofs.is_none_or(|m| m[d]);
 
         let limits = model.dof_limits();
         let num_seeds = self.num_seeds.max(1);
@@ -2184,8 +2355,11 @@ impl BatchIkSolver {
                 if s == 0 {
                     q_seed.to_vec()
                 } else {
-                    let mut q = vec![0.0; dof];
+                    let mut q = q_seed.to_vec();
                     for d in 0..dof {
+                        if !is_active(d) {
+                            continue;
+                        }
                         // Golden-ratio Kronecker sequence for low-discrepancy coverage
                         let golden = 0.5 * (1.0 + 5.0_f64.sqrt());
                         let phi = golden * ((d + 1) as f64 * 0.754_877_666_246_692_7);
@@ -2207,9 +2381,10 @@ impl BatchIkSolver {
             .filter_map(|seed| {
                 let mut buf = model.create_transform_buffer();
                 model
-                    .solve_ik_dls(
+                    .solve_ik_dls_masked(
                         targets,
                         &seed,
+                        active_dofs,
                         self.max_iterations,
                         self.tolerance,
                         self.damping,
@@ -2362,7 +2537,23 @@ impl BatchMppiOptimizer {
         start: &[f64],
         goal: &[f64],
     ) -> Vec<crate::robot::Configuration> {
-        self.optimize_with_trace(backend, model, flat_model, esdf, start, goal)
+        self.optimize_with_trace_masked(backend, model, flat_model, esdf, start, goal, None)
+            .nominal
+    }
+
+    /// Masked subgroup variant of [`Self::optimize`], keeping inactive DOFs (`!mask[d]`) pinned to `start[d]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn optimize_masked<B: BatchRolloutBackend>(
+        &self,
+        backend: &B,
+        model: &MultiRobotModel,
+        flat_model: &FlatRobotModelF32,
+        esdf: Option<&EsdfGridF32>,
+        start: &[f64],
+        goal: &[f64],
+        active_dofs: Option<&[bool]>,
+    ) -> Vec<crate::robot::Configuration> {
+        self.optimize_with_trace_masked(backend, model, flat_model, esdf, start, goal, active_dofs)
             .nominal
     }
 
@@ -2377,9 +2568,28 @@ impl BatchMppiOptimizer {
         start: &[f64],
         goal: &[f64],
     ) -> MppiOptimizationTrace {
+        self.optimize_with_trace_masked(backend, model, flat_model, esdf, start, goal, None)
+    }
+
+    /// Masked subgroup variant of [`Self::optimize_with_trace`], holding `!mask[d]` fixed at `start[d]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn optimize_with_trace_masked<B: BatchRolloutBackend>(
+        &self,
+        backend: &B,
+        model: &MultiRobotModel,
+        flat_model: &FlatRobotModelF32,
+        esdf: Option<&EsdfGridF32>,
+        start: &[f64],
+        goal: &[f64],
+        active_dofs: Option<&[bool]>,
+    ) -> MppiOptimizationTrace {
         let dof = model.dof();
         assert_eq!(start.len(), dof, "start configuration must match model DOF");
         assert_eq!(goal.len(), dof, "goal configuration must match model DOF");
+        if let Some(mask) = active_dofs {
+            assert_eq!(mask.len(), dof, "active_dofs mask must match model DOF");
+        }
+        let is_active = |d: usize| active_dofs.is_none_or(|m| m[d]);
 
         let h = self.config.horizon.max(3);
         let b_count = self.config.num_rollouts.max(2);
@@ -2390,7 +2600,11 @@ impl BatchMppiOptimizer {
         for t in 0..h {
             let alpha = (t as f64) / ((h - 1) as f64);
             for d in 0..dof {
-                nominal[t * dof + d] = (1.0 - alpha) * start[d] + alpha * goal[d];
+                nominal[t * dof + d] = if is_active(d) {
+                    (1.0 - alpha) * start[d] + alpha * goal[d]
+                } else {
+                    start[d]
+                };
             }
         }
 
@@ -2431,6 +2645,12 @@ impl BatchMppiOptimizer {
                 let base_idx = b * h * dof;
                 // Sample 3 smooth Fourier modes per joint so perturbations are naturally C^2 smooth
                 for d in 0..dof {
+                    if !is_active(d) {
+                        for t in 0..h {
+                            rollout_q[base_idx + t * dof + d] = start[d];
+                        }
+                        continue;
+                    }
                     let c1 = next_gaussian() * sigma;
                     let c2 = next_gaussian() * (0.5 * sigma);
                     let c3 = next_gaussian() * (0.25 * sigma);
@@ -2521,10 +2741,14 @@ impl BatchMppiOptimizer {
                 }
             }
 
-            // Update nominal interior waypoints
+            // Update nominal interior waypoints (keeping inactive DOFs exact `start[d]`)
             let step = self.config.step_size.clamp(0.05, 1.0);
             for t in 1..(h - 1) {
                 for d in 0..dof {
+                    if !is_active(d) {
+                        nominal[t * dof + d] = start[d];
+                        continue;
+                    }
                     let mut weighted_q = 0.0_f64;
                     for (b, &w) in weights.iter().enumerate() {
                         weighted_q += w * rollout_q[(b * h + t) * dof + d];
