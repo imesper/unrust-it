@@ -1,0 +1,402 @@
+//! Right Dock: Plan & CBF parameters, Targets & IK Preview, Live Joint Jogging, and pinned Execution Footer.
+
+use crate::gui::panels::scene_panel::labeled_slider;
+use crate::gui::panels::{
+    rgba_to_color32, section_card, ACCENT_STAGE2, BG_CANVAS, BG_SURFACE, BORDER_SUBTLE,
+    STATUS_SAFE, TEXT_MUTED, TEXT_PRIMARY,
+};
+use crate::gui::state::{PlannerTab, SolverStatus, StudioState};
+use crate::scene::{ArmTargetSpec, DirtyFlags, PlannerSpec};
+
+pub fn show(ui: &mut egui::Ui, state: &mut StudioState) {
+    ui.horizontal(|ui| {
+        if ui
+            .selectable_label(state.planner_tab == PlannerTab::PlanCbf, "Plan & CBF")
+            .clicked()
+        {
+            state.planner_tab = PlannerTab::PlanCbf;
+        }
+        if ui
+            .selectable_label(state.planner_tab == PlannerTab::TargetsIk, "Targets & IK")
+            .clicked()
+        {
+            state.planner_tab = PlannerTab::TargetsIk;
+        }
+        if ui
+            .selectable_label(state.planner_tab == PlannerTab::JointsJog, "Joints / Jog")
+            .clicked()
+        {
+            state.planner_tab = PlannerTab::JointsJog;
+        }
+    });
+    ui.separator();
+
+    let footer_h = 154.0;
+    let body_h = (ui.available_height() - footer_h - 6.0).max(80.0);
+
+    egui::ScrollArea::vertical()
+        .max_height(body_h)
+        .auto_shrink([false, false])
+        .show(ui, |ui| match state.planner_tab {
+            PlannerTab::PlanCbf => show_plan_cbf_tab(ui, state),
+            PlannerTab::TargetsIk => show_targets_ik_tab(ui, state),
+            PlannerTab::JointsJog => show_joints_jog_tab(ui, state),
+        });
+
+    ui.add_space(6.0);
+    show_execution_footer(ui, state);
+}
+
+fn show_plan_cbf_tab(ui: &mut egui::Ui, state: &mut StudioState) {
+    let mut prio_changed = false;
+    section_card(ui, "ARM PRIORITY WEIGHTS (QP-CBF)", |ui| {
+        for arm in &mut state.spec.arms {
+            let mut p = arm.priority as f32;
+            if labeled_slider(ui, &arm.label, &mut p, 0.2..=6.0, 0.1, "x") {
+                arm.priority = p as f64;
+                prio_changed = true;
+            }
+        }
+    });
+    if prio_changed {
+        state.schedule_debounced(DirtyFlags::PLAN);
+    }
+
+    ui.add_space(6.0);
+
+    let mut cbf_changed = false;
+    let mut margin_mm = (state.spec.rules.default_body_margin * 1000.0) as f32;
+    let mut act_mm = (state.spec.rules.default_body_activation * 1000.0) as f32;
+    let (mut gamma, mut curl, has_servo) = match &state.spec.planner {
+        PlannerSpec::TwoStageProximity { servo, .. }
+        | PlannerSpec::ThreeArmCrossing { servo, .. }
+        | PlannerSpec::ClosedChainCbfServo { servo, .. } => {
+            (servo.cbf_gamma as f32, servo.tangential_curl_gain as f32, true)
+        }
+        _ => (8.0, 0.35, false),
+    };
+
+    section_card(ui, "CBF & DEADLOCK AVOIDANCE", |ui| {
+        cbf_changed |=
+            labeled_slider(ui, "Default Body Margin", &mut margin_mm, 5.0..=100.0, 1.0, " mm");
+        cbf_changed |=
+            labeled_slider(ui, "CBF Activation Dist", &mut act_mm, 30.0..=350.0, 5.0, " mm");
+        if has_servo {
+            cbf_changed |=
+                labeled_slider(ui, "CBF Decay (gamma)", &mut gamma, 1.0..=20.0, 0.5, " 1/s");
+            cbf_changed |=
+                labeled_slider(ui, "Tangential Curl Gain", &mut curl, 0.0..=1.5, 0.05, "");
+        }
+    });
+    if cbf_changed {
+        state.spec.rules.default_body_margin = (margin_mm as f64) * 0.001;
+        state.spec.rules.default_body_activation = (act_mm as f64) * 0.001;
+        match &mut state.spec.planner {
+            PlannerSpec::TwoStageProximity { servo, .. }
+            | PlannerSpec::ThreeArmCrossing { servo, .. }
+            | PlannerSpec::ClosedChainCbfServo { servo, .. } => {
+                servo.safety_margin = (margin_mm as f64) * 0.001;
+                servo.cbf_activation_distance = (act_mm as f64) * 0.001;
+                servo.cbf_gamma = gamma as f64;
+                servo.tangential_curl_gain = curl as f64;
+            }
+            _ => {}
+        }
+        state.schedule_debounced(DirtyFlags::RULES);
+    }
+
+    if let PlannerSpec::TwoStageProximity { mppi, .. } | PlannerSpec::BatchMppiEsdf { mppi, .. } =
+        &mut state.spec.planner
+    {
+        ui.add_space(6.0);
+        let mut mppi_changed = false;
+        let mut b = mppi.num_rollouts as f32;
+        let mut h = mppi.horizon as f32;
+        let mut it = mppi.num_iterations as f32;
+        section_card(ui, "BATCHED MPPI PARAMETERS", |ui| {
+            mppi_changed |= labeled_slider(ui, "Rollouts (B)", &mut b, 16.0..=128.0, 8.0, "");
+            mppi_changed |= labeled_slider(ui, "Horizon (H)", &mut h, 8.0..=40.0, 2.0, "");
+            mppi_changed |= labeled_slider(ui, "Iterations", &mut it, 5.0..=60.0, 5.0, "");
+        });
+        if mppi_changed {
+            mppi.num_rollouts = (b.round() as usize).max(8);
+            mppi.horizon = (h.round() as usize).max(4);
+            mppi.num_iterations = (it.round() as usize).max(1);
+            state.schedule_debounced(DirtyFlags::PLAN);
+        }
+    }
+}
+
+fn show_targets_ik_tab(ui: &mut egui::Ui, state: &mut StudioState) {
+    let target_indices: Vec<usize> = state
+        .spec
+        .arms
+        .iter()
+        .enumerate()
+        .filter_map(|(i, a)| {
+            matches!(
+                a.target,
+                ArmTargetSpec::ApproachPose { .. } | ArmTargetSpec::DirectPose(_)
+            )
+            .then_some(i)
+        })
+        .collect();
+
+    if !target_indices.is_empty() && !target_indices.contains(&state.selected_target_arm) {
+        state.selected_target_arm = target_indices[0];
+    }
+
+    let mut copy_arm_idx: Option<usize> = None;
+    let mut solve_ik_clicked = false;
+    let mut pose_edited: Option<(usize, [f64; 3], [f64; 3], f64)> = None;
+
+    section_card(
+        ui,
+        &format!("ARM TCP TARGETS ({})", target_indices.len()),
+        |ui| {
+            if target_indices.is_empty() {
+                ui.label(
+                    egui::RichText::new(
+                        "This scenario uses direct joint goals or closed-chain constraints.",
+                    )
+                    .size(10.5)
+                    .color(TEXT_MUTED),
+                );
+                return;
+            }
+
+            ui.horizontal_wrapped(|ui| {
+                for &r_idx in &target_indices {
+                    if ui
+                        .selectable_label(
+                            state.selected_target_arm == r_idx,
+                            &state.spec.arms[r_idx].label,
+                        )
+                        .clicked()
+                    {
+                        state.selected_target_arm = r_idx;
+                    }
+                }
+            });
+
+            let sel = state.selected_target_arm;
+            if let (Some(arm_s), Some(arm_c)) =
+                (state.spec.arms.get(sel), state.workcell.arms.get(sel))
+            {
+                let tcp_name = state
+                    .workcell
+                    .model
+                    .frame_graph()
+                    .node(arm_c.tcp_frame)
+                    .map_or("tcp", |n| n.name.as_str());
+                ui.label(
+                    egui::RichText::new(format!("Target TCP: {tcp_name}"))
+                        .size(11.0)
+                        .strong()
+                        .color(rgba_to_color32(arm_s.color_rgba)),
+                );
+
+                let (pose, mut standoff_mm) = match &arm_s.target {
+                    ArmTargetSpec::ApproachPose {
+                        final_pose,
+                        standoff_local,
+                    } => (*final_pose, (standoff_local[2].abs() * 1000.0) as f32),
+                    ArmTargetSpec::DirectPose(p) => (*p, 0.0),
+                    _ => return,
+                };
+                let mut x = pose.xyz[0] as f32;
+                let mut y = pose.xyz[1] as f32;
+                let mut z = pose.xyz[2] as f32;
+                let mut r_deg = pose.rpy[0].to_degrees() as f32;
+                let mut p_deg = pose.rpy[1].to_degrees() as f32;
+                let mut y_deg = pose.rpy[2].to_degrees() as f32;
+
+                let mut chg = false;
+                chg |= labeled_slider(ui, "Target X", &mut x, -0.9..=0.9, 0.01, " m");
+                chg |= labeled_slider(ui, "Target Y", &mut y, -0.9..=0.9, 0.01, " m");
+                chg |= labeled_slider(ui, "Target Z", &mut z, 0.05..=1.25, 0.01, " m");
+                chg |= labeled_slider(ui, "Roll", &mut r_deg, -180.0..=180.0, 1.0, " deg");
+                chg |= labeled_slider(ui, "Pitch", &mut p_deg, -180.0..=180.0, 1.0, " deg");
+                chg |= labeled_slider(ui, "Yaw", &mut y_deg, -180.0..=180.0, 1.0, " deg");
+                chg |= labeled_slider(ui, "Standoff", &mut standoff_mm, 0.0..=200.0, 2.0, " mm");
+
+                if chg {
+                    pose_edited = Some((
+                        sel,
+                        [x as f64, y as f64, z as f64],
+                        [
+                            (r_deg as f64).to_radians(),
+                            (p_deg as f64).to_radians(),
+                            (y_deg as f64).to_radians(),
+                        ],
+                        standoff_mm as f64,
+                    ));
+                }
+
+                if ui.button("Copy Current TCP Pose -> Target").clicked() {
+                    copy_arm_idx = Some(sel);
+                }
+            }
+
+            ui.add_space(4.0);
+            if ui.button("Solve IK Preview (Batch 32 Seeds)").clicked() {
+                solve_ik_clicked = true;
+            }
+        },
+    );
+
+    if let Some((sel, xyz, rpy, standoff_mm)) = pose_edited {
+        if let Some(arm) = state.spec.arms.get_mut(sel) {
+            let new_pose = crate::scene::PoseSpec { xyz, rpy };
+            match &mut arm.target {
+                ArmTargetSpec::ApproachPose {
+                    final_pose,
+                    standoff_local,
+                } => {
+                    *final_pose = new_pose;
+                    standoff_local[2] = -standoff_mm.max(0.0) * 0.001;
+                }
+                ArmTargetSpec::DirectPose(p) => {
+                    if standoff_mm > 0.5 {
+                        arm.target = ArmTargetSpec::ApproachPose {
+                            final_pose: new_pose,
+                            standoff_local: [0.0, 0.0, -standoff_mm * 0.001],
+                        };
+                    } else {
+                        *p = new_pose;
+                    }
+                }
+                _ => {}
+            }
+        }
+        state.refresh_pose_and_scene();
+        state.schedule_debounced(DirtyFlags::PLAN);
+    } else if let Some(idx) = copy_arm_idx {
+        state.copy_current_tcp_to_target(idx);
+    } else if solve_ik_clicked {
+        state.preview_ik_targets();
+    }
+}
+
+fn show_joints_jog_tab(ui: &mut egui::Ui, state: &mut StudioState) {
+    ui.checkbox(&mut state.live_jog_mode, "Live FK & Convex Witness Mode");
+    ui.separator();
+
+    let limits = state.workcell.model.dof_limits();
+    let mut jogged = false;
+    for arm in &state.workcell.arms {
+        ui.label(
+            egui::RichText::new(&arm.label)
+                .size(10.5)
+                .strong()
+                .color(rgba_to_color32(arm.color_rgba)),
+        );
+        for (local_i, global_q) in arm.q_range.clone().enumerate() {
+            if global_q >= state.current_q.len() || global_q >= limits.len() {
+                continue;
+            }
+            let name = arm
+                .joint_names
+                .get(local_i)
+                .map_or("q", String::as_str);
+            let lim = limits[global_q];
+            let lo = lim.position.min.max(-std::f64::consts::TAU) as f32;
+            let hi = lim.position.max.min(std::f64::consts::TAU) as f32;
+            let mut val = state.current_q[global_q] as f32;
+            if labeled_slider(ui, name, &mut val, lo..=hi, 0.02, " rad") {
+                state.current_q[global_q] = val as f64;
+                state.playing = false;
+                jogged = true;
+            }
+        }
+    }
+    if jogged {
+        state.refresh_pose_and_scene();
+    }
+}
+
+fn show_execution_footer(ui: &mut egui::Ui, state: &mut StudioState) {
+    let running = matches!(state.solver_status, SolverStatus::Running);
+    egui::Frame::new()
+        .fill(BG_SURFACE)
+        .stroke(egui::Stroke::new(1.0, BORDER_SUBTLE))
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::same(8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let run_lbl = if running {
+                    "Planning..."
+                } else {
+                    "▶ Plan / Re-run"
+                };
+                if ui.button(run_lbl).clicked() {
+                    state.dispatch_compile_and_plan(DirtyFlags::RULES);
+                }
+                if running && ui.button("Stop").clicked() {
+                    state.cancel_plan();
+                }
+            });
+
+            let bar_val = if running {
+                state.solver_progress.clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            ui.add(egui::ProgressBar::new(bar_val).desired_height(6.0));
+            ui.label(
+                egui::RichText::new(&state.solver_message)
+                    .size(10.0)
+                    .color(TEXT_MUTED),
+            );
+
+            let (solve_txt, err_txt, body_txt, tool_txt) = if let Some(traj) = &state.trajectory {
+                (
+                    format!("{:.1} ms", traj.metrics.solve_time_ms),
+                    format!("{:.2} mm", traj.metrics.max_pos_error_mm),
+                    format!("{:.1} mm", traj.metrics.min_clearance_mm),
+                    traj.metrics
+                        .min_tool_clearance_mm
+                        .map_or_else(|| "--".to_string(), |v| format!("{v:.1} mm")),
+                )
+            } else {
+                (
+                    "--".to_string(),
+                    "--".to_string(),
+                    "--".to_string(),
+                    "--".to_string(),
+                )
+            };
+
+            ui.columns(2, |cols| {
+                metric_tile(&mut cols[0], "SOLVE", &solve_txt, TEXT_PRIMARY);
+                metric_tile(&mut cols[1], "POSE ERR", &err_txt, TEXT_PRIMARY);
+            });
+            ui.columns(2, |cols| {
+                metric_tile(&mut cols[0], "BODY CLR", &body_txt, STATUS_SAFE);
+                metric_tile(&mut cols[1], "TOOL CLR", &tool_txt, ACCENT_STAGE2);
+            });
+        });
+}
+
+fn metric_tile(ui: &mut egui::Ui, label: &str, value: &str, val_col: egui::Color32) {
+    egui::Frame::new()
+        .fill(BG_CANVAS)
+        .corner_radius(egui::CornerRadius::same(4))
+        .inner_margin(egui::Margin::symmetric(6, 4))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(
+                egui::RichText::new(label)
+                    .size(8.0)
+                    .strong()
+                    .color(TEXT_MUTED),
+            );
+            ui.label(
+                egui::RichText::new(value)
+                    .size(10.5)
+                    .strong()
+                    .color(val_col),
+            );
+        });
+}

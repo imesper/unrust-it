@@ -1,4 +1,4 @@
-//! Pure-`wgpu 30` 3D viewport renderer for `unrust-it` (zero Slint/windowing dependencies).
+//! Pure-`wgpu 30` 3D viewport renderer for `unrust-it` (zero GUI/windowing dependencies).
 
 pub mod camera;
 pub mod extract;

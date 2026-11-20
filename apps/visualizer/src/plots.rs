@@ -2,7 +2,7 @@
 
 use crate::scene::{BuiltWorkcell, PlaybackTrajectory};
 
-/// Rasterized RGBA8 plot image ready to upload into Slint `Image::from_rgba8(...)`.
+/// Rasterized RGBA8 plot image for headless/offscreen inspection.
 #[derive(Debug, Clone)]
 pub struct PlotImage {
     pub width: u32,

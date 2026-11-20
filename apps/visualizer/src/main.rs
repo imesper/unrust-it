@@ -1,7 +1,7 @@
 //! Entry point for the `unrust-it` 3D multi-arm desktop studio and headless CLI exporter.
 //!
 //! Usage:
-//! - `cargo run -p unrust-it-visualizer` (launches native Slint + wgpu 3D Desktop Studio)
+//! - `cargo run -p unrust-it-visualizer` (launches native egui/eframe + wgpu 3D Desktop Studio)
 //! - `cargo run -p unrust-it-visualizer -- --export-html visualizer.html`
 //! - `cargo run -p unrust-it-visualizer -- --export-json scenarios.json`
 //! - `cargo run -p unrust-it-visualizer -- --serve 127.0.0.1:8080`
@@ -46,7 +46,7 @@ fn main() {
         }
     }
 
-    // Parse headless export/serve CLI flags FIRST without initializing Slint/windowing.
+    // Parse headless export/serve CLI flags FIRST without initializing eframe/windowing.
     if export_html_path.is_some() || export_json_path.is_some() || serve_addr.is_some() {
         let scenarios = generate_scenarios();
         if let Some(path) = export_html_path {
@@ -84,7 +84,7 @@ fn main() {
         return;
     }
 
-    #[cfg(any(feature = "gui", feature = "gui-readback"))]
+    #[cfg(feature = "gui")]
     {
         if let Err(err) = unrust_it_visualizer::gui::run_gui() {
             eprintln!("unrust-it Studio failed to start: {err}");
@@ -92,7 +92,7 @@ fn main() {
         }
     }
 
-    #[cfg(not(any(feature = "gui", feature = "gui-readback")))]
+    #[cfg(not(feature = "gui"))]
     {
         let scenarios = generate_scenarios();
         println!(

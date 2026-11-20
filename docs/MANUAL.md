@@ -22,9 +22,8 @@ parry3d = { package = "parry3d-f64", version = "0.26" }
 | :--- | :--- | :---: | :--- |
 | `unrust-it` | `gpu` | Yes | Enables `wgpu` + `pollster` WGSL compute shaders (`WgpuBatchBackend`, `GpuRobotContext`). Disable (`default-features = false`) for pure CPU SIMD (`wide::f32x8` + `rayon`) headless targets. |
 | `unrust-it-urdf` | *(none)* | — | Pure CPU XML URDF/SRDF parser (`roxmltree` + `parry3d-f64`). |
-| `unrust-it-visualizer` | `gui` | Yes | Enables native Slint 1.19 + `winit` + zero-copy `wgpu 30` Desktop Engineering Studio (implies `render`). |
-| `unrust-it-visualizer` | `render` | via `gui` | Pure-`wgpu 30` 3D `SceneRenderer` + `OffscreenViewport` without Slint windowing. |
-| `unrust-it-visualizer` | `gui-readback` | No | Slint UI presenting `OffscreenViewport` RGBA8 readback buffers (useful on headless/software backends without `unstable-wgpu-30`). |
+| `unrust-it-visualizer` | `gui` | Yes | Enables native `eframe` / `egui 0.37` + `egui-wgpu 0.37` + `egui_plot 0.38` + zero-copy `wgpu 30` Desktop Engineering Studio (implies `render`). |
+| `unrust-it-visualizer` | `render` | via `gui` | Pure-`wgpu 30` 3D `SceneRenderer` + `OffscreenViewport` without `eframe`/`egui` windowing. |
 | `unrust-it-visualizer` | `gpu-compute` | No | Uses GPU `WgpuBatchBackend` inside Studio planners instead of `CpuSimdBatchBackend`. |
 
 ---
@@ -175,7 +174,7 @@ For dual-arm cooperative manipulation carrying one rigid object, pass `Some(&Clo
 ### 3.1 Launching GUI & CLI Modes
 
 ```bash
-# Interactive Desktop Engineering Studio (Slint 1.19 + zero-copy wgpu 30)
+# Interactive Desktop Engineering Studio (eframe/egui 0.37 + zero-copy wgpu 30)
 cargo run --release -p unrust-it-visualizer
 
 # Headless CLI exports (zero windowing initialized)
@@ -188,30 +187,30 @@ cargo run -p unrust-it-visualizer -- --serve 127.0.0.1:8080
 
 ### 3.2 Workspace Panels & Controls
 
-- **Top Toolbar (`top_toolbar.slint`)**:
-  - View mode switcher: **`3D Viewport`**, **`ACM Matrix`**, or **`Split (3D | ACM)`**.
-  - Scenario preset loader, Solver status badge (`Idle`, `Running`, `Converged`, `Warning`, `Failed`), active GPU/CPU backend label, and **`Re-Plan Now`** trigger.
-- **Left Dock — Scene & N-Arm Manager (`scene_panel.slint`)**:
+- **Top Toolbar (`top_toolbar.rs`)**:
+  - View mode switcher: **`3D View`**, **`ACM Matrix`**, or **`Split 3D | ACM`**.
+  - Scenario preset loader, URDF import / legacy JSON & HTML export buttons, and active GPU/CPU backend badge.
+- **Left Dock — Scene & N-Arm Manager (`scene_panel.rs`)**:
   - Hierarchical collapsible Scene Tree (`Robots -> Arm -> Links & Tool`, `Obstacles -> Obstacles & Workpieces`).
-  - `+ 6-DOF Arm`, `+ 4-DOF Arm`, `Import URDF` file picker, `+ Sphere Obs`, `+ Workpiece Box`, and `Arrange Ring`.
-  - **Selected Arm / Tool Inspector**: Base X/Y/Z/Yaw sliders, `Face Origin`, Tool Preset switcher (`None`, `ParallelGripper`, `Screwdriver`, `InspectionProbe`), Tool Safety Margin / CBF Activation sliders, and **`TOUCH LINKS (SELF-EXEMPT)`** switches per link.
+  - `+ 6-DOF Arm`, `+ 4-DOF Arm`, `+ Sphere Obs`, `+ Workpiece Box`, and `Arrange Arms on Ring`.
+  - **Selected Arm / Tool Inspector**: Base X/Y/Yaw sliders, `Face Origin`, Tool Preset switcher (`None`, `Parallel Gripper`, `Precision Screwdriver`, `Inspection Probe`), Tool Safety Margin / CBF Activation sliders, and **`TOUCH LINKS (SELF-EXEMPT)`** checkboxes per link.
   - **Selected Obstacle Inspector** *(appears when an obstacle/workpiece is selected via Tree or 3D Pick)*: toggle `Workpiece Role (WP)`, `Carve Into ESDF Grid`, Pos X/Y/Z, Obstacle Margin, CBF Activation, and `Remove Obstacle`.
-- **Center — 3D Viewport (`viewport_panel.slint`)**:
+- **Center — 3D Viewport (`viewport_panel.rs`)**:
   - **Left-drag**: Orbit camera · **Right/Middle/Shift+Left drag**: Pan · **Scroll**: Zoom · **Double-click**: 3D raycast pick (selects clicked link, tool, or obstacle).
-  - Camera preset buttons (`Iso`, `Top`, `Front`, `Side`, `Focus WP`) and **`Layers`** popover (`Links`, `Tools`, `Tier-1 Spheres`, `3D ESDF Slice Heatmap` with `X`/`Y`/`Z` axis + offset + opacity, `MPPI Rollouts & Trails`, `Distance Witnesses` with X-Ray & `Max Witnesses` slider, `TCP / TF Frames`, `Target & Standoff Ghosts`, `Floor Grid`).
-  - Top HUD displays scenario title, live safety pill (`SAFE` / `TIGHT` / `COLLISION`), and live `wgpu 30` frame timing (`ms`).
-- **Center / Split — Frozen-Header ACM Matrix (`acm_matrix_panel.slint`)**:
-  - Slice tabs: `Inter-Arm`, `Self`, `Tool & WP`, `Link-Obs`, `All Filtered`, plus quick bulk buttons (`Inter-Arm 40mm`, `Tool-Tool 4mm`, `Tool-WP 3mm`, `Reset SRDF`).
-  - Live text filter (`Filter links / tools / obstacles...`) and `Active / Custom Only` switch.
+  - Camera preset buttons (`Iso`, `Top`, `Front`, `Side`, `Workpiece`) and **`Layers`** popover (`Arm Links`, `Attached Tools`, `Tier-1 Spheres`, `3D ESDF Slice Heatmap` with `X`/`Y`/`Z` axis + offset + opacity, `MPPI Rollouts & Trails`, `Distance Witnesses` with X-Ray & `Max Witnesses` slider, `TCP / TF Frames`, `Target & Standoff Ghosts`, `Floor Grid`).
+  - Top HUD displays scenario title and live safety pill (`SAFE` / `TIGHT` / `COLLISION`).
+- **Center / Split — Frozen-Header ACM Matrix (`acm_panel.rs`)**:
+  - Slice tabs: `Inter-Arm Body`, `Self-Collision`, `Tools & Workpieces`, `Links x Obstacles`, plus quick bulk buttons (`Body 40mm`, `Tool-Tool 4mm`, `Tool-WP 3mm`, `Reset SRDF`).
+  - Live text filter (`Filter links / tools / obstacles...`) and `Active / Custom Only` checkbox.
   - Synchronized frozen column/row headers with per-cell rule code (`4mm`, `DEF`, `ADJ`, `NEV`, `TCH`, `DYN`) and live distance `d(t)` in mm.
   - **Single-click cell**: inspects pair in the pinned bottom strip AND highlights both bodies + draws a cyan 3D connector rod in Split/3D view. **Double-click cell**: toggles pair Enabled/Disabled.
-  - Bottom Pair Strip allows editing exact `Margin (mm)` and `Act (mm)` values inline via keyboard + `Apply`.
-- **Right Dock — Planner, `Targets & IK`, & `Joints / Jog` (`planner_panel.slint`)**:
-  - **`Plan & CBF`**: Preset selector, arm priority weights, CBF safety margin / activation / $\gamma$ / tangential curl, MPPI rollouts/horizon/iterations, and diagnostics (`Solve Time`, `Pose Error`, `Min Body Clr`, `Min Tool Clr`).
+  - Bottom Pair Strip allows editing exact `Margin` and `Act` values inline via drag/keyboard + `Apply`.
+- **Right Dock — Planner, `Targets & IK`, & `Joints / Jog` (`planner_panel.rs`)**:
+  - **`Plan & CBF`**: Arm priority weights, CBF safety margin / activation / $\gamma$ / tangential curl, MPPI rollouts/horizon/iterations, plus pinned Execution Footer (`▶ Plan / Re-run`, `Stop`, diagnostics `SOLVE`, `POSE ERR`, `BODY CLR`, `TOOL CLR`).
   - **`Targets & IK`**: Per-arm target pose sliders (`X/Y/Z`, `Roll/Pitch/Yaw`, `Standoff`), `Copy Current TCP Pose -> Target`, and **`Solve IK Preview (Batch 32 Seeds)`** (runs `BatchIkSolver` live and updates robot configuration in the viewport).
   - **`Joints / Jog`**: Interactive per-DOF joint sliders for live FK and exact witness inspection.
-- **Bottom Dock — Timeline & Telemetry Plots (`timeline_dock.slint`)**:
-  - Transport controls (`|<`, `<`, `Play/Pause`, `>`, `>|`), speed (`0.1x`–`2.0x`), **`Loop`** toggle, Stage-1/Stage-2 annotated scrubber with near-collision alert ticks, and 4 real-time RGBA8 telemetry plots (`Min Clearance`, `Tool Clearance`, `Pose Error`, `Joint Velocities`).
+- **Bottom Dock — Timeline & Telemetry Plots (`timeline_dock.rs`)**:
+  - Transport controls (`|<`, `<`, `▶/❚❚`, `>`, `>|`), speed (`0.1x`–`2.0x`), **`Loop`** toggle, Stage-1/Stage-2 annotated scrubber with near-collision alert ticks, and 4 interactive `egui_plot 0.38` charts (`Min Clearance`, `Tool-Tool & Workpiece`, `Pose / Grasp Error`, `Per-Arm Max |dq/dt|`) with hover readouts and click-to-scrub.
 
 ### 3.3 Built-In Studio Presets
 
@@ -233,4 +232,4 @@ cargo run -p unrust-it-visualizer -- --serve 127.0.0.1:8080
   - Use `GeometryTier::Convex` during final Stage-2 millimeter convergence and safety verification.
 - **Debug Build vs. Release Build**: `parry3d-f64`, `wide::f32x8`, and BVH traversals run **10–30x faster** with `--release`. Always benchmark and run live Studio sessions in `--release`.
 - **Self-Collision False Positives After Attaching a Tool**: Check that `AttachedPayload::with_touch_links(...)` includes both the flange and nearby wrist links whose bounding volumes touch the mounted adapter bracket.
-- **No GPU Adapter in Headless CI**: Build `unrust-it` with `--no-default-features` or `unrust-it-visualizer` with `--no-default-features --features render` / `gui-readback`.
+- **No GPU Adapter in Headless CI**: Build `unrust-it` with `--no-default-features` or `unrust-it-visualizer` with `--no-default-features --features render`.

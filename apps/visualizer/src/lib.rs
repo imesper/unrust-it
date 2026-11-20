@@ -1,6 +1,6 @@
 //! Multi-arm simulation scenario generator, declarative scene engine, and JSON/HTML exporter for `unrust-it`.
 
-#[cfg(any(feature = "gui", feature = "gui-readback"))]
+#[cfg(feature = "gui")]
 pub mod gui;
 pub mod plots;
 #[cfg(feature = "render")]

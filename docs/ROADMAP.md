@@ -12,7 +12,7 @@ This document tracks all completed engineering phases and commits on `main`, alo
 | **1** | Multi-arm kinematics, bitset ACM, `f64` collision, manifolds, TOPP-RA, 1 kHz CBF servo | **Complete** | `8a29e0e`, `e204ff0` |
 | **2A/2B** | CuRobo-style `f32` SIMD/WGSL batching, `EsdfGridF32`, `GpuRobotContext`, Batch IK & MPPI, URDF/SRDF | **Complete** | `31eae0d`, `fc4197c`, `d728dfd`, `335efd1` |
 | **2C** | Compound tool payloads, per-pair safety margins, priority QP-CBF + curl, Two-Stage planner | **Complete** | `3f475f6` |
-| **2D** | Declarative scene engine, pure-`wgpu 30` 3D renderer, Slint 1.19 Studio UI, interactive inspectors | **Complete** | `556a732`, `9f8067a`, `1eff888`, `dbcf530` |
+| **2D** | Declarative scene engine, pure-`wgpu 30` 3D renderer, `egui 0.37` Studio UI, interactive inspectors | **Complete** | `556a732`, `9f8067a`, `1eff888`, `dbcf530` |
 | **3** | Core 1 kHz zero-alloc polish, `WorldScene`, `unrust-it-io` (TOML/JSON), Dual-Rate Pipeline | **In Progress (3A Complete)** | — |
 | **4** | `unrust-it-perception`: Calibration ingestion, RGB-D/LiDAR/Radar self-filtering, dynamic ESDF + CV-EKF | **Planned** | — |
 | **5** | Mobile manipulators (`nq`/`nv`), CAD mesh ingestion (VHACD), ROS 2 / Zenoh / Python / C ABI | **Planned** | — |
@@ -46,7 +46,8 @@ This document tracks all completed engineering phases and commits on `main`, alo
 - **Milestone 2D-1 (`556a732`)**: Added GUI-free kernel/URDF enablers (`BatchMppiOptimizer::optimize_with_trace`, `EsdfGridF32::carve_collision_environment`, `CollisionEnvironment::set_obstacle_pose`, file loaders & `presets` in `unrust-it-urdf`), plus the declarative `WorkcellSpec -> BuiltWorkcell` compiler and 5 multi-arm presets.
 - **Milestone 2D-2 (`9f8067a`)**: Built the Slint-free pure-`wgpu 30` `SceneRenderer` (`OrbitCamera`, `meshes.rs`, `extract.rs`, `solid.wgsl`, `lines.wgsl`, `esdf_slice.wgsl`) and `OffscreenViewport` headless CI validation across all presets.
 - **Milestone 2D-3 (`1eff888`)**: Built the Slint `~1.19` desktop shell (`ui/main.slint`, `state.slint`, panels, widgets), zero-copy `GraphicsAPI::WGPU30` viewport bridge (plus `gui-readback` fallback), latest-generation coalescing `PlannerWorker`, and 4 RGBA8 telemetry plot views (`plots.rs`).
-- **Milestone 2D-4 (`dbcf530`)**: Completed 3D raycast picking (`pick_entity_along_ray`), ACM & entity 3D pair/rod highlighting (`SceneHighlights`), Obstacle & Tool/Touch-Link inspectors (`custom_tool_touch_link_names`), frozen-header 2D `Flickable` ACM Matrix with search/active filtering & SRDF reset, `Targets & IK` tab with 32-seed `BatchIkSolver` preview, ESDF X/Y/Z axis & opacity controls, Timeline `Loop` toggle, and live `wgpu 30` frame-time telemetry.
+- **Milestone 2D-4 (`dbcf530`)**: Completed 3D raycast picking (`pick_entity_along_ray`), ACM & entity 3D pair/rod highlighting (`SceneHighlights`), Obstacle & Tool/Touch-Link inspectors (`custom_tool_touch_link_names`), frozen-header 2D ACM Matrix with search/active filtering & SRDF reset, `Targets & IK` tab with 32-seed `BatchIkSolver` preview, ESDF X/Y/Z axis & opacity controls, Timeline `Loop` toggle, and live `wgpu 30` frame-time telemetry.
+- **Milestone 2D-5**: Migrated the Studio GUI layer from Slint `~1.19` (`unstable-wgpu-30` + `.slint` DSL) to dual-licensed (`MIT OR Apache-2.0`) **`eframe` / `egui 0.37` + `egui-wgpu 0.37` + interactive `egui_plot 0.38`**, unifying on `wgpu 30` with direct Rust `StudioState` ownership and zero `.slint` codegen.
 
 ---
 
@@ -139,5 +140,4 @@ Every milestone on `main` is verified before committing with the following works
 5. `cargo test --doc --workspace`
 6. When `apps/visualizer` changes:
    - `cargo check -p unrust-it-visualizer --no-default-features --features render`
-   - `cargo check -p unrust-it-visualizer --no-default-features --features gui-readback`
    - `cargo run -p unrust-it-visualizer -- --export-json target/ci_smoke.json --export-html target/ci_smoke.html`

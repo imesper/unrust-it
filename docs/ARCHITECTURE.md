@@ -30,7 +30,7 @@ This document describes the architectural foundations of `unrust-it`, the curren
 ```mermaid
 flowchart TB
     subgraph Apps["Applications & Tools"]
-        Studio["apps/visualizer<br/>Slint 1.19 + zero-copy wgpu 30 Studio<br/>WorkcellSpec / OrbitCamera / Headless CLI"]
+        Studio["apps/visualizer<br/>eframe/egui 0.37 + zero-copy wgpu 30 Studio<br/>WorkcellSpec / OrbitCamera / Headless CLI"]
     end
 
     subgraph IO_Percep["I/O & Perception Crates"]
@@ -93,8 +93,8 @@ flowchart TB
 ### 3.3 Desktop Engineering Studio (`apps/visualizer`)
 
 - **Declarative Scene Compiler (`src/scene/`)**: `WorkcellSpec` compiles deterministically into an immutable `BuiltWorkcell` (`MultiRobotModel`, `CollisionEnvironment`, `FlatRobotModelF32`, `EsdfGridF32`), evaluates planners (`eval.rs`), and provides 5 built-in N-arm presets (`presets.rs`).
-- **Pure-`wgpu 30` 3D Renderer (`src/render/`)**: Slint-free `SceneRenderer` with `OrbitCamera` (with `screen_ray` picking), instanced `TypedShape` extraction (`extract_render_scene_with_highlights`), `solid.wgsl` / `lines.wgsl` / `esdf_slice.wgsl`, and `OffscreenViewport` for headless CI validation.
-- **Native Desktop Shell (`src/gui/` + `ui/`)**: Slint `~1.19` Studio integrating zero-copy `GraphicsAPI::WGPU30` double-buffered `Rgba8Unorm` rendering, background `PlannerWorker` with latest-generation coalescing, 4 RGBA8 telemetry plots (`plots.rs`), 3D raycast picking, frozen-header ACM Matrix with live $d(t)$ and filtering, Obstacle/Tool/Touch-Link inspectors, and `Targets & IK` (32-seed `BatchIkSolver` preview).
+- **Pure-`wgpu 30` 3D Renderer (`src/render/`)**: GUI-free `SceneRenderer` with `OrbitCamera` (with `screen_ray` picking), instanced `TypedShape` extraction (`extract_render_scene_with_highlights`), `solid.wgsl` / `lines.wgsl` / `esdf_slice.wgsl`, and `OffscreenViewport` for headless CI validation.
+- **Native Desktop Shell (`src/gui/`)**: `eframe` / `egui 0.37` + `egui-wgpu 0.37` Studio integrating zero-copy native `Rgba8Unorm` texture presentation (`GpuViewportBridge`), direct-ownership `StudioState`, background `PlannerWorker` with latest-generation coalescing, 4 interactive `egui_plot 0.38` charts (plus pure-Rust RGBA8 charts in `plots.rs`), 3D raycast picking, frozen-header ACM Matrix with live $d(t)$ and filtering, Obstacle/Tool/Touch-Link inspectors, and `Targets & IK` (32-seed `BatchIkSolver` preview).
 - **Headless Exports**: `--export-html`, `--export-json`, and `--serve` run without initializing any GUI or windowing backend (also supported under `--no-default-features`).
 
 ---

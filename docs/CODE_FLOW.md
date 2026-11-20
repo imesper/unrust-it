@@ -44,9 +44,9 @@ This reference maps every file in the workspace and walks through the five prima
 | [`src/render/extract.rs`](../apps/visualizer/src/render/extract.rs) | Extracts instanced `RenderSceneData`, `pick_entity_along_ray`, `SceneHighlights`, and ESDF 2D heatmap slices |
 | [`src/render/camera.rs`](../apps/visualizer/src/render/camera.rs) & [`meshes.rs`](../apps/visualizer/src/render/meshes.rs) | Z-up `OrbitCamera` (`screen_ray` + view/proj) and unit sphere/box/cylinder/capsule/cone/rod meshes |
 | [`src/render/offscreen.rs`](../apps/visualizer/src/render/offscreen.rs) | `OffscreenViewport` rendering `wgpu 30` scenes to RGBA8 buffers for headless CI tests |
-| [`src/gui/viewport_bridge.rs`](../apps/visualizer/src/gui/viewport_bridge.rs) | Slint `GraphicsAPI::WGPU30` double-buffered `Rgba8Unorm` (`Image::try_from`) presentation bridge (+ `gui-readback` fallback) |
-| [`src/gui/controller.rs`](../apps/visualizer/src/gui/controller.rs) | UI-thread `AppController` binding Slint state/callbacks, debounced replanning, ray picking, ACM filtering, and `Targets & IK` preview |
-| [`ui/`](../apps/visualizer/ui/main.slint) | Slint 1.19 declarative panels (`top_toolbar`, `scene_panel`, `viewport_panel`, `acm_matrix_panel`, `planner_panel`, `timeline_dock`) and widgets |
+| [`src/gui/viewport.rs`](../apps/visualizer/src/gui/viewport.rs) | `GpuViewportBridge`: zero-copy `egui-wgpu 0.37` (`Rgba8Unorm` `register_native_texture` / `update_egui_texture_from_wgpu_texture`) presentation bridge |
+| [`src/gui/state.rs`](../apps/visualizer/src/gui/state.rs) | Direct-ownership `StudioState` holding `WorkcellSpec`, `PlannerWorker`, debounced replanning, playback timers, 3D ray picking, ACM filtering, and `Targets & IK` preview |
+| [`src/gui/panels/`](../apps/visualizer/src/gui/panels/mod.rs) & [`src/gui/mod.rs`](../apps/visualizer/src/gui/mod.rs) | `eframe::App` shell (`top_toolbar`, `scene_panel`, `viewport_panel`, `acm_panel`, `planner_panel`, `timeline_dock` with `egui_plot 0.38`) |
 
 ---
 
@@ -141,24 +141,22 @@ flowchart LR
 
 ```mermaid
 sequenceDiagram
-    participant UI as Slint 1.19 UI Thread
-    participant CTRL as AppController
+    participant UI as egui 0.37 UI Panels
+    participant ST as StudioState
     participant WRK as PlannerWorker (BG Thread)
-    participant GPU as SceneRenderer (wgpu 30)
+    participant GPU as GpuViewportBridge (wgpu 30)
 
-    UI->>CTRL: Edit obstacle / tool margin / target / preset
-    CTRL->>CTRL: Mutate WorkcellSpec + Debounce Timer (85 ms)
-    CTRL->>WRK: Submit WorkerCommand (gen = N)
+    UI->>ST: Mutate WorkcellSpec + schedule_debounced(85 ms)
+    ST->>WRK: Submit WorkerCommand (gen = N)
     WRK->>WRK: Coalesce stale gens -> WorkcellSpec::compile() -> run_planner_sync()
-    WRK-->>UI: invoke_from_event_loop -> on_drain_worker_events()
-    CTRL->>CTRL: evaluate_frame_snapshot() + build_scene_highlights() -> extract_render_scene_with_highlights()
-    CTRL->>CTRL: regenerate_plots() (RGBA8 charts) + sync_acm_ui()
-    UI->>GPU: BeforeRendering (GraphicsAPI::WGPU30)
-    GPU->>GPU: 4x MSAA Render -> double-buffered Rgba8Unorm Texture
-    GPU-->>UI: ViewportState.set_frame_image(Image::try_from(tex))
+    WRK-->>UI: ctx.request_repaint() -> drain_worker_events()
+    ST->>ST: evaluate_frame_snapshot() + build_scene_highlights() -> extract_render_scene_with_highlights()
+    UI->>GPU: GpuViewportBridge::ensure_rendered() (when viewport_dirty)
+    GPU->>GPU: 4x MSAA Render -> resident Rgba8Unorm Texture (register/update native texture)
+    GPU-->>UI: ui.painter().image(TextureId) + interactive egui_plot charts
 ```
 
-1. User edits (`SceneState`, `AcmState`, `PlannerState`) mutate the declarative `WorkcellSpec` and bump an atomic generation counter on `PlannerWorker`.
+1. Immediate-mode UI panels (`top_toolbar`, `scene_panel`, `acm_panel`, `planner_panel`) mutate `StudioState.spec` directly and bump an atomic generation counter on `PlannerWorker`.
 2. Rapid slider drags debounce at `85 ms`; the background thread drops any superseded generation before executing expensive `BuiltWorkcell` compilation or planning.
-3. On completion (`WorkerEvent::PlanReady`), `AppController` renders 4 RGBA8 telemetry plots (`plots.rs`), updates Slint `ModelRc` lists (`SceneTreeNode`, `ArmTargetPose`, filtered `AcmMatrixRow`), and pushes `RenderSceneData` to `ViewportRenderState` (`dirty = true`).
-4. Double-clicking in the viewport invokes `ViewportState::pick-ray(nx, ny)`, raycasting against live poses and synchronizing Scene Tree selection and obstacle/tool inspectors. Clicking any ACM cell calls `sync_acm_ui()` + `refresh_pose_and_scene()` to highlight the pair in 3D with a cyan witness rod.
+3. On completion (`WorkerEvent::PlanReady`), `StudioState` updates `trajectory`, computes `RenderSceneData` via `extract_render_scene_with_highlights`, and sets `viewport_dirty = true` while `timeline_dock` renders 4 interactive `egui_plot 0.38` charts.
+4. Double-clicking in `viewport_panel` invokes `StudioState::pick_ray(nx, ny)`, raycasting against live poses and synchronizing Scene Tree selection and obstacle/tool inspectors. Clicking any ACM cell calls `StudioState::select_acm_pair()` + `refresh_pose_and_scene()` to highlight the pair in 3D with a cyan witness rod.
