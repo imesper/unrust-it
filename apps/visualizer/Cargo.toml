@@ -33,5 +33,6 @@ rayon.workspace = true
 rfd = { version = "0.18", optional = true }
 thiserror.workspace = true
 unrust-it.workspace = true
+unrust-it-io.workspace = true
 unrust-it-urdf = { path = "../../crates/unrust-it-urdf" }
 wgpu = { workspace = true, optional = true }

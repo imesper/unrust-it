@@ -7,6 +7,7 @@ use crate::gui::panels::{
 };
 use crate::gui::state::{PlannerTab, SolverStatus, StudioState};
 use crate::scene::{ArmTargetSpec, DirtyFlags, PlannerSpec};
+use unrust_it_io::SubframeRole;
 
 pub fn show(ui: &mut egui::Ui, state: &mut StudioState) {
     ui.horizontal(|ui| {
@@ -48,6 +49,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut StudioState) {
 }
 
 fn show_plan_cbf_tab(ui: &mut egui::Ui, state: &mut StudioState) {
+    show_imported_trajectories_card(ui, state);
+    ui.add_space(6.0);
+
     let mut prio_changed = false;
     section_card(ui, "ARM PRIORITY WEIGHTS (QP-CBF)", |ui| {
         for arm in &mut state.spec.arms {
@@ -399,4 +403,171 @@ fn metric_tile(ui: &mut egui::Ui, label: &str, value: &str, val_col: egui::Color
                     .color(val_col),
             );
         });
+}
+
+fn show_imported_trajectories_card(ui: &mut egui::Ui, state: &mut StudioState) {
+    enum Action {
+        None,
+        Import,
+        LoadSample,
+        ExportSample,
+        ReEval,
+        Clear,
+        SelectNode(Option<String>),
+    }
+
+    let mut action = Action::None;
+
+    section_card(ui, "IMPORTED TRAJECTORIES", |ui| {
+        if state.imported_trajectory_set.is_none() {
+            ui.label(
+                egui::RichText::new("Import per-robot ordered frames & subframes (.toml / .json).")
+                    .size(10.5)
+                    .color(TEXT_MUTED),
+            );
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Import...").clicked() {
+                    action = Action::Import;
+                }
+                if ui.button("Load Sample").clicked() {
+                    action = Action::LoadSample;
+                }
+                if ui.button("Export Sample").clicked() {
+                    action = Action::ExportSample;
+                }
+            });
+            return;
+        }
+
+        let source_lbl = state
+            .imported_source_label
+            .clone()
+            .unwrap_or_else(|| "imported".to_string());
+        let set_name = state
+            .imported_trajectory_set
+            .as_ref()
+            .map_or_else(String::new, |s| s.name.clone());
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                egui::RichText::new(format!("{set_name} ({source_lbl})"))
+                    .size(11.0)
+                    .strong()
+                    .color(TEXT_PRIMARY),
+            );
+        });
+
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .checkbox(&mut state.imported_cbf_filter, "QP-CBF Filter")
+                .changed()
+            {
+                action = Action::ReEval;
+            }
+            if ui.button("Re-Eval").clicked() {
+                action = Action::ReEval;
+            }
+            if ui.button("Import...").clicked() {
+                action = Action::Import;
+            }
+            if ui.button("Clear").clicked() {
+                action = Action::Clear;
+            }
+        });
+
+        ui.add_space(2.0);
+        let selected_copy = state.selected_imported_node.clone();
+        let resolved_ref = state.imported_resolved.as_ref();
+
+        if let Some(ref mut set) = state.imported_trajectory_set {
+            for r_spec in &mut set.robots {
+                let r_uid = r_spec.robot_uid.clone();
+                let header_txt = format!("Robot: {r_uid} ({} traj)", r_spec.trajectories.len());
+                egui::CollapsingHeader::new(header_txt)
+                    .id_salt(("imported_robot", &r_uid))
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        let res_robot = resolved_ref
+                            .and_then(|res| res.robots.iter().find(|rr| rr.robot_uid == r_uid));
+
+                        for traj_spec in &mut r_spec.trajectories {
+                            let label_txt = if traj_spec.label.trim().is_empty() {
+                                traj_spec.id.clone()
+                            } else {
+                                traj_spec.label.clone()
+                            };
+                            ui.horizontal(|ui| {
+                                if ui.checkbox(&mut traj_spec.enabled, "").changed() {
+                                    action = Action::ReEval;
+                                }
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{label_txt} ({} frames)",
+                                        traj_spec.frames.len()
+                                    ))
+                                    .size(10.5)
+                                    .color(if traj_spec.enabled {
+                                        TEXT_PRIMARY
+                                    } else {
+                                        TEXT_MUTED
+                                    }),
+                                );
+                            });
+
+                            if let Some(res_traj) = res_robot.and_then(|rr| {
+                                rr.trajectories.iter().find(|rt| rt.id == traj_spec.id)
+                            }) {
+                                for wp in &res_traj.waypoints {
+                                    let indent = "  ".repeat(wp.depth);
+                                    let role_tag = match wp.role {
+                                        SubframeRole::Approach => "APP",
+                                        SubframeRole::Waypoint => "WPT",
+                                        SubframeRole::Contact => "CNT",
+                                        SubframeRole::Retract => "RET",
+                                        SubframeRole::ReferenceOnly => "REF",
+                                    };
+                                    let key = format!(
+                                        "{}/{}/{}",
+                                        wp.robot_uid, wp.trajectory_id, wp.node_id
+                                    );
+                                    let is_sel = selected_copy.as_deref() == Some(key.as_str());
+                                    let time_txt = wp
+                                        .time_s
+                                        .map_or_else(String::new, |t| format!(" @{t:.2}s"));
+                                    let row_txt = format!(
+                                        "{indent}[{role_tag}] {}{time_txt}",
+                                        wp.label
+                                    );
+                                    let rich = egui::RichText::new(row_txt).size(10.0).color(
+                                        if wp.execute_ik {
+                                            rgba_to_color32(wp.color_rgba)
+                                        } else {
+                                            TEXT_MUTED
+                                        },
+                                    );
+                                    if ui.selectable_label(is_sel, rich).clicked() {
+                                        action = Action::SelectNode(if is_sel {
+                                            None
+                                        } else {
+                                            Some(key)
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    });
+            }
+        }
+    });
+
+    match action {
+        Action::None => {}
+        Action::Import => state.import_trajectories_dialog(),
+        Action::LoadSample => state.load_sample_trajectories(),
+        Action::ExportSample => state.export_sample_trajectories_dialog(),
+        Action::ReEval => state.apply_imported_trajectories(),
+        Action::Clear => state.clear_imported_trajectories(),
+        Action::SelectNode(node) => state.select_imported_node(node),
+    }
 }

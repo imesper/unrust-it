@@ -2,14 +2,18 @@
 //! 3D picking, playback, and ACM matrix view building for the `egui` Studio UI.
 
 use crate::render::{
-    extract_render_scene_with_highlights, pick_entity_along_ray, OrbitCamera, OverlayFlags,
-    PickedEntity, RenderSceneData, SceneHighlights,
+    extract_render_scene_with_highlights, pick_entity_along_ray, ImportedFrameMarker, OrbitCamera,
+    OverlayFlags, PickedEntity, RenderSceneData, SceneHighlights,
 };
 use crate::scene::{
-    arm_palette_color, evaluate_frame_snapshot, preset_workcell, ArmSpec, ArmTargetSpec,
-    BuiltWorkcell, DirtyFlags, FrameSnapshot, ObstacleRole, ObstacleSpec, PlaybackTrajectory,
-    PoseSpec, PresetId, ShapePrimitiveSpec, ToolPreset, UrdfSource, WorkcellSpec,
+    arm_palette_color, build_imported_frame_markers, evaluate_frame_snapshot,
+    evaluate_imported_trajectory_set, preset_workcell, resolve_trajectory_set_for_workcell,
+    sample_trajectory_set_for_workcell, workcell_spec_to_world_spec, world_spec_to_workcell_spec,
+    ArmSpec, ArmTargetSpec, BuiltWorkcell, DirtyFlags, FrameSnapshot, ObstacleRole, ObstacleSpec,
+    PlaybackTrajectory, PoseSpec, PresetId, ShapePrimitiveSpec, ToolPreset, UrdfSource,
+    WorkcellSpec,
 };
+use unrust_it_io::{ResolvedTrajectorySet, TrajectorySetSpec, WorldSpec};
 use crate::worker::{PlannerWorker, WakeupCallback, WorkerCommand, WorkerEvent};
 use crate::{generate_scenarios, render_visualizer_html, scenarios_to_json};
 use nalgebra::Vector3;
@@ -204,6 +208,14 @@ pub struct StudioState {
     pub acm_edit_margin_mm: f32,
     pub acm_edit_act_mm: f32,
 
+    // Imported Trajectories & Hierarchical Frame/Subframe Markers
+    pub imported_trajectory_set: Option<TrajectorySetSpec>,
+    pub imported_resolved: Option<ResolvedTrajectorySet>,
+    pub imported_source_label: Option<String>,
+    pub imported_frame_markers: Vec<ImportedFrameMarker>,
+    pub imported_cbf_filter: bool,
+    pub selected_imported_node: Option<String>,
+
     // Debounced Recompile / Replan
     pending_debounce: Option<(Instant, DirtyFlags)>,
 }
@@ -270,6 +282,12 @@ impl StudioState {
             acm_selected_pair: None,
             acm_edit_margin_mm: 40.0,
             acm_edit_act_mm: 160.0,
+            imported_trajectory_set: None,
+            imported_resolved: None,
+            imported_source_label: None,
+            imported_frame_markers: Vec::new(),
+            imported_cbf_filter: true,
+            selected_imported_node: None,
             pending_debounce: None,
         };
 
@@ -487,7 +505,7 @@ impl StudioState {
             &mut self.workspace,
         );
 
-        let highlights = build_scene_highlights(
+        let mut highlights = build_scene_highlights(
             &self.workcell,
             &snap,
             self.selected_link_id,
@@ -495,6 +513,7 @@ impl StudioState {
             self.selected_obstacle_idx,
             self.acm_selected_pair.as_ref(),
         );
+        highlights.imported_frames = self.imported_frame_markers.clone();
         self.render_scene = extract_render_scene_with_highlights(
             &self.workcell,
             &self.spec,
@@ -521,6 +540,7 @@ impl StudioState {
         self.selected_payload_name = None;
         self.selected_obstacle_idx = None;
         self.acm_selected_pair = None;
+        self.clear_imported_state_only();
         self.dispatch_compile_and_plan(DirtyFlags::TOPO);
     }
 
@@ -948,6 +968,199 @@ impl StudioState {
             let scens = generate_scenarios();
             let _ = std::fs::write(path, render_visualizer_html(&scens));
         }
+    }
+
+    pub fn open_world_dialog(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Workcell World", &["toml", "json"])
+            .pick_file()
+        else {
+            return;
+        };
+        match WorldSpec::load_file(&path) {
+            Ok(world) => {
+                self.spec = world_spec_to_workcell_spec(&world);
+                self.playing = false;
+                self.selected_arm_idx = 0;
+                self.selected_target_arm = 0;
+                self.selected_tree_key = "arm:0".to_string();
+                self.selected_link_id = None;
+                self.selected_payload_name = None;
+                self.selected_obstacle_idx = None;
+                self.acm_selected_pair = None;
+                self.clear_imported_state_only();
+                self.solver_status = SolverStatus::Running;
+                self.solver_progress = 0.2;
+                self.solver_message = format!("Loaded world {}", path.display());
+                self.dispatch_compile_and_plan(DirtyFlags::TOPO);
+            }
+            Err(err) => {
+                self.solver_status = SolverStatus::Failed;
+                self.solver_message = format!("Failed to load world: {err}");
+            }
+        }
+    }
+
+    pub fn save_world_dialog(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name("workcell.toml")
+            .add_filter("Workcell World (TOML/JSON)", &["toml", "json"])
+            .save_file()
+        else {
+            return;
+        };
+        let world = workcell_spec_to_world_spec(&self.spec);
+        match world.save_file(&path) {
+            Ok(()) => {
+                self.solver_message = format!("Saved world to {}", path.display());
+            }
+            Err(err) => {
+                self.solver_status = SolverStatus::Failed;
+                self.solver_message = format!("Failed to save world: {err}");
+            }
+        }
+    }
+
+    pub fn import_trajectories_dialog(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Trajectories (TOML/JSON)", &["toml", "json"])
+            .pick_file()
+        else {
+            return;
+        };
+        match TrajectorySetSpec::load_file(&path) {
+            Ok(set) => {
+                let label = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("imported")
+                    .to_string();
+                self.load_imported_trajectory_set(set, label);
+            }
+            Err(err) => {
+                self.solver_status = SolverStatus::Failed;
+                self.solver_message = format!("Trajectory import failed: {err}");
+            }
+        }
+    }
+
+    pub fn load_sample_trajectories(&mut self) {
+        let sample = sample_trajectory_set_for_workcell(&self.spec, &self.workcell, &self.current_q);
+        self.load_imported_trajectory_set(sample, "Sample Multi-Robot Batch".to_string());
+    }
+
+    pub fn export_sample_trajectories_dialog(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name("trajectories_sample.toml")
+            .add_filter("Trajectories (TOML/JSON)", &["toml", "json"])
+            .save_file()
+        else {
+            return;
+        };
+        let sample = sample_trajectory_set_for_workcell(&self.spec, &self.workcell, &self.current_q);
+        match sample.save_file(&path) {
+            Ok(()) => {
+                self.solver_message = format!("Exported sample trajectories to {}", path.display());
+            }
+            Err(err) => {
+                self.solver_status = SolverStatus::Failed;
+                self.solver_message = format!("Failed to export sample trajectories: {err}");
+            }
+        }
+    }
+
+    pub fn load_imported_trajectory_set(&mut self, set: TrajectorySetSpec, source_label: String) {
+        self.imported_trajectory_set = Some(set);
+        self.imported_source_label = Some(source_label);
+        self.selected_imported_node = None;
+        self.apply_imported_trajectories();
+    }
+
+    pub fn apply_imported_trajectories(&mut self) {
+        let Some(set) = self.imported_trajectory_set.as_ref() else {
+            return;
+        };
+        let resolved = match resolve_trajectory_set_for_workcell(
+            set,
+            &self.spec,
+            &self.workcell,
+            &self.workcell.q_start.0,
+        ) {
+            Ok(r) => r,
+            Err(err) => {
+                self.imported_resolved = None;
+                self.imported_frame_markers.clear();
+                self.solver_status = SolverStatus::Failed;
+                self.solver_message = format!("Trajectory resolve failed: {err}");
+                self.refresh_pose_and_scene();
+                return;
+            }
+        };
+
+        self.imported_frame_markers =
+            build_imported_frame_markers(&resolved, self.selected_imported_node.as_deref());
+        self.imported_resolved = Some(resolved.clone());
+
+        match evaluate_imported_trajectory_set(
+            &self.spec,
+            &self.workcell,
+            &resolved,
+            &self.workcell.q_start.0,
+            self.imported_cbf_filter,
+        ) {
+            Ok(traj) => {
+                let n_wps: usize = resolved
+                    .robots
+                    .iter()
+                    .flat_map(|r| r.trajectories.iter())
+                    .map(|t| t.waypoints.len())
+                    .sum();
+                let min_clr = traj.metrics.min_clearance_mm;
+                let err_mm = traj.metrics.max_pos_error_mm;
+                if let Some(first) = traj.frames.first() {
+                    self.current_q = first.q.clone();
+                }
+                self.trajectory = Some(Arc::new(traj));
+                self.playing = false;
+                self.playback_time = 0.0;
+                self.current_frame_idx = 0;
+                self.solver_status = SolverStatus::Converged;
+                self.solver_progress = 1.0;
+                self.solver_message = format!(
+                    "Imported `{}` ({} waypoints, err {:.1} mm, clr {:.1} mm)",
+                    resolved.name, n_wps, err_mm, min_clr
+                );
+            }
+            Err(err) => {
+                self.solver_status = SolverStatus::Warning;
+                self.solver_progress = 1.0;
+                self.solver_message = format!("Preview markers loaded; eval: {err}");
+            }
+        }
+        self.refresh_pose_and_scene();
+    }
+
+    pub fn select_imported_node(&mut self, node_key: Option<String>) {
+        self.selected_imported_node = node_key;
+        if let Some(ref resolved) = self.imported_resolved {
+            self.imported_frame_markers =
+                build_imported_frame_markers(resolved, self.selected_imported_node.as_deref());
+        }
+        self.refresh_pose_and_scene();
+    }
+
+    pub fn clear_imported_trajectories(&mut self) {
+        self.clear_imported_state_only();
+        self.refresh_pose_and_scene();
+        self.dispatch_plan(DirtyFlags::PLAN);
+    }
+
+    fn clear_imported_state_only(&mut self) {
+        self.imported_trajectory_set = None;
+        self.imported_resolved = None;
+        self.imported_source_label = None;
+        self.imported_frame_markers.clear();
+        self.selected_imported_node = None;
     }
 
     pub fn reset_acm_from_srdf(&mut self) {

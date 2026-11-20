@@ -35,7 +35,7 @@ flowchart TB
 
     subgraph IO_Percep["I/O & Perception Crates"]
         URDF["crates/unrust-it-urdf (Implemented)<br/>URDF / SRDF Parser + Multi-Tier SSV/Convex"]
-        IO["crates/unrust-it-io (Planned P3)<br/>WorldSpec (TOML primary + JSON)"]
+        IO["crates/unrust-it-io (Implemented P3C)<br/>WorldSpec + TrajectorySetSpec (TOML / JSON)"]
         PER["crates/unrust-it-perception (Planned P4)<br/>CalibrationBundle / Self-Filter / DynamicVoxelGrid + CV-EKF"]
     end
 
@@ -91,9 +91,15 @@ flowchart TB
 - Automatically synthesizes Tier-1 sphere trees and capsule approximations alongside Tier-2 `parry3d` convex collision shapes.
 - Includes reusable `presets` (`ARM_4DOF_URDF`/`SRDF`, `ARM_6DOF_URDF`/`SRDF`) shared across tests and Studio scenes.
 
-### 3.3 Desktop Engineering Studio (`apps/visualizer`)
+### 3.3 Declarative World & Trajectory I/O (`crates/unrust-it-io`)
 
-- **Declarative Scene Compiler (`src/scene/`)**: `WorkcellSpec` compiles deterministically into an immutable `BuiltWorkcell` (`MultiRobotModel`, `CollisionEnvironment`, `FlatRobotModelF32`, `EsdfGridF32`), evaluates planners (`eval.rs`), and provides 5 built-in N-arm presets (`presets.rs`).
+- Keeps `serde`, `toml`, and `serde_json` isolated outside `unrust-it` and `unrust-it-urdf`.
+- Compiles **TOML / JSON** `WorldSpec` files (with relative URDF/SRDF path resolution) directly into `CompiledWorld` backed by `WorldScene`, `FlatRobotModelF32`, and `EsdfGridF32`.
+- Resolves per-robot `TrajectorySetSpec` hierarchies (primary `frames` + recursive `subframes`, `ReferenceFrame::{World, RobotBase, ModelFrame, Workpiece}`, `SubframeRole`, pre/post `time_offset_s` ordering) into validated world-space waypoint streams ([`docs/TRAJECTORY_FORMAT.md`](TRAJECTORY_FORMAT.md)).
+
+### 3.4 Desktop Engineering Studio (`apps/visualizer`)
+
+- **Declarative Scene Compiler & I/O Bridge (`src/scene/`)**: `WorkcellSpec` compiles deterministically into `BuiltWorkcell`; `io_bridge.rs` converts bidirectionally with `WorldSpec`, resolves `TrajectorySetSpec` into 3D `ImportedFrameMarker`s, and evaluates per-robot paths via masked subgroup `BatchIkSolver` + toggleable `ReactiveServoController::step_joint_reference` QP-CBF filtering.
 - **Pure-`wgpu 30` 3D Renderer (`src/render/`)**: GUI-free `SceneRenderer` with `OrbitCamera` (with `screen_ray` picking), instanced `TypedShape` extraction (`extract_render_scene_with_highlights`), `solid.wgsl` / `lines.wgsl` / `esdf_slice.wgsl`, and `OffscreenViewport` for headless CI validation.
 - **Native Desktop Shell (`src/gui/`)**: `eframe` / `egui 0.37` + `egui-wgpu 0.37` Studio integrating zero-copy native `Rgba8Unorm` texture presentation (`GpuViewportBridge`), direct-ownership `StudioState`, background `PlannerWorker` with latest-generation coalescing, 4 interactive `egui_plot 0.38` charts (plus pure-Rust RGBA8 charts in `plots.rs`), 3D raycast picking, frozen-header ACM Matrix with live $d(t)$ and filtering, Obstacle/Tool/Touch-Link inspectors, and `Targets & IK` (32-seed `BatchIkSolver` preview).
 - **Headless Exports**: `--export-html`, `--export-json`, and `--serve` run without initializing any GUI or windowing backend (also supported under `--no-default-features`).
@@ -114,21 +120,9 @@ Before building external world schemas and sensor pipelines, an architectural au
 
 ## 5. Planned Architecture (Phases 3–5)
 
-### 5.1 Unified World Scene & Declarative `WorldSpec` (`crates/unrust-it-io`)
+### 5.1 Implemented Phase 3 Foundations & Remaining Pipeline Work
 
-- **`WorldScene` Owner (Core)**: Manages synchronized static & named dynamic obstacles (`ObstacleHandle`), automatic BVH rebuilds, and dirty-region ESDF updates.
-- **Dual-Format Serialization (`serde`)**:
-  - Core kernel stays `serde`-free behind optional config/spec serialization (or `unrust-it-io` owns schema structs compiling into `MultiRobotModel` + `CollisionEnvironment` + `EsdfGridF32` + `CalibrationBundle`).
-  - **TOML (`.unrust.toml`)** as the primary human-authored format in Git (clean sections for `[[robots]]`, `[[payloads]]`, `[[obstacles]]`, `[[sensors]]`, `[[collision.pair_rules]]`, `[esdf]`, `[planner]`).
-  - **JSON (`.unrust.json`)** automatically supported from the exact same `WorldSpec` structs for IPC, web/desktop Studio interchange, and runtime snapshots.
-  - Studio's `WorkcellSpec` will share or map directly to `WorldSpec`, enabling seamless Open/Save in the desktop UI.
-- **Per-Robot Trajectory & Frame/Subframe Import (`Format TBD`)**:
-  - **Core Requirement**: Import an ordered list of trajectories per robot (`robot_uid`), where each trajectory contains a sequence of **frames** (named keyframes/reference poses — either Cartesian $SE(3)$ poses relative to `world`/workpiece/base frames or joint-space waypoints — with optional timing, velocity, and blend metadata) and nested **subframes** (local child transforms such as approach/retract/tool-tip offsets or dense intermediate micro-frames relative to a parent frame).
-  - **Format Status**: Exact file schema and container format are **to be decided (TBD)** during Milestone 3C design — primary candidates are **JSON** and **TOML** (consistent with `WorldSpec` in `crates/unrust-it-io`), with optional CSV/YAML/industrial adapters.
-  - **Execution Modes**:
-    1. *Cartesian Frame/Subframe Planning*: Resolve the frame -> subframe hierarchy into `TaskPose` / `ApproachTarget` sequences and plan collision-free multi-arm trajectories (`BatchIkSolver` + `TwoStageApproachPlanner` / MPPI / RRT + TOPP-RA).
-    2. *Joint-Space Replay & Safety Verification/Filtering*: Evaluate exact `GeometryTier::Convex` clearances & ACM rules across imported frames/subframes, and optionally filter multi-arm interference live at 1 kHz via `ServoTarget::JointReference` (Milestone 3A).
-  - **Desktop Studio UI (`apps/visualizer`)**: Add a dedicated **`Import Trajectories`** button in the Top Toolbar / Planner panel to load per-robot trajectory lists into the active workcell for 3D preview, ACM/witness clearance inspection, and CBF-filtered replanning.
+- **`WorldScene` Owner (`unrust-it::scene`, Milestone 3B)** & **`WorldSpec` / `TrajectorySetSpec` (`crates/unrust-it-io`, Milestone 3C)** are implemented and integrated into `apps/visualizer` (`File ▾` Open/Save World, `Import Trajectories`, and `IMPORTED TRAJECTORIES` inspector with CBF-filtered execution; schema in [`docs/TRAJECTORY_FORMAT.md`](TRAJECTORY_FORMAT.md)).
 
 ### 5.2 Sensors, Calibration & Real-Time Dynamic Fusion (`crates/unrust-it-perception`)
 

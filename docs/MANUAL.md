@@ -189,7 +189,7 @@ cargo run -p unrust-it-visualizer -- --serve 127.0.0.1:8080
 
 - **Top Toolbar (`top_toolbar.rs`)**:
   - View mode switcher: **`3D View`**, **`ACM Matrix`**, or **`Split 3D | ACM`**.
-  - Scenario preset loader, URDF import / legacy JSON & HTML export buttons, and active GPU/CPU backend badge.
+  - Scenario preset loader, **`Import Trajectories`** button (opens a `.toml` / `.json` `TrajectorySetSpec` dialog), **`File ▾`** menu (`Open World`, `Save World`, `Import Trajectories`, `Load Sample Trajectories`, `Export Sample Trajectories`, `Import URDF...`, legacy JSON/HTML exports), and active GPU/CPU backend badge.
 - **Left Dock — Scene & N-Arm Manager (`scene_panel.rs`)**:
   - Hierarchical collapsible Scene Tree (`Robots -> Arm -> Links & Tool`, `Obstacles -> Obstacles & Workpieces`).
   - `+ 6-DOF Arm`, `+ 4-DOF Arm`, `+ Sphere Obs`, `+ Workpiece Box`, and `Arrange Arms on Ring`.
@@ -206,6 +206,7 @@ cargo run -p unrust-it-visualizer -- --serve 127.0.0.1:8080
   - **Single-click cell**: inspects pair in the pinned bottom strip AND highlights both bodies + draws a cyan 3D connector rod in Split/3D view. **Double-click cell**: toggles pair Enabled/Disabled.
   - Bottom Pair Strip allows editing exact `Margin` and `Act` values inline via drag/keyboard + `Apply`.
 - **Right Dock — Planner, `Targets & IK`, & `Joints / Jog` (`planner_panel.rs`)**:
+  - **`IMPORTED TRAJECTORIES` Card** *(top of `Plan & CBF`)*: Inspect per-robot imported trajectories, toggle trajectory `enabled` checkboxes, switch the **`QP-CBF Filter`** (enabling/disabling `ReactiveServoController::step_joint_reference` multi-arm interference filtering), or click any frame / nested subframe (`APP`, `WPT`, `CNT`, `RET`, `REF`) to highlight its 3D coordinate triad and parent connector. When empty, provides one-click **`Import...`**, **`Load Sample`**, and **`Export Sample`** buttons (see [`docs/TRAJECTORY_FORMAT.md`](TRAJECTORY_FORMAT.md)).
   - **`Plan & CBF`**: Arm priority weights, CBF safety margin / activation / $\gamma$ / tangential curl, MPPI rollouts/horizon/iterations, plus pinned Execution Footer (`▶ Plan / Re-run`, `Stop`, diagnostics `SOLVE`, `POSE ERR`, `BODY CLR`, `TOOL CLR`).
   - **`Targets & IK`**: Per-arm target pose sliders (`X/Y/Z`, `Roll/Pitch/Yaw`, `Standoff`), `Copy Current TCP Pose -> Target`, and **`Solve IK Preview (Batch 32 Seeds)`** (runs `BatchIkSolver` live and updates robot configuration in the viewport).
   - **`Joints / Jog`**: Interactive per-DOF joint sliders for live FK and exact witness inspection.

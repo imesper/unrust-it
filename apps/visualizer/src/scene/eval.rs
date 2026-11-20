@@ -879,7 +879,7 @@ fn sample_toppra_frames(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_trajectory_frame(
+pub(crate) fn build_trajectory_frame(
     workcell: &BuiltWorkcell,
     env: &CollisionEnvironment,
     time: f64,
@@ -1009,7 +1009,7 @@ fn compute_task_errors(
     (max_p, max_r)
 }
 
-fn verify_path_convex(
+pub(crate) fn verify_path_convex(
     workcell: &BuiltWorkcell,
     path: &[Configuration],
     max_workspace_step: f64,
@@ -1048,7 +1048,7 @@ fn verify_path_convex(
     true
 }
 
-fn compute_tcp_trails(
+pub(crate) fn compute_tcp_trails(
     workcell: &BuiltWorkcell,
     frames: &[TrajectoryFrame],
 ) -> Vec<Vec<[f32; 3]>> {
@@ -1065,7 +1065,7 @@ fn compute_tcp_trails(
     trails
 }
 
-fn summarize_metrics(
+pub(crate) fn summarize_metrics(
     frames: &[TrajectoryFrame],
     solve_time_ms: f64,
     max_pos_error_mm: f64,

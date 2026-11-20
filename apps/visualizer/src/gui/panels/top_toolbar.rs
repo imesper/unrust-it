@@ -68,14 +68,48 @@ pub fn show(ui: &mut egui::Ui, state: &mut StudioState) {
                 state.right_collapsed = !state.right_collapsed;
             }
             status_badge(ui, &state.gpu_adapter_label, 3);
-            if ui.button("Export HTML").clicked() {
-                state.export_legacy_html();
-            }
-            if ui.button("Export JSON").clicked() {
-                state.export_legacy_json();
-            }
-            if ui.button("Import URDF").clicked() {
-                state.import_urdf_dialog();
+            ui.menu_button("File ▾", |ui| {
+                if ui.button("Open World (.toml / .json)...").clicked() {
+                    ui.close();
+                    state.open_world_dialog();
+                }
+                if ui.button("Save World (.toml / .json)...").clicked() {
+                    ui.close();
+                    state.save_world_dialog();
+                }
+                ui.separator();
+                if ui.button("Import Trajectories (.toml / .json)...").clicked() {
+                    ui.close();
+                    state.import_trajectories_dialog();
+                }
+                if ui.button("Load Sample Trajectories").clicked() {
+                    ui.close();
+                    state.load_sample_trajectories();
+                }
+                if ui.button("Export Sample Trajectories...").clicked() {
+                    ui.close();
+                    state.export_sample_trajectories_dialog();
+                }
+                ui.separator();
+                if ui.button("Import URDF...").clicked() {
+                    ui.close();
+                    state.import_urdf_dialog();
+                }
+                if ui.button("Export Legacy JSON...").clicked() {
+                    ui.close();
+                    state.export_legacy_json();
+                }
+                if ui.button("Export Legacy HTML...").clicked() {
+                    ui.close();
+                    state.export_legacy_html();
+                }
+            });
+            if ui
+                .button("Import Trajectories")
+                .on_hover_text("Import per-robot ordered trajectories with frames & subframes (.toml / .json)")
+                .clicked()
+            {
+                state.import_trajectories_dialog();
             }
         });
     });

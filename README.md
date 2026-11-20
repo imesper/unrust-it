@@ -22,11 +22,11 @@
 | :--- | :--- | :--- |
 | **`unrust-it`** | [`crates/unrust-it`](crates/unrust-it/Cargo.toml) | Pure Rust kinematics, collision, manifolds, trajectories, 1 kHz CBF control, planners, and CPU SIMD / `wgpu` batched rollouts (**Implemented**, GUI/IO-free) |
 | **`unrust-it-urdf`** | [`crates/unrust-it-urdf`](crates/unrust-it-urdf/Cargo.toml) | URDF & MoveIt SRDF parser with automatic multi-tier sphere/capsule/convex collision decomposition & built-in presets (**Implemented**, GUI-free) |
+| **`unrust-it-io`** | [`crates/unrust-it-io`](crates/unrust-it-io/Cargo.toml) | `serde`-isolated TOML/JSON `WorldSpec` compiler -> `WorldScene` & per-robot ordered `TrajectorySetSpec` (frames & recursive subframes) (**Implemented**) |
 | **`unrust-it-visualizer`** | [`apps/visualizer`](apps/visualizer/Cargo.toml) | Native `eframe`/`egui 0.37` + zero-copy `wgpu 30` Desktop Engineering Studio, offscreen CI renderer, and headless JSON/HTML scenario exporter (**Implemented**) |
-| **`unrust-it-io`** | *Planned (Phase 3)* | Unified `serde` declarative `WorldSpec` loader/compiler (`.unrust.toml` + `.unrust.json`) shared across runtime and Studio |
 | **`unrust-it-perception`** | *Planned (Phase 4)* | Sensor calibration (`CalibrationBundle`), RGB-D / LiDAR / mmWave Radar ingestion, zero-alloc `f32x8` self-filtering, and dynamic voxel-ESDF + CV-EKF obstacle fusion |
 
-Core robotics crates (`unrust-it`, `unrust-it-urdf`) intentionally contain **no GUI, windowing, or runtime-framework dependencies**.
+Core robotics crates (`unrust-it`, `unrust-it-urdf`) intentionally contain **no GUI, windowing, `serde`, or runtime-framework dependencies**.
 
 ---
 
@@ -35,9 +35,10 @@ Core robotics crates (`unrust-it`, `unrust-it-urdf`) intentionally contain **no 
 | Document | Scope |
 | :--- | :--- |
 | **[Architecture](docs/ARCHITECTURE.md)** | Current dual-precision architecture, zero-alloc workspace separation, Phase 2 friction audit, and planned Phase 3–5 world modeling, sensor calibration/fusion, dual-rate pipeline, and mobile manipulator designs |
-| **[Roadmap & Milestones](docs/ROADMAP.md)** | Completed Phases 0–2D (with exact commits), planned Phase 3–5 milestones with exit criteria, and CI verification policy |
-| **[Code Flow Reference](docs/CODE_FLOW.md)** | Module-by-module inventory and step-by-step data & execution flows from URDF parsing through Two-Stage planning, 1 kHz CBF ticks, WGSL rollouts, and the `egui` + `wgpu 30` Studio loop |
-| **[User & Developer Manual](docs/MANUAL.md)** | Setup, feature flags, core library tutorials, `apps/visualizer` Studio UI guide, preset descriptions, performance tuning, and troubleshooting |
+| **[Roadmap & Milestones](docs/ROADMAP.md)** | Completed Phases 0–3C, planned Phase 3D–5 milestones with exit criteria, and CI verification policy |
+| **[Code Flow Reference](docs/CODE_FLOW.md)** | Module-by-module inventory and step-by-step data & execution flows from URDF/World/Trajectory parsing through Two-Stage planning, 1 kHz CBF ticks, WGSL rollouts, and the `egui` + `wgpu 30` Studio loop |
+| **[World & Trajectory Format](docs/TRAJECTORY_FORMAT.md)** | Schema v1 reference and TOML/JSON examples for `WorldSpec` and per-robot `TrajectorySetSpec` (ordered trajectories, reference frames, recursive subframes, roles, and TCP overrides) |
+| **[User & Developer Manual](docs/MANUAL.md)** | Setup, feature flags, core library tutorials, `apps/visualizer` Studio UI guide (including World & Trajectory Import), preset descriptions, performance tuning, and troubleshooting |
 
 ---
 

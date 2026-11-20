@@ -29,7 +29,16 @@ This reference maps every file in the workspace and walks through the five prima
 | [`src/lib.rs`](../crates/unrust-it-urdf/src/lib.rs) | `load_urdf_str`, `load_urdf_file`, `add_urdf_to_scene`, `add_urdf_file_to_scene`, `apply_srdf_str`, `apply_srdf_file`, `UrdfRobotHandle`, `SrdfData`, `UrdfError`, and `presets::{ARM_4DOF_URDF, ARM_4DOF_SRDF, ARM_6DOF_URDF, ARM_6DOF_SRDF}` |
 | [`tests/three_arm_proximity.rs`](../crates/unrust-it-urdf/tests/three_arm_proximity.rs) | End-to-end 3-arm close-proximity convergence & deadlock-free crossing integration tests |
 
-### 1.3 `apps/visualizer` (Desktop Studio & Headless Exporter)
+### 1.3 `crates/unrust-it-io` (Declarative World & Trajectory I/O)
+
+| File | Responsibility & Key Types |
+| :--- | :--- |
+| [`src/error.rs`](../crates/unrust-it-io/src/error.rs) | Unified `IoError` (I/O, TOML/JSON parse, schema version, validation, unknown robot/obstacle/frame/link/group, DOF mismatch) |
+| [`src/pose.rs`](../crates/unrust-it-io/src/pose.rs) | `FileFormat`, `PoseSpec` (`xyz`/`rpy`), and `ShapeSpec` (`Box`, `Sphere`, `Cylinder`, `Capsule`, `SegmentCapsule`) |
+| [`src/world.rs`](../crates/unrust-it-io/src/world.rs) | `WorldSpec` (TOML/JSON + relative URDF/SRDF path resolution) -> `WorldSpec::compile()` -> `CompiledWorld` (`WorldScene`) |
+| [`src/trajectory_io.rs`](../crates/unrust-it-io/src/trajectory_io.rs) | `TrajectorySetSpec`, `RobotTrajectoriesSpec`, `TrajectorySpec`, `TrajectoryFrameSpec`, `SubframeSpec`, `ReferenceFrame`, `SubframeRole`, `resolve_trajectory_set`, and `resolve_trajectory_set_with_model` |
+
+### 1.4 `apps/visualizer` (Desktop Studio & Headless Exporter)
 
 | File | Responsibility |
 | :--- | :--- |
@@ -39,6 +48,7 @@ This reference maps every file in the workspace and walks through the five prima
 | [`src/scene/compile.rs`](../apps/visualizer/src/scene/compile.rs) | Compiles `WorkcellSpec` -> `BuiltWorkcell` (`MultiRobotModel`, `CollisionEnvironment`, `FlatRobotModelF32`, carved `EsdfGridF32`) |
 | [`src/scene/presets.rs`](../apps/visualizer/src/scene/presets.rs) | 5 built-in N-arm preset scenarios (`PresetId`) |
 | [`src/scene/eval.rs`](../apps/visualizer/src/scene/eval.rs) | Synchronizes planner execution (`run_planner_sync` -> `PlaybackTrajectory`) and zero-alloc `evaluate_frame_snapshot` |
+| [`src/scene/io_bridge.rs`](../apps/visualizer/src/scene/io_bridge.rs) | Bidirectional `WorkcellSpec <-> WorldSpec`, `resolve_trajectory_set_for_workcell`, `build_imported_frame_markers`, `sample_trajectory_set_for_workcell`, and masked IK + QP-CBF `evaluate_imported_trajectory_set` |
 | [`src/worker.rs`](../apps/visualizer/src/worker.rs) | Background `PlannerWorker` thread with atomic latest-generation coalescing & cancellation |
 | [`src/plots.rs`](../apps/visualizer/src/plots.rs) | CPU RGBA8 time-series chart rasterizers (`min clearance`, `tool clearance`, `pose error`, `joint velocities`) |
 | [`src/render/mod.rs`](../apps/visualizer/src/render/mod.rs) | Pure-`wgpu 30` `SceneRenderer` (4x MSAA, depth pass, instanced `solid.wgsl`, `lines.wgsl`, `esdf_slice.wgsl`) |
@@ -161,3 +171,11 @@ sequenceDiagram
 2. Rapid slider drags debounce at `85 ms`; the background thread drops any superseded generation before executing expensive `BuiltWorkcell` compilation or planning.
 3. On completion (`WorkerEvent::PlanReady`), `StudioState` updates `trajectory`, computes `RenderSceneData` via `extract_render_scene_with_highlights`, and sets `viewport_dirty = true` while `timeline_dock` renders 4 interactive `egui_plot 0.38` charts.
 4. Double-clicking in `viewport_panel` invokes `StudioState::pick_ray(nx, ny)`, raycasting against live poses and synchronizing Scene Tree selection and obstacle/tool inspectors. Clicking any ACM cell calls `StudioState::select_acm_pair()` + `refresh_pose_and_scene()` to highlight the pair in 3D with a cyan witness rod.
+
+---
+
+### Flow 6 — Declarative World & Trajectory Import (`crates/unrust-it-io` -> Studio)
+
+1. **World Open/Save (`File ▾`)**: `WorldSpec::load_file(path)` parses `.toml` or `.json` and records `base_dir` so relative URDF/SRDF file paths resolve cleanly in `WorldSpec::compile()` (core `unrust-it-io` runtime) or `world_spec_to_workcell_spec()` (`apps/visualizer` Studio).
+2. **Trajectory Import (`Import Trajectories`)**: `TrajectorySetSpec::load_file(path)` parses multi-robot ordered trajectories with `frames` and nested `subframes`. `resolve_trajectory_set_for_workcell()` delegates to `resolve_trajectory_set_with_model()` to evaluate `ReferenceFrame::{World, RobotBase, ModelFrame, Workpiece}` transforms, TCP inheritance, and `time_offset_s < 0` (pre-parent) vs `time_offset_s >= 0` (post-parent) ordering.
+3. **3D Preview & Masked IK + QP-CBF Evaluation**: `build_imported_frame_markers()` populates `SceneHighlights.imported_frames` (rendering axis triads, role-colored spheres, parent-child connectors, and sequence polylines in `extract.rs`). `evaluate_imported_trajectory_set()` solves per-robot masked subgroup IK (`BatchIkSolver::solve_collision_free_masked` with DLS fallback) over executable waypoints, interpolates smooth reference trajectories, and optionally runs `ReactiveServoController::step_joint_reference()` before producing `PlaybackTrajectory` for playback and clearance plotting.

@@ -94,6 +94,19 @@ pub struct RenderSceneData {
     pub esdf_slice: Option<EsdfSliceData>,
 }
 
+/// Imported waypoint frame / subframe marker rendered as a 3D coordinate triad,
+/// node sphere, and hierarchy / sequence connectors.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportedFrameMarker {
+    pub world_pose: Isometry3<f64>,
+    pub parent_world_pose: Option<Isometry3<f64>>,
+    pub prev_sequence_pos: Option<[f64; 3]>,
+    pub depth: usize,
+    pub execute_ik: bool,
+    pub selected: bool,
+    pub color_rgba: [f32; 4],
+}
+
 /// Interactive 3D selection & ACM-pair highlight specification.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SceneHighlights {
@@ -101,6 +114,7 @@ pub struct SceneHighlights {
     pub highlighted_payloads: Vec<String>,
     pub highlighted_obstacles: Vec<ObstacleId>,
     pub highlighted_pair_segment: Option<([f64; 3], [f64; 3])>,
+    pub imported_frames: Vec<ImportedFrameMarker>,
 }
 
 /// Entity intersected by a 3D viewport picking ray.
@@ -520,6 +534,65 @@ pub fn extract_render_scene_with_highlights(
         push_line(&mut out.xray_lines, pa, pb, col);
     }
 
+    // 7c. Imported Trajectory Frames & Hierarchical Subframes
+    for marker in &highlights.imported_frames {
+        let axis_len = if marker.selected {
+            0.068
+        } else if marker.depth == 0 {
+            0.048
+        } else {
+            0.032
+        };
+        push_axis_triad(&mut out.overlay_lines, &marker.world_pose, axis_len);
+
+        let pos = marker.world_pose.translation.vector;
+        let radius = if marker.selected {
+            0.0085
+        } else if marker.depth == 0 {
+            0.0058
+        } else {
+            0.0040
+        };
+        let mut sphere_col = marker.color_rgba;
+        if !marker.execute_ik {
+            sphere_col[3] = sphere_col[3].min(0.60);
+        }
+        out.spheres.push(SolidInstance {
+            model_mat: translation_scale_mat4(pos, [radius, radius, radius]),
+            color: sphere_col,
+        });
+
+        if let Some(parent_iso) = marker.parent_world_pose {
+            let hierarchy_col = [
+                marker.color_rgba[0],
+                marker.color_rgba[1],
+                marker.color_rgba[2],
+                0.45,
+            ];
+            push_line(
+                &mut out.overlay_lines,
+                parent_iso.translation.vector,
+                pos,
+                hierarchy_col,
+            );
+        }
+
+        if let Some(prev) = marker.prev_sequence_pos {
+            let seq_col = [
+                marker.color_rgba[0],
+                marker.color_rgba[1],
+                marker.color_rgba[2],
+                0.90,
+            ];
+            push_line(
+                &mut out.overlay_lines,
+                Vector3::new(prev[0], prev[1], prev[2]),
+                pos,
+                seq_col,
+            );
+        }
+    }
+
     // 8. 3D ESDF 2D Slice
     if overlays.show_esdf_slice {
         out.esdf_slice = extract_esdf_slice(
@@ -874,6 +947,7 @@ mod tests {
             highlighted_payloads: vec!["arm1_screwdriver".to_string()],
             highlighted_obstacles: vec![*wc.obstacle_by_uid.get("workpiece").unwrap()],
             highlighted_pair_segment: Some(([0.0, 0.0, 0.40], [0.05, 0.02, 0.44])),
+            ..Default::default()
         };
         let with_hl = extract_render_scene_with_highlights(
             &wc,

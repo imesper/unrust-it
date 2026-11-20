@@ -1,0 +1,20 @@
+[package]
+name = "unrust-it-io"
+description = "Declarative TOML/JSON workcell world definitions and per-robot trajectory/frame/subframe import/export for unrust-it"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+nalgebra.workspace = true
+parry3d.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+unrust-it.workspace = true
+unrust-it-urdf.workspace = true
+
+[dev-dependencies]
+approx.workspace = true

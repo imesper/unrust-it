@@ -8,8 +8,8 @@ pub mod offscreen;
 pub use camera::OrbitCamera;
 pub use extract::{
     extract_esdf_slice, extract_render_scene, extract_render_scene_with_highlights,
-    pick_entity_along_ray, EsdfSliceData, LineVertex, OverlayFlags, PickedEntity, RenderSceneData,
-    SceneHighlights, SolidInstance,
+    pick_entity_along_ray, EsdfSliceData, ImportedFrameMarker, LineVertex, OverlayFlags,
+    PickedEntity, RenderSceneData, SceneHighlights, SolidInstance,
 };
 pub use offscreen::OffscreenViewport;
 
