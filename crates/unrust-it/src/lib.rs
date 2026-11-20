@@ -27,6 +27,7 @@
 //! - [`trajectory`]: $C^2$ `CubicSplinePath`, `ToppraTrajectory`, and `JerkLimitedTrajectory`.
 //! - [`control`]: 1 kHz `ReactiveServoController` with priority-weighted QP-CBF, tangential curl, and velocity dampers.
 //! - [`planner`]: Bidirectional `RrtPlanner` and two-stage close-proximity `TwoStageApproachPlanner`.
+//! - [`scene`]: Unified [`WorldScene`] owner with generational [`ObstacleHandle`]s and dirty-region ESDF sync.
 //! - [`batch`]: `FlatRobotModelF32`, `EsdfGridF32`, `BatchIkSolver`, `BatchMppiOptimizer`, SIMD/GPU backends.
 //!
 //! # Feature Flags
@@ -88,6 +89,7 @@ pub mod kinematics;
 pub mod manifold;
 pub mod planner;
 pub mod robot;
+pub mod scene;
 pub mod trajectory;
 
 pub use batch::{
@@ -110,6 +112,7 @@ pub use planner::{
     ApproachTarget, CoarsePlannerMode, PathPlanner, PlannerError, RrtPlanner, Target,
     TwoStageApproachPlanner, TwoStagePlanConfig, TwoStagePlanResult,
 };
+pub use scene::{EsdfConfig, ObstacleHandle, ObstacleOptions, SceneError, WorldScene};
 pub use robot::{
     AttachedPayload, Configuration, FrameAttachment, FrameGraph, FrameId, FrameNode, JointId,
     JointLimit, JointSpec, JointState, JointType, KinodynamicLimits, LinkId, LinkSpec,

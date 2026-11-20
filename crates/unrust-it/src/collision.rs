@@ -1179,10 +1179,15 @@ fn combine_optional_max(a: Option<f64>, b: Option<f64>) -> Option<f64> {
 /// multi-tier robot link geometries, an [`AllowedCollisionMatrix`], and attached payloads.
 #[derive(Debug, Default, Clone)]
 pub struct CollisionEnvironment {
-    /// Obstacles in the world frame.
+    /// Obstacles in the world frame. Inactive/removed slots remain in place as tombstones
+    /// so [`ObstacleId`] indices never invalidate active siblings.
     pub obstacles: Vec<Obstacle>,
-    /// Broad-phase Bounding Volume Hierarchy over `obstacles`.
+    /// Active flag per slot in `obstacles` (missing entries default to `true` for manual pushes).
+    obstacle_active: Vec<bool>,
+    /// Broad-phase Bounding Volume Hierarchy over active `obstacles`.
     obstacle_bvh: Option<Bvh>,
+    /// Compact BVH leaf index -> [`ObstacleId`] lookup (since `parry3d::Bvh` requires dense `0..N` keys).
+    bvh_leaf_obstacles: Vec<ObstacleId>,
     /// Per-link collision geometries indexed by `LinkId`.
     link_geometries: Vec<Option<LinkGeometry>>,
     /// Allowed Collision Matrix governing link-to-link self and inter-arm collision pairs.
@@ -1217,41 +1222,193 @@ impl CollisionEnvironment {
         Self::default()
     }
 
+    /// Returns `true` if `id` refers to an existing, active (non-removed) obstacle.
+    #[inline]
+    pub fn is_obstacle_active(&self, id: ObstacleId) -> bool {
+        let idx = id.0 as usize;
+        idx < self.obstacles.len() && self.obstacle_active.get(idx).copied().unwrap_or(true)
+    }
+
+    /// Returns the obstacle at `id` if it exists and is active.
+    #[inline]
+    pub fn obstacle(&self, id: ObstacleId) -> Option<&Obstacle> {
+        self.is_obstacle_active(id)
+            .then(|| &self.obstacles[id.0 as usize])
+    }
+
+    /// Iterates over all active `(ObstacleId, &Obstacle)` entries in index order.
+    #[inline]
+    pub fn active_obstacles(&self) -> impl Iterator<Item = (ObstacleId, &Obstacle)> + '_ {
+        self.obstacles.iter().enumerate().filter_map(|(i, obs)| {
+            let id = ObstacleId(i as u32);
+            self.is_obstacle_active(id).then_some((id, obs))
+        })
+    }
+
+    /// Number of currently active obstacles in the environment.
+    #[inline]
+    pub fn num_active_obstacles(&self) -> usize {
+        (0..self.obstacles.len())
+            .filter(|&i| self.obstacle_active.get(i).copied().unwrap_or(true))
+            .count()
+    }
+
     /// Adds a `parry3d` obstacle to the environment and updates the broad-phase BVH.
     pub fn add_obstacle(&mut self, shape: SharedShape, pose: Isometry3<f64>) -> ObstacleId {
-        let id = ObstacleId(self.obstacles.len() as u32);
-        self.obstacles.push(Obstacle { shape, pose });
-        self.obstacle_margins.push(None);
-        self.obstacle_activations.push(None);
+        let id = self.add_obstacle_deferred(shape, pose);
         self.rebuild_bvh();
         id
     }
 
-    /// Updates the world pose of an existing obstacle and rebuilds the obstacle BVH
+    pub(crate) fn add_obstacle_deferred(
+        &mut self,
+        shape: SharedShape,
+        pose: Isometry3<f64>,
+    ) -> ObstacleId {
+        if self.obstacle_active.len() < self.obstacles.len() {
+            self.obstacle_active.resize(self.obstacles.len(), true);
+        }
+        let id = ObstacleId(self.obstacles.len() as u32);
+        self.obstacles.push(Obstacle { shape, pose });
+        self.obstacle_active.push(true);
+        self.obstacle_margins.push(None);
+        self.obstacle_activations.push(None);
+        id
+    }
+
+    /// Updates the world pose of an existing active obstacle and rebuilds the obstacle BVH
     /// without disturbing per-obstacle margin/activation or rule tables.
     ///
-    /// Returns `false` if `id` is out of bounds.
+    /// Returns `false` if `id` is out of bounds or has been removed.
     pub fn set_obstacle_pose(&mut self, id: ObstacleId, pose: Isometry3<f64>) -> bool {
-        let Some(obs) = self.obstacles.get_mut(id.0 as usize) else {
+        if self.set_obstacle_pose_deferred(id, pose) {
+            self.rebuild_bvh();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn set_obstacle_pose_deferred(
+        &mut self,
+        id: ObstacleId,
+        pose: Isometry3<f64>,
+    ) -> bool {
+        if !self.is_obstacle_active(id) {
             return false;
-        };
-        obs.pose = pose;
-        self.rebuild_bvh();
+        }
+        self.obstacles[id.0 as usize].pose = pose;
         true
     }
 
-    /// Rebuilds the static obstacle `Bvh` broad-phase acceleration structure.
+    /// Replaces the geometry shape of an existing active obstacle and rebuilds the obstacle BVH.
+    ///
+    /// Returns `false` if `id` is out of bounds or has been removed.
+    pub fn set_obstacle_shape(&mut self, id: ObstacleId, shape: SharedShape) -> bool {
+        if self.set_obstacle_shape_deferred(id, shape) {
+            self.rebuild_bvh();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn set_obstacle_shape_deferred(
+        &mut self,
+        id: ObstacleId,
+        shape: SharedShape,
+    ) -> bool {
+        if !self.is_obstacle_active(id) {
+            return false;
+        }
+        self.obstacles[id.0 as usize].shape = shape;
+        true
+    }
+
+    /// Atomically updates both the geometry shape and world pose of an active obstacle and rebuilds the BVH.
+    ///
+    /// Returns `false` if `id` is out of bounds or has been removed.
+    pub fn update_obstacle(
+        &mut self,
+        id: ObstacleId,
+        shape: SharedShape,
+        pose: Isometry3<f64>,
+    ) -> bool {
+        if self.update_obstacle_deferred(id, shape, pose) {
+            self.rebuild_bvh();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn update_obstacle_deferred(
+        &mut self,
+        id: ObstacleId,
+        shape: SharedShape,
+        pose: Isometry3<f64>,
+    ) -> bool {
+        if !self.is_obstacle_active(id) {
+            return false;
+        }
+        let obs = &mut self.obstacles[id.0 as usize];
+        obs.shape = shape;
+        obs.pose = pose;
+        true
+    }
+
+    /// Tombstones an obstacle, clears its margin/activation and pair rules, and rebuilds the BVH.
+    ///
+    /// Remaining [`ObstacleId`] handles keep their numeric indices. Returns `false` if `id`
+    /// is invalid or already removed.
+    pub fn remove_obstacle(&mut self, id: ObstacleId) -> bool {
+        if self.remove_obstacle_deferred(id) {
+            self.rebuild_bvh();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn remove_obstacle_deferred(&mut self, id: ObstacleId) -> bool {
+        if !self.is_obstacle_active(id) {
+            return false;
+        }
+        let idx = id.0 as usize;
+        if self.obstacle_active.len() < self.obstacles.len() {
+            self.obstacle_active.resize(self.obstacles.len(), true);
+        }
+        self.obstacle_active[idx] = false;
+        if idx < self.obstacle_margins.len() {
+            self.obstacle_margins[idx] = None;
+        }
+        if idx < self.obstacle_activations.len() {
+            self.obstacle_activations[idx] = None;
+        }
+        self.link_obstacle_rules.retain(|&(_, oid), _| oid != id);
+        self.payload_obstacle_rules
+            .retain(|&(_, oid), _| oid != id);
+        self.rebuild_payload_rule_caches();
+        true
+    }
+
+    /// Rebuilds the static obstacle `Bvh` broad-phase acceleration structure over active obstacles.
     pub fn rebuild_bvh(&mut self) {
-        if self.obstacles.is_empty() {
+        let mut leaf_ids = Vec::with_capacity(self.obstacles.len());
+        let mut leaves = Vec::with_capacity(self.obstacles.len());
+        for (i, obs) in self.obstacles.iter().enumerate() {
+            let id = ObstacleId(i as u32);
+            if self.is_obstacle_active(id) {
+                let compact_idx = leaves.len();
+                leaf_ids.push(id);
+                leaves.push((compact_idx, obs.world_aabb()));
+            }
+        }
+        self.bvh_leaf_obstacles = leaf_ids;
+        if leaves.is_empty() {
             self.obstacle_bvh = None;
             return;
         }
-        let leaves: Vec<(usize, Aabb)> = self
-            .obstacles
-            .iter()
-            .enumerate()
-            .map(|(i, obs)| (i, obs.world_aabb()))
-            .collect();
         self.obstacle_bvh = Some(Bvh::from_iter(BvhBuildStrategy::Binned, leaves));
     }
 
@@ -2042,8 +2199,8 @@ impl CollisionEnvironment {
                     *link_aabb
                 };
 
-                for obs_idx in bvh.intersect_aabb(&query_aabb) {
-                    let obs_id = ObstacleId(obs_idx);
+                for leaf_idx in bvh.intersect_aabb(&query_aabb) {
+                    let obs_id = self.bvh_leaf_obstacles[leaf_idx as usize];
                     if !self.is_link_obstacle_enabled(link_id, obs_id) {
                         continue;
                     }
@@ -2053,13 +2210,13 @@ impl CollisionEnvironment {
                             obstacle: obs_id,
                         })
                         .unwrap_or(0.0);
+                    let obs = &self.obstacles[obs_id.0 as usize];
                     if !link_aabb
                         .loosened(margin.max(0.0))
-                        .intersects(&self.obstacles[obs_idx as usize].world_aabb())
+                        .intersects(&obs.world_aabb())
                     {
                         continue;
                     }
-                    let obs = &self.obstacles[obs_idx as usize];
                     let collides = match tier {
                         GeometryTier::AnalyticSsv => {
                             let range = &workspace.world_spheres.link_ranges[link_idx];
@@ -2112,8 +2269,8 @@ impl CollisionEnvironment {
                     .fold(max_obs_margin, f64::max);
                 let query_aabb = payload_aabb.loosened(rule_max.max(0.0));
 
-                for obs_idx in bvh.intersect_aabb(&query_aabb) {
-                    let obs_id = ObstacleId(obs_idx);
+                for leaf_idx in bvh.intersect_aabb(&query_aabb) {
+                    let obs_id = self.bvh_leaf_obstacles[leaf_idx as usize];
                     if !self.is_payload_obstacle_id_enabled(payload_id, obs_id) {
                         continue;
                     }
@@ -2123,7 +2280,7 @@ impl CollisionEnvironment {
                         obstacle: obs_id,
                     };
                     let margin = self.custom_pair_margin(&pair).unwrap_or(0.0);
-                    let obs = &self.obstacles[obs_idx as usize];
+                    let obs = &self.obstacles[obs_id.0 as usize];
                     if !payload_aabb
                         .loosened(margin.max(0.0))
                         .intersects(&obs.world_aabb())
@@ -2445,12 +2602,12 @@ impl CollisionEnvironment {
                 let query_aabb = workspace.link_aabbs[link_idx].loosened(margin);
                 let link_pose = workspace.transforms.link_pose(link_id);
 
-                for obs_idx in bvh.intersect_aabb(&query_aabb) {
-                    let obs_id = ObstacleId(obs_idx);
+                for leaf_idx in bvh.intersect_aabb(&query_aabb) {
+                    let obs_id = self.bvh_leaf_obstacles[leaf_idx as usize];
                     if !self.is_link_obstacle_enabled(link_id, obs_id) {
                         continue;
                     }
-                    let obs = &self.obstacles[obs_idx as usize];
+                    let obs = &self.obstacles[obs_id.0 as usize];
                     let obs_slice = [(Isometry3::identity(), obs.shape.clone())];
                     if let Some((dist, p_a, p_b, normal)) = Self::closest_shapes_witness(
                         link_pose,
@@ -2488,12 +2645,12 @@ impl CollisionEnvironment {
 
             // 3. Payload-to-Obstacle
             if let Some(bvh) = &self.obstacle_bvh {
-                for obs_idx in bvh.intersect_aabb(&loosened_payload) {
-                    let obs_id = ObstacleId(obs_idx);
+                for leaf_idx in bvh.intersect_aabb(&loosened_payload) {
+                    let obs_id = self.bvh_leaf_obstacles[leaf_idx as usize];
                     if !self.is_payload_obstacle_id_enabled(payload_id, obs_id) {
                         continue;
                     }
-                    let obs = &self.obstacles[obs_idx as usize];
+                    let obs = &self.obstacles[obs_id.0 as usize];
                     let witness = if tier == GeometryTier::AnalyticSsv
                         && !workspace.world_spheres.payload_ranges[p_idx].is_empty()
                     {

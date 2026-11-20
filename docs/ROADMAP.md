@@ -13,7 +13,7 @@ This document tracks all completed engineering phases and commits on `main`, alo
 | **2A/2B** | CuRobo-style `f32` SIMD/WGSL batching, `EsdfGridF32`, `GpuRobotContext`, Batch IK & MPPI, URDF/SRDF | **Complete** | `31eae0d`, `fc4197c`, `d728dfd`, `335efd1` |
 | **2C** | Compound tool payloads, per-pair safety margins, priority QP-CBF + curl, Two-Stage planner | **Complete** | `3f475f6` |
 | **2D** | Declarative scene engine, pure-`wgpu 30` 3D renderer, `egui 0.37` Studio UI, interactive inspectors | **Complete** | `556a732`, `9f8067a`, `1eff888`, `dbcf530` |
-| **3** | Core 1 kHz zero-alloc polish, `WorldScene`, `unrust-it-io` (TOML/JSON), Dual-Rate Pipeline | **In Progress (3A Complete)** | — |
+| **3** | Core 1 kHz zero-alloc polish, `WorldScene`, `unrust-it-io` (TOML/JSON), Dual-Rate Pipeline | **In Progress (3A & 3B Complete)** | — |
 | **4** | `unrust-it-perception`: Calibration ingestion, RGB-D/LiDAR/Radar self-filtering, dynamic ESDF + CV-EKF | **Planned** | — |
 | **5** | Mobile manipulators (`nq`/`nv`), CAD mesh ingestion (VHACD), ROS 2 / Zenoh / Python / C ABI | **Planned** | — |
 
@@ -63,7 +63,7 @@ This document tracks all completed engineering phases and commits on `main`, alo
   - Enable masked subgroup planning over `PlanningGroup` subsets in `RrtPlanner` and `TwoStageApproachPlanner`.
 - **Exit Criteria**: Zero heap allocations inside 1 kHz `step()` and trajectory sampling loops (verified with an allocation-counting test); joint-trajectory CBF filter benchmark & tests pass.
 
-#### Milestone 3B — Unified `WorldScene` Owner
+#### Milestone 3B — Unified `WorldScene` Owner ✅ Complete
 - **Deliverables**:
   - Named obstacle handles (`ObstacleHandle`), add/update/remove APIs, dirty-region `EsdfGridF32` re-carving, and synchronized `CollisionEnvironment` + ESDF state inside one owner.
 - **Exit Criteria**: Adding, moving, or removing obstacles updates both Tier-2 BVH queries and `EsdfGridF32` distances atomically without manual caller synchronization.

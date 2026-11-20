@@ -480,10 +480,185 @@ impl EsdfGridF32 {
             });
     }
 
-    /// Carves all obstacles currently registered in `env` into this ESDF grid.
+    /// Carves all active obstacles currently registered in `env` into this ESDF grid.
     pub fn carve_collision_environment(&mut self, env: &CollisionEnvironment) {
-        for obs in &env.obstacles {
+        for (_, obs) in env.active_obstacles() {
             self.carve_shape(&obs.shape, &obs.pose);
+        }
+    }
+
+    /// Maps a world-space AABB `[min_w, max_w]` into clamped inclusive voxel index bounds
+    /// `(min_idx, max_idx)`, returning `None` if the AABB does not intersect the grid volume.
+    pub fn voxel_region_for_world_aabb(
+        &self,
+        min_w: [f32; 3],
+        max_w: [f32; 3],
+    ) -> Option<([usize; 3], [usize; 3])> {
+        let mut min_idx = [0_usize; 3];
+        let mut max_idx = [0_usize; 3];
+        for a in 0..3 {
+            let dim = self.dims[a];
+            if dim == 0 {
+                return None;
+            }
+            let lo = ((min_w[a] - self.origin[a]) * self.inv_voxel_size - 0.5).floor() as isize;
+            let hi = ((max_w[a] - self.origin[a]) * self.inv_voxel_size - 0.5).ceil() as isize;
+            if hi < 0 || lo >= dim as isize {
+                return None;
+            }
+            min_idx[a] = lo.max(0) as usize;
+            max_idx[a] = (hi.min(dim as isize - 1)).max(0) as usize;
+        }
+        Some((min_idx, max_idx))
+    }
+
+    /// Resets voxels inside the inclusive index box `[min_idx, max_idx]` to `default_distance`.
+    pub fn clear_region(&mut self, min_idx: [usize; 3], max_idx: [usize; 3], default_distance: f32) {
+        let [nx, ny, nz] = self.dims;
+        if nx == 0 || ny == 0 || nz == 0 {
+            return;
+        }
+        let x0 = min_idx[0].min(nx - 1);
+        let x1 = max_idx[0].min(nx - 1);
+        let y0 = min_idx[1].min(ny - 1);
+        let y1 = max_idx[1].min(ny - 1);
+        let z0 = min_idx[2].min(nz - 1);
+        let z1 = max_idx[2].min(nz - 1);
+        if x0 > x1 || y0 > y1 || z0 > z1 {
+            return;
+        }
+        let stride_y = nx;
+        let stride_z = nx * ny;
+        for iz in z0..=z1 {
+            let z_off = iz * stride_z;
+            for iy in y0..=y1 {
+                let row_off = z_off + iy * stride_y;
+                self.distances[(row_off + x0)..=(row_off + x1)].fill(default_distance);
+            }
+        }
+    }
+
+    /// Carves `shape` posed at `pose` only inside the inclusive voxel index box `[min_idx, max_idx]`.
+    pub fn carve_shape_in_region(
+        &mut self,
+        shape: &SharedShape,
+        pose: &Isometry3<f64>,
+        min_idx: [usize; 3],
+        max_idx: [usize; 3],
+    ) {
+        let [nx, ny, nz] = self.dims;
+        if nx == 0 || ny == 0 || nz == 0 {
+            return;
+        }
+        let x0 = min_idx[0].min(nx - 1);
+        let x1 = max_idx[0].min(nx - 1);
+        let y0 = min_idx[1].min(ny - 1);
+        let y1 = max_idx[1].min(ny - 1);
+        let z0 = min_idx[2].min(nz - 1);
+        let z1 = max_idx[2].min(nz - 1);
+        if x0 > x1 || y0 > y1 || z0 > z1 {
+            return;
+        }
+
+        let stride_y = nx;
+        let stride_z = nx * ny;
+        let origin = self.origin;
+        let voxel_size = self.voxel_size;
+
+        match shape.as_typed_shape() {
+            TypedShape::Ball(ball) => {
+                let c = pose.translation.vector;
+                let center = [c.x as f32, c.y as f32, c.z as f32];
+                let radius = ball.radius as f32;
+                for iz in z0..=z1 {
+                    let pz = origin[2] + (iz as f32 + 0.5) * voxel_size;
+                    let dz = pz - center[2];
+                    for iy in y0..=y1 {
+                        let py = origin[1] + (iy as f32 + 0.5) * voxel_size;
+                        let dy = py - center[1];
+                        let row_off = iz * stride_z + iy * stride_y;
+                        for ix in x0..=x1 {
+                            let px = origin[0] + (ix as f32 + 0.5) * voxel_size;
+                            let dx = px - center[0];
+                            let dist = (dx * dx + dy * dy + dz * dz).sqrt() - radius;
+                            let slot = &mut self.distances[row_off + ix];
+                            if dist < *slot {
+                                *slot = dist;
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+            TypedShape::Compound(compound) => {
+                for (sub_pose, sub_shape) in compound.shapes() {
+                    let world_sub = *pose * parry_to_isometry(sub_pose);
+                    self.carve_shape_in_region(sub_shape, &world_sub, [x0, y0, z0], [x1, y1, z1]);
+                }
+                return;
+            }
+            _ => {}
+        }
+
+        let parry_pose = isometry_to_parry(pose);
+        let shape_ref = shape.as_ref();
+        let z_count = z1 - z0 + 1;
+        let sub_slice = &mut self.distances[z0 * stride_z..(z1 + 1) * stride_z];
+
+        let carve_slice = |(rel_z, slice): (usize, &mut [f32])| {
+            let iz = z0 + rel_z;
+            let pz = (origin[2] + (iz as f32 + 0.5) * voxel_size) as f64;
+            for iy in y0..=y1 {
+                let py = (origin[1] + (iy as f32 + 0.5) * voxel_size) as f64;
+                let row_off = iy * stride_y;
+                for ix in x0..=x1 {
+                    let px = (origin[0] + (ix as f32 + 0.5) * voxel_size) as f64;
+                    let pt = ParryVector::new(px, py, pz);
+                    let proj = shape_ref.project_point(&parry_pose, pt, false);
+                    let dist = (proj.point - pt).length();
+                    let signed_d = if proj.is_inside { -dist } else { dist } as f32;
+                    let slot = &mut slice[row_off + ix];
+                    if signed_d < *slot {
+                        *slot = signed_d;
+                    }
+                }
+            }
+        };
+
+        if z_count >= 4 {
+            sub_slice
+                .par_chunks_mut(stride_z)
+                .enumerate()
+                .for_each(carve_slice);
+        } else {
+            sub_slice
+                .chunks_mut(stride_z)
+                .enumerate()
+                .for_each(carve_slice);
+        }
+    }
+
+    /// Carves `shape` posed at `pose` only within its world AABB expanded by `truncation + voxel_size`.
+    pub fn carve_shape_bounded(
+        &mut self,
+        shape: &SharedShape,
+        pose: &Isometry3<f64>,
+        truncation: f32,
+    ) {
+        let aabb = shape.compute_aabb(&isometry_to_parry(pose));
+        let pad = truncation.max(0.0) + self.voxel_size;
+        let min_w = [
+            aabb.mins.x as f32 - pad,
+            aabb.mins.y as f32 - pad,
+            aabb.mins.z as f32 - pad,
+        ];
+        let max_w = [
+            aabb.maxs.x as f32 + pad,
+            aabb.maxs.y as f32 + pad,
+            aabb.maxs.z as f32 + pad,
+        ];
+        if let Some((min_idx, max_idx)) = self.voxel_region_for_world_aabb(min_w, max_w) {
+            self.carve_shape_in_region(shape, pose, min_idx, max_idx);
         }
     }
 

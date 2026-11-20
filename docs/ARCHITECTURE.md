@@ -81,6 +81,7 @@ flowchart TB
 | [`trajectory`](../crates/unrust-it/src/trajectory.rs) | `f64` | $C^2$ `CubicSplinePath`, time-optimal `ToppraTrajectory`, and online `JerkLimitedTrajectory` under velocity/acceleration/jerk limits. |
 | [`control`](../crates/unrust-it/src/control.rs) | `f64` | 1 kHz `ReactiveServoController`: multi-arm prioritized differential IK, closed-chain stabilization, tangential curl deadlock breaking, velocity-damper joint bounds, and Dykstra-projected QP CBF safety inequalities. |
 | [`planner`](../crates/unrust-it/src/planner.rs) | `f64` / `f32` | `RrtPlanner` (bidirectional flat-arena RRT-Connect with shortcutting and `Target::MultiPose`) and `TwoStageApproachPlanner` (Stage 1 global MPPI/RRT + Stage 2 exact `GeometryTier::Convex` CBF convergence). |
+| [`scene`](../crates/unrust-it/src/scene.rs) | `f64` / `f32` | Unified `WorldScene` owner with generational `ObstacleHandle`s, atomic BVH/rule updates, `batch_update`, and dirty-region `EsdfGridF32` re-carving. |
 | [`batch`](../crates/unrust-it/src/batch.rs) + [`rollout.wgsl`](../crates/unrust-it/src/rollout.wgsl) | `f32` | `FlatRobotModelF32`, `EsdfGridF32` (with `clear`, `carve_shape`, `carve_collision_environment`), `CpuSimdBatchBackend` (`wide::f32x8` + `rayon`), `WgpuBatchBackend` (`wgpu 30`, <= 8 storage buffers for WebGPU parity), persistent `GpuRobotContext` (with `update_esdf`), `BatchIkSolver`, and `BatchMppiOptimizer` (with `optimize_with_trace`). |
 
 ### 3.2 URDF/SRDF Ingestion (`crates/unrust-it-urdf`)
@@ -103,7 +104,7 @@ flowchart TB
 
 Before building external world schemas and sensor pipelines, an architectural audit identified five core friction points to resolve cleanly in Phase 3:
 
-1. **Split-Brain Scene Updates**: Currently callers mutate `MultiRobotModel`, `CollisionEnvironment`, and `EsdfGridF32` independently; adding or moving an obstacle does not automatically re-carve `EsdfGridF32`.
+1. **Split-Brain Scene Updates** *(resolved in Milestone 3B)*: Previously callers mutated `MultiRobotModel`, `CollisionEnvironment`, and `EsdfGridF32` independently; `WorldScene` now synchronizes BVH, rules, payloads, and dirty-region ESDF re-carving under one owner.
 2. **Remaining 1 kHz Heap Allocations**: `ReactiveServoController::step()` allocates temporary `DVector`/`DMatrix` instances, `canonical_payload_pair()` allocates `String` keys per lookup, and `ToppraTrajectory::sample(t)` allocates output `Vec<f64>`s.
 3. **Trajectory Safety Filtering**: `ReactiveServoController` currently accepts task-space Cartesian targets (`ServoTarget`); adding `ServoTarget::JointReference { q_ref, dq_ref, kp }` enables using it directly as a 1 kHz CBF safety filter tracking any `ToppraTrajectory`.
 4. **Resident GPU Context Wiring**: `BatchMppiOptimizer` and `BatchIkSolver` currently dispatch through transient buffer allocations in `WgpuBatchBackend` rather than reusing `GpuRobotContext`'s persistent resident storage buffers (`forward_kinematics_resident`, `collision_cost_resident`).
