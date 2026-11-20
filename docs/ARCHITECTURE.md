@@ -121,6 +121,13 @@ Before building external world schemas and sensor pipelines, an architectural au
   - **TOML (`.unrust.toml`)** as the primary human-authored format in Git (clean sections for `[[robots]]`, `[[payloads]]`, `[[obstacles]]`, `[[sensors]]`, `[[collision.pair_rules]]`, `[esdf]`, `[planner]`).
   - **JSON (`.unrust.json`)** automatically supported from the exact same `WorldSpec` structs for IPC, web/desktop Studio interchange, and runtime snapshots.
   - Studio's `WorkcellSpec` will share or map directly to `WorldSpec`, enabling seamless Open/Save in the desktop UI.
+- **Per-Robot Trajectory & Frame/Subframe Import (`Format TBD`)**:
+  - **Core Requirement**: Import an ordered list of trajectories per robot (`robot_uid`), where each trajectory contains a sequence of **frames** (named keyframes/reference poses — either Cartesian $SE(3)$ poses relative to `world`/workpiece/base frames or joint-space waypoints — with optional timing, velocity, and blend metadata) and nested **subframes** (local child transforms such as approach/retract/tool-tip offsets or dense intermediate micro-frames relative to a parent frame).
+  - **Format Status**: Exact file schema and container format are **to be decided (TBD)** during Milestone 3C design — primary candidates are **JSON** and **TOML** (consistent with `WorldSpec` in `crates/unrust-it-io`), with optional CSV/YAML/industrial adapters.
+  - **Execution Modes**:
+    1. *Cartesian Frame/Subframe Planning*: Resolve the frame -> subframe hierarchy into `TaskPose` / `ApproachTarget` sequences and plan collision-free multi-arm trajectories (`BatchIkSolver` + `TwoStageApproachPlanner` / MPPI / RRT + TOPP-RA).
+    2. *Joint-Space Replay & Safety Verification/Filtering*: Evaluate exact `GeometryTier::Convex` clearances & ACM rules across imported frames/subframes, and optionally filter multi-arm interference live at 1 kHz via `ServoTarget::JointReference` (Milestone 3A).
+  - **Desktop Studio UI (`apps/visualizer`)**: Add a dedicated **`Import Trajectories`** button in the Top Toolbar / Planner panel to load per-robot trajectory lists into the active workcell for 3D preview, ACM/witness clearance inspection, and CBF-filtered replanning.
 
 ### 5.2 Sensors, Calibration & Real-Time Dynamic Fusion (`crates/unrust-it-perception`)
 

@@ -67,12 +67,13 @@ This document tracks all completed engineering phases and commits on `main`, alo
   - Named obstacle handles (`ObstacleHandle`), add/update/remove APIs, dirty-region `EsdfGridF32` re-carving, and synchronized `CollisionEnvironment` + ESDF state inside one owner.
 - **Exit Criteria**: Adding, moving, or removing obstacles updates both Tier-2 BVH queries and `EsdfGridF32` distances atomically without manual caller synchronization.
 
-#### Milestone 3C — `crates/unrust-it-io` (Declarative `WorldSpec`: TOML + JSON)
+#### Milestone 3C — `crates/unrust-it-io` (Declarative `WorldSpec` & Per-Robot Trajectory Import)
 - **Deliverables**:
   - New `unrust-it-io` crate with `serde`-backed `WorldSpec` (`[[robots]]`, `[[payloads]]`, `[[obstacles]]`, `[[sensors]]`, `[[collision.pair_rules]]`, `[esdf]`, `[planner]`).
   - TOML (`.unrust.toml`) primary human-editable format + automatic JSON (`.unrust.json`) support -> `WorldSpec::compile() -> CompiledWorld`.
-  - File -> Open / Save `.unrust.toml` & `.unrust.json` integration in `apps/visualizer`.
-- **Exit Criteria**: Round-trip TOML/JSON serialization tests, multi-arm URDF path resolution relative to config file directory, and Studio import/export smoke test.
+  - **Per-Robot Trajectory & Frame/Subframe Import Schema (`format TBD`)**: Design and finalize the multi-robot trajectory list schema (ordered trajectories per robot with frames, nested subframes, timing/blend metadata, and Cartesian/joint representations) inside `crates/unrust-it-io`.
+  - File -> Open / Save `.unrust.toml` & `.unrust.json` integration plus a dedicated **`Import Trajectories`** file-picker button in `apps/visualizer` to load per-robot trajectory sequences with frames & subframes for playback, collision verification, and CBF-filtered execution.
+- **Exit Criteria**: Round-trip TOML/JSON serialization tests, multi-arm URDF path resolution relative to config file directory, trajectory-list import round-trip parsing & frame/subframe transform resolution tests, and Studio import/export validation.
 
 #### Milestone 3D — Composable Dual-Rate Pipeline (`unrust_it::pipeline`)
 - **Deliverables**:
