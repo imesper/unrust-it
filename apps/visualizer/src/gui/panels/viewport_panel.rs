@@ -108,7 +108,7 @@ pub fn show(
     egui::Area::new(egui::Id::unique("vp_hud_top_left"))
         .order(egui::Order::Middle)
         .constrain_to(rect)
-        .fixed_pos(rect.min + egui::vec2(10.0, 10.0))
+        .anchor(egui::Align2::LEFT_TOP, egui::vec2(10.0, 10.0))
         .show(ui.ctx(), |ui| {
             hud_frame.show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -130,17 +130,12 @@ pub fn show(
             });
         });
 
-    // Top-Right Camera Preset & Layers Bar (anchored dynamically inside `rect` top-right corner)
-    let screen = ui.ctx().content_rect();
+    // Top-Right Camera Preset & Layers Bar (anchored cleanly inside `rect` top-right corner)
     let cam_y_pad = if rect.width() < 640.0 { 44.0 } else { 10.0 };
-    let top_right_offset = egui::vec2(
-        rect.max.x - screen.max.x - 10.0,
-        rect.min.y - screen.min.y + cam_y_pad,
-    );
     let cam_bar_resp = egui::Area::new(egui::Id::unique("vp_hud_top_right"))
         .order(egui::Order::Middle)
         .constrain_to(rect)
-        .anchor(egui::Align2::RIGHT_TOP, top_right_offset)
+        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-10.0, cam_y_pad))
         .show(ui.ctx(), |ui| {
             hud_frame.show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -296,18 +291,15 @@ pub fn show(
             });
     }
 
-    // Bottom-Left Dynamic N-Arm Legend & Controls Hint
-    let bottom_left_offset = egui::vec2(
-        rect.min.x - screen.min.x + 10.0,
-        rect.max.y - screen.max.y - 10.0,
-    );
+    // Bottom-Left Dynamic N-Arm Legend & Controls Hint (flush inside `rect` bottom-left)
     egui::Area::new(egui::Id::unique("vp_hud_bottom_left"))
         .order(egui::Order::Middle)
         .constrain_to(rect)
-        .anchor(egui::Align2::LEFT_BOTTOM, bottom_left_offset)
+        .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(10.0, -10.0))
         .show(ui.ctx(), |ui| {
             hud_frame.show(ui, |ui| {
-                ui.horizontal(|ui| {
+                ui.set_max_width((rect.width() - 36.0).max(160.0));
+                ui.horizontal_wrapped(|ui| {
                     for arm in &state.workcell.arms {
                         let (dot_r, _) =
                             ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
